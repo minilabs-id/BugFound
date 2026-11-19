@@ -31,7 +31,7 @@ hash chain, so a run can be inspected and replayed after the fact.
 | **Local report only** | The report is written inside `--cwd`. Review and submit it yourself. AgentBug has no submission adapter by design (see `PRODUCTION_PLAN.md` §7). |
 | **No auto-submit** | No CLI flag or desktop button submits to HackerOne/Bugcrowd/Intigriti/etc. If a future build adds one, it must be opt-in and gated. |
 | **ROE fail-closed** | If the program page cannot be fetched, parsed, or its scope/ROE cannot be established, the engagement does not act on that target. A target that is not explicitly in scope is refused. Scope is re-evaluated before every network action, including after resume. |
-| **Pause / abort** | `pause` stops at the next safe boundary and keeps resumable state; `abort` is terminal. Both stop new tool calls immediately. |
+| **Pause / abort** | `pause` stops at the next safe boundary and keeps resumable state; `abort` is terminal. Both write a durable stop flag that a runner observes within one step (and immediately before spawning a tool), not instantaneously mid-tool. |
 | **Policy still applies in `full_auto`** | Budgets, scope, allowlists, tool risk labels, approvals, and egress controls stay active. Autonomy does not disable guardrails. |
 
 ## 3. Prerequisites
@@ -105,33 +105,44 @@ The Engagement tab and the trace log show a stream of events. Typical kinds incl
 
 | Event kind | Meaning |
 | --- | --- |
-| `engagement.start` | Run began; program URL recorded. |
-| `brief.fetch` | Program page was fetched and snapshotted. |
-| `brief.extract` / `roe.decision` | Scope/ROE extraction result and fail-closed decision. |
-| `task.created` / `task.status` | A task was queued or changed status. |
-| `tool.call` / `tool.result` | A policy-approved tool call and its (redacted) result. |
-| `clue.recorded` / `evidence.saved` | An observation or evidence artifact was stored. |
-| `finding.saved` | A deduplicated finding was written. |
-| `engagement.paused` / `engagement.resumed` / `engagement.aborted` | Lifecycle controls. |
-| `report.exported` | A local report was written. |
+| `run_start` | Run boundary; carries `run_id` for reproducibility. |
+| `brief.ingested` / `brief.extracted` | Program page snapshot and scope/ROE extraction result. |
+| `action` | A tool call with `tool`, `target`, `ok` and redacted detail. |
+| `finding` | A deduplicated finding with `id`, `type`, `cwe` and verifier verdict. |
+| `verifier` | Deterministic verdict over tool-captured bytes + canary (not LLM fields). |
+| `usage` | Real API `prompt_tokens` / `completion_tokens` for the run. |
+| `report.ready` | Local report written; payload includes the SHA-256 hash. |
+| `engagement.error` | Fail-closed decision or run error (message redacted). |
 
 The authoritative source is the `trace_events` table (`kind`, `payload_json`,
 `created_at`, `run_id`) plus the tamper-evident session event hash chain. Verify chain
-integrity with `agentbug verify-log --session <id>`.
+integrity with `agentbug verify-log --session <id>`. The engagement also appends a
+redacted `replay-<engagement-id>.jsonl` file under `--cwd`; the evaluation harness
+joins it with `trace_events` into `eval/results/<id>/replay.jsonl` so metrics can be
+recomputed without trusting the report. See `docs/evaluation.md`.
 
 ## 8. Pause, resume, abort
 
 ```sh
-agentbug engage pause  --engagement <id>
-agentbug engage resume --engagement <id>
-agentbug engage abort  --engagement <id>
+agentbug engagement --id <id> --status
+agentbug engagement --id <id> --pause
+agentbug engagement --id <id> --resume
+agentbug engagement --id <id> --abort
 ```
 
-- **Pause** stops new tool calls at the next safe boundary and persists all state.
-  Use it to review findings or tighten scope. `resume` re-evaluates policy and scope
-  before doing anything else (a changed program brief is re-read).
-- **Abort** is terminal: no further tool calls, no further resume. Existing findings,
-  evidence, and the partial report remain available for inspection.
+Pass `--db <path>` when the engagement was launched with `engage --db <path>`;
+control commands must point at the same database.
+
+- **Pause** writes a durable control state and requests a stop on the runner
+  sessions; it takes effect at the next step boundary, not instantaneously. All
+  state is persisted. Use it to review findings or tighten scope.
+- **Resume** clears the durable stop flag and sets state back to running. It does
+  **not** re-fetch or re-read the program brief; scope and policy are still
+  re-evaluated before each network action by the tool/runtime gates. If you changed
+  the ROE, re-run from a fresh engagement (or re-import scope manually).
+- **Abort** is terminal: no further tool calls and `resume` refuses an aborted
+  engagement. Existing findings, evidence, and any partial report remain available
+  for inspection.
 - In the desktop Engagement tab the same actions are buttons next to the state display.
 
 ## 9. Inspect findings and export the report
@@ -170,14 +181,19 @@ or submitting it.**
   remain subject to scope, budget, and approval policy.
 - **Honeypots and decoy assets.** Public pages can contain stale, misleading, or
   intentionally planted scope/data. Treat extracted ROE as a claim to verify, not
-  authority: scope is fail-closed, and a deterministic verifier (not the LLM's own
-  judgment) must confirm a finding before it is reported.
+  authority: scope is fail-closed, and a deterministic verifier replaying stored
+  request/response bytes and a canary (not the LLM's own judgment) must confirm a
+  finding before it is reported. `validate_poc` is a tool, not an authoritative
+  gate; operator review remains the final acceptance step.
 - **Not a substitute for authorization.** A program page is a statement of intent,
   not a legal grant. Confirm you are allowed to test each in-scope asset.
 - **No OS sandbox / no clustering.** Run on an isolated host, keep egress restricted,
   and prefer `ask` mode unless the engagement explicitly authorizes autonomy.
-- **Replay fidelity.** Replay logs (Cochise) are required for evaluation, but a replay
-  is a debugging aid, not proof that a finding is valid; see `docs/evaluation.md`.
+- **Replay fidelity.** A replay JSONL (Cochise-style) is required for evaluation,
+  but it is a debugging and audit aid, not proof that a finding is valid; see
+  `docs/evaluation.md`. A replay without ground truth cannot establish recall or
+  precision. Deferred scope (no real browser, no clustering, no live submission)
+  is listed in `docs/REMAINING_GAPS.md`.
 
 ## 11. See also
 

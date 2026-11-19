@@ -2,7 +2,10 @@
 
 Tanggal: 2026-11-19
 Sumber: audit independen `HARNESS AUDIT` (temuan A1–A9, B1–B5)
-Status: **diekskusi oleh 4 workstream paralel — selesai, 152 tes hijau**
+Status: **A1–A9 / B1–B5 ditutup oleh 4 workstream paralel; B1–B14
+(remaining-gap pass) menyusul. Suite saat ini 180+ tes — angka pasti dan hijau/
+tidaknya harus dibaca dari `cargo test --workspace` (lihat
+`PRODUCTION_PLAN.md` §4), bukan dari status dokumen ini.**
 
 ---
 
@@ -11,6 +14,10 @@ Status: **diekskusi oleh 4 workstream paralel — selesai, 152 tes hijau**
 Membuat klaim AgentBug sesuai dengan kode yang benar-benar jalan, dan mengubah
 harness dari "scripted 9-step LLM loop" menjadi agent yang **aman, terverifikasi,
 dan bisa diukur**.
+
+> **ID note:** B1–B5 in this 2026-11-19 audit are the original follow-ups to
+> H-10…H-14. The newer `docs/B1_B14_FIX_PLAN.md` reuses the "B" prefix for a
+> separate remaining-gap set; see `docs/REMAINING_GAPS.md` §2 for that list.
 
 Prinsip:
 
@@ -216,9 +223,13 @@ Aturan: WS tidak boleh mengubah file di luar ownership. Integrasi dilakukan sete
 
 - Semua task H-01…H-14 selesai dengan tes yang menyertai.
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-  `cargo test --workspace`, `cargo build --release --workspace` hijau.
-- Tidak ada temuan A1–A9, B1–B5 yang masih open.
-- Laporan produksi lolos `eval/score.py --strict`.
+  `cargo test --workspace`, `cargo build --release --workspace` hijau (jangan
+  meng-copy jumlah tes dari dokumen mana pun; baca output aktual).
+- Tidak ada temuan A1–A9, B1–B5 (audit lama) yang masih open.
+- B1–B14 dari `docs/B1_B14_FIX_PLAN.md` terverifikasi (lihat
+  `docs/REMAINING_GAPS.md` §2).
+- Laporan produksi lolos `eval/score.py --strict`; `eval/e2e_test.ps1` memeriksa
+  bagian laporan dan menjalankan scorer dengan `--strict`.
 - Pause/Abort teruji menghentikan step dalam ≤1 langkah.
 - Dokumen tidak punya klaim tanpa call site.
 

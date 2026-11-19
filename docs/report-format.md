@@ -68,7 +68,14 @@ gated or not used. Reference the playbooks/hypotheses where relevant.>
 
 **Proof of concept**
 
-`<request / payload / minimal script — secrets redacted>`
+`<redacted view of the tool-captured request/payload; the authoritative bytes are
+the stored ToolCapture.request_bytes / response_bytes artifact referenced below>`
+
+The PoC is derived from the bytes captured by the tool that performed the
+request, not from a string supplied by the model. Include the canary marker used
+by the deterministic verifier in the evidence section, redacted if it is a
+secret. `validate_poc` is a helper tool, not an authoritative acceptance gate:
+acceptance requires the verifier replaying stored bytes and operator review.
 
 **Impact**
 
@@ -80,10 +87,12 @@ gated or not used. Reference the playbooks/hypotheses where relevant.>
 
 **Evidence**
 
-- SHA-256: `<64 hex chars>`
-- Artifact path: `<relative path under --cwd>`
-- Request: `<redacted request>`
-- Response: `<redacted response>`
+- SHA-256: `<64 hex chars over the raw captured request||response bytes>`
+- Artifact path: `<relative path under --cwd containing the captured bytes>`
+- Capture source: `<tool that produced the bytes; e.g. http_request / validate_poc>`
+- Canary: `<redacted canary marker used by the deterministic verifier>`
+- Request: `<redacted view of ToolCapture.request_bytes>`
+- Response: `<redacted view of ToolCapture.response_bytes>`
 
 <Repeat one `### F-00N` block per finding.>
 
@@ -132,10 +141,10 @@ fields:
 | CVSS v3.1 Vector | Base metrics only: `CVSS:3.1/AV:/AC:/PR:/UI:/S:/C:/I:/A:`. Use temporal/environmental metrics only if explicitly labeled as such. |
 | CWE | `CWE-<number>` plus a short name. Choose the most specific applicable CWE. |
 | Steps to reproduce | Numbered, deterministic, no secrets. |
-| PoC | Minimal reproducible payload/request. |
+| PoC | Minimal reproducible payload/request shown in the report, derived from tool-captured bytes (not an LLM-supplied string). |
 | Impact | Concrete security consequence, not a generic claim. |
 | Remediation | Actionable fix plus a re-test step. |
-| Evidence hash | SHA-256 over the raw captured evidence bytes, stored as a separate artifact; report the redacted view. Redaction must never alter the meaning of the proof. |
+| Evidence hash | SHA-256 over the raw captured request/response bytes (`attach_capture` / `get_capture`), stored as a separate artifact; report the redacted view. Redaction must never alter the meaning of the proof. |
 
 ## CVSS v3.1 severity bands (FIRST)
 

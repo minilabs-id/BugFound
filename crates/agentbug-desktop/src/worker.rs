@@ -1,7 +1,7 @@
 use crate::config::{resolve_api_key, AppConfig};
 use agentbug_core::{AgentConfig, Runner};
 use agentbug_llm::LlmConfig;
-use agentbug_policy::{BudgetConfig, Mode, PolicyConfig};
+use agentbug_policy::{Mode, PolicyConfig};
 use agentbug_store::Store;
 use agentbug_tools::{try_default_registry_with_options, ToolOptions};
 use anyhow::{Context, Result};
@@ -43,6 +43,43 @@ fn job_label(job: &Job) -> String {
     }
 }
 
+fn policy_config(config: &AppConfig, mode: Mode) -> PolicyConfig {
+    let budgets = config.policy.budgets();
+    PolicyConfig {
+        mode,
+        scope: config.scope.clone(),
+        allowed_tools: config.policy.allowed_tools.clone(),
+        denied_tools: config.policy.denied_tools.clone(),
+        allowed_targets: config.policy.allowed_targets.clone(),
+        denied_targets: config.policy.denied_targets.clone(),
+        budgets: budgets.clone(),
+        rate_limits: budgets,
+        ..Default::default()
+    }
+}
+
+fn agent_config(config: &AppConfig, mode: Mode) -> AgentConfig {
+    let budgets = config.effective_budgets();
+    AgentConfig {
+        mode,
+        max_steps: config.agent.max_steps,
+        system_prompt: config.agent.system_prompt.clone(),
+        budgets: budgets.clone(),
+        budget: budgets.clone(),
+        rate_limits: budgets.clone(),
+        rate_limit: budgets,
+        max_tool_calls: config.agent.max_tool_calls,
+        max_network_calls: config.agent.max_network_calls,
+        requests_per_minute: config.agent.requests_per_minute,
+        auto_approve_tools: config.agent.auto_approve_tools.clone(),
+        auto_approve_all: config.agent.auto_approve_all,
+        max_estimated_tokens: config.agent.max_estimated_tokens,
+        cost_per_1k_input: config.llm.cost_per_1k_input,
+        cost_per_1k_output: config.llm.cost_per_1k_output,
+        ..Default::default()
+    }
+}
+
 fn build_runner(config: &AppConfig, cwd: &str, mode: Mode) -> Result<Runner> {
     let api_key = resolve_api_key(&config.llm.api_key)?;
     let llm_config = LlmConfig {
@@ -72,37 +109,8 @@ fn build_runner(config: &AppConfig, cwd: &str, mode: Mode) -> Result<Runner> {
     };
     let tools = try_default_registry_with_options(cwd, options)?;
 
-    let policy = agentbug_core::build_policy_config(PolicyConfig {
-        mode,
-        scope: config.scope.clone(),
-        ..Default::default()
-    });
-
-    let budget = BudgetConfig {
-        max_tool_calls: config.agent.max_tool_calls,
-        max_network_calls: config.agent.max_network_calls,
-        requests_per_minute: config.agent.requests_per_minute,
-        max_steps: config.agent.max_steps,
-        max_tokens: config.agent.max_estimated_tokens,
-    };
-    let agent = AgentConfig {
-        mode,
-        max_steps: config.agent.max_steps,
-        system_prompt: config.agent.system_prompt.clone(),
-        budgets: budget.clone(),
-        budget: budget.clone(),
-        rate_limits: budget.clone(),
-        rate_limit: budget,
-        max_tool_calls: config.agent.max_tool_calls,
-        max_network_calls: config.agent.max_network_calls,
-        requests_per_minute: config.agent.requests_per_minute,
-        auto_approve_tools: config.agent.auto_approve_tools.clone(),
-        auto_approve_all: config.agent.auto_approve_all,
-        max_estimated_tokens: config.agent.max_estimated_tokens,
-        cost_per_1k_input: config.llm.cost_per_1k_input,
-        cost_per_1k_output: config.llm.cost_per_1k_output,
-        ..Default::default()
-    };
+    let policy = agentbug_core::build_policy_config(policy_config(config, mode));
+    let agent = agent_config(config, mode);
 
     let store = Store::open(&config.storage.path)?;
     Ok(Runner::new(store, Arc::new(client), tools, policy, agent))
@@ -162,6 +170,31 @@ pub fn spawn_job(config: AppConfig, job: Job, tx: Sender<JobEvent>) -> std::thre
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_fields_and_budget_aliases_are_forwarded() {
+        let config: AppConfig = toml::from_str(crate::config::POLICY_CONFIG).expect("parse config");
+        let policy = policy_config(&config, Mode::FullAuto);
+        assert_eq!(policy.allowed_tools, ["http_request", "dns_lookup"]);
+        assert_eq!(policy.denied_tools, ["shell"]);
+        assert_eq!(policy.allowed_targets, ["example.com"]);
+        assert_eq!(policy.denied_targets, ["evil.example.com"]);
+        assert_eq!(policy.budgets.max_steps, 11);
+        assert_eq!(policy.rate_limits.max_tokens, 55);
+        let agent = agent_config(&config, Mode::FullAuto);
+        for alias in [
+            &agent.budgets,
+            &agent.budget,
+            &agent.rate_limits,
+            &agent.rate_limit,
+        ] {
+            assert_eq!(alias.max_steps, 11);
+            assert_eq!(alias.max_tool_calls, 22);
+            assert_eq!(alias.max_network_calls, 33);
+            assert_eq!(alias.requests_per_minute, 44);
+            assert_eq!(alias.max_tokens, 55);
+        }
+    }
 
     #[test]
     fn labels_describe_the_job() {

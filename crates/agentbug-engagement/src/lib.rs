@@ -15,7 +15,7 @@
 use agentbug_core::{build_policy_config, AgentConfig, Runner};
 use agentbug_llm::{ChatMessage, ChatResponse, Llm, LlmClient, LlmConfig};
 use agentbug_policy::{BudgetConfig, Mode, PolicyConfig, ScopeConfig};
-use agentbug_store::{redact, Store};
+use agentbug_store::{redact, Store, ToolCapture};
 use agentbug_tools::{try_default_registry_with_options, ToolOptions};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -542,6 +542,29 @@ fn emit(tx: &Sender<EngagementEvent>, replay: Option<&ReplayLog>, event: Engagem
     let _ = tx.send(event);
 }
 
+/// Durable eval-trace writer. Every event is stamped with a `run_id` built from
+/// the engagement id plus a step counter so an evaluator can order the replay
+/// deterministically. All string payloads pass through the store's redactor.
+struct TraceRun {
+    engagement_id: String,
+    step: u64,
+}
+
+impl TraceRun {
+    fn new(engagement_id: &str) -> Self {
+        Self {
+            engagement_id: engagement_id.to_string(),
+            step: 0,
+        }
+    }
+
+    fn record(&mut self, store: &Store, kind: &str, payload: Value) {
+        let run_id = format!("{}-{}", self.engagement_id, self.step);
+        self.step += 1;
+        let _ = store.append_trace(&self.engagement_id, &run_id, kind, &payload.to_string());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Engagement orchestration
 // ---------------------------------------------------------------------------
@@ -586,6 +609,34 @@ async fn engage_async(
         },
     );
 
+    // Eval trace: one durable run_start carrying the (redacted) inputs so the
+    // evaluator can reconstruct the run without trusting the generated report.
+    let mut trace = TraceRun::new(&id);
+    let model = std::env::var("AGENTBUG_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    trace.record(
+        &store,
+        "run_start",
+        json!({
+            "program_url": redact(program_url),
+            "model": model.as_deref().map(redact),
+            "brief_only": brief_only,
+            "options": {
+                "mode": format!("{:?}", options.mode),
+                "max_steps": options.max_steps,
+                "max_tool_calls": options.max_tool_calls,
+                "max_network_calls": options.max_network_calls,
+                "requests_per_minute": options.requests_per_minute,
+                "max_estimated_tokens": options.max_estimated_tokens,
+                "allow_network_write": options.allow_network_write,
+                "allow_intrusive": options.allow_intrusive,
+                "auto_approve_all": options.auto_approve_all,
+            }
+        }),
+    );
+
     let outcome = run_engagement(
         &store,
         db_path,
@@ -594,6 +645,7 @@ async fn engage_async(
         workspace,
         &tx,
         &replay,
+        &mut trace,
         brief_only,
         options,
     )
@@ -611,11 +663,10 @@ async fn engage_async(
             );
             update_control(&id, |control| control.state = ControlState::Aborted);
             let _ = store.set_engagement_state(&id, "aborted");
-            let _ = store.append_trace(
-                &id,
-                &id,
+            trace.record(
+                &store,
                 "engagement.error",
-                &json!({ "message": redact(&message) }).to_string(),
+                json!({ "message": redact(&message) }),
             );
             Err(error)
         }
@@ -631,6 +682,7 @@ async fn run_engagement(
     workspace: &Path,
     tx: &Sender<EngagementEvent>,
     replay: &ReplayLog,
+    trace: &mut TraceRun,
     brief_only: bool,
     options: EngagementOptions,
 ) -> Result<EngagementProfile> {
@@ -826,10 +878,8 @@ async fn run_engagement(
         .into_iter()
         .map(|finding| finding.id)
         .collect();
-    // H-04: canaries are generated here (never by the LLM) and kept only for
-    // the lifetime of this run so the verifier can replay stored bytes against
-    // a deterministic oracle.
-    let mut canaries: HashMap<String, String> = HashMap::new();
+    // H-04/B1: canaries and evidence bytes come only from the tool capture
+    // persisted by core. No LLM-supplied request/response participates.
     let mut evidence_hashes: HashMap<String, String> = HashMap::new();
 
     for task in store.list_tasks(id)? {
@@ -844,6 +894,7 @@ async fn run_engagement(
         // TC-4: make the fail-closed method gate observable in the replay log
         // and the event stream so an auditor can see why generic HTTP is gone.
         if !roe.allow_state_change {
+            let detail = "ROE forbids state changes: http_request and validate_poc withheld; read-only http_probe and dns_lookup retained";
             emit(
                 tx,
                 Some(replay),
@@ -851,8 +902,18 @@ async fn run_engagement(
                     tool: "tool_registry".into(),
                     target: None,
                     ok: true,
-                    detail: "ROE forbids state changes: http_request withheld; read-only http_probe and dns_lookup retained".into(),
+                    detail: detail.into(),
                 },
+            );
+            trace.record(
+                store,
+                "action",
+                json!({
+                    "tool": redact("tool_registry"),
+                    "target": Value::Null,
+                    "ok": true,
+                    "detail": redact(detail),
+                }),
             );
         }
         // H-01: only safe/read tools are auto-approved by default. Network-write
@@ -902,7 +963,7 @@ async fn run_engagement(
                     let _ = store.record_coverage(id, &row.target, &row.method, &row.path);
                 }
             }
-            observe_session(store, id, Some(&task.id), &session.id, tx, replay)?;
+            observe_session(store, id, Some(&task.id), &session.id, tx, replay, trace)?;
         }
 
         match run_result {
@@ -931,8 +992,7 @@ async fn run_engagement(
         for finding in current {
             if known_findings.insert(finding.id.clone()) {
                 match capture_evidence(store, &finding) {
-                    Ok((canary, evidence_hash)) => {
-                        canaries.insert(finding.id.clone(), canary);
+                    Ok((_, evidence_hash)) => {
                         evidence_hashes.insert(finding.id.clone(), evidence_hash);
                     }
                     Err(error) => {
@@ -965,7 +1025,7 @@ async fn run_engagement(
     // oracle are promoted to `validated`; candidates stay out of the report.
     let aborted = control_aborted(db_path, id);
     let findings = store.list_findings(id)?;
-    let verified_count = verify_findings(store, id, &canaries, &evidence_hashes, &roe)?;
+    let verified_count = verify_findings(store, id, &roe, trace)?;
     let verified_findings = store.verified_findings(id)?;
     let candidate_count = findings.len().saturating_sub(verified_findings.len());
 
@@ -1045,6 +1105,7 @@ fn observe_session(
     session_id: &str,
     tx: &Sender<EngagementEvent>,
     replay: &ReplayLog,
+    trace: &mut TraceRun,
 ) -> Result<()> {
     let messages = store.list_messages(session_id)?;
     let mut calls: HashMap<String, (String, Value)> = HashMap::new();
@@ -1095,6 +1156,16 @@ fn observe_session(
                 detail: detail.to_string(),
             },
         );
+        trace.record(
+            store,
+            "action",
+            json!({
+                "tool": redact(&tool),
+                "target": target.as_deref().map(redact),
+                "ok": ok,
+                "detail": redact(detail),
+            }),
+        );
         let _ = store.add_clue(
             engagement_id,
             task_id,
@@ -1109,6 +1180,18 @@ fn observe_session(
         "runner.session",
         &json!({ "messages": messages.len() }).to_string(),
     );
+    // Eval trace: durable provider token usage for this runner session.
+    if let Ok(usage) = store.token_usage(session_id) {
+        trace.record(
+            store,
+            "usage",
+            json!({
+                "prompt": usage.prompt_tokens,
+                "completion": usage.completion_tokens,
+                "cost": usage.cost_usd,
+            }),
+        );
+    }
     Ok(())
 }
 
@@ -1727,7 +1810,7 @@ fn auto_approvable_tools(
             if intrusive {
                 return options.allow_intrusive;
             }
-            let network_write = risk == "network"
+            let network_write = matches!(risk, "network" | "network-write")
                 || name.contains("http")
                 || name.contains("request")
                 || name.contains("write");
@@ -1961,82 +2044,136 @@ fn map_cwe(title: &str, vuln_type: Option<&str>) -> String {
     "CWE-284".to_string()
 }
 
-/// Pin the raw request/response bytes of a finding with SHA-256 and return the
-/// canary plus digest used by the deterministic verifier. The canary is minted
-/// here from the finding id — never taken from LLM output.
+/// The trusted canary for a capture: use the value minted by the tool, or fall
+/// back to a deterministic digest of the captured request bytes. Neither path
+/// consults an LLM-supplied field.
+fn capture_canary(capture: &ToolCapture) -> String {
+    if capture.canary.trim().is_empty() {
+        format!("agentbug-canary-{}", hex_digest(&capture.request_bytes))
+    } else {
+        capture.canary.clone()
+    }
+}
+
+/// Digest over the exact captured bytes plus the canary, matching the evidence
+/// row written by [`capture_evidence`].
+fn capture_digest(capture: &ToolCapture, canary: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(&capture.request_bytes);
+    hasher.update(&capture.response_bytes);
+    hasher.update(canary.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Pin the raw tool-captured request/response bytes with SHA-256 and return the
+/// canary plus digest used by the deterministic verifier. LLM-supplied
+/// `finding.request`/`response` are never consulted (B1).
 fn capture_evidence(store: &Store, finding: &agentbug_store::Finding) -> Result<(String, String)> {
-    let request = finding.request.clone().unwrap_or_default();
-    let response = finding.response.clone().unwrap_or_default();
-    // Derive the canary from the stored request bytes so it is reproducible
-    // from evidence alone and cannot be supplied or guessed by the LLM.
-    let canary = format!("agentbug-canary-{}", hex_digest(request.as_bytes()));
-    let artifact = canary.as_bytes();
+    let Some(capture) = store.get_capture(&finding.id)? else {
+        return Err(anyhow!("finding {} has no tool capture", finding.id));
+    };
+    let canary = capture_canary(&capture);
     let sha256 = store.add_evidence_bytes(
         &finding.id,
-        "http",
-        request.as_bytes(),
-        response.as_bytes(),
-        Some(artifact),
+        "tool-capture",
+        &capture.request_bytes,
+        &capture.response_bytes,
+        Some(canary.as_bytes()),
     )?;
     Ok((canary, sha256))
 }
 
-/// Deterministic, independent replay oracle. A finding is promoted to
-/// `validated` only when its *stored* response bytes contain the locally minted
-/// canary, carry a 2xx status line, and the store can still reproduce the
-/// SHA-256 digest of the captured bytes. No LLM-supplied `expected_status` or
-/// `marker` participates in the decision.
+/// Deterministic, independent replay oracle (B1). A finding is promoted to
+/// `validated` only when it has an authoritative tool capture whose response
+/// bytes contain the canary and carry a 2xx status, and the store can still
+/// reproduce the evidence digests. No LLM-supplied request/response, expected
+/// status or marker participates in the decision.
 fn verify_findings(
     store: &Store,
     id: &str,
-    canaries: &HashMap<String, String>,
-    evidence_hashes: &HashMap<String, String>,
     roe: &RoePolicy,
+    trace: &mut TraceRun,
 ) -> Result<usize> {
     if !store.verify_evidence(id)? {
         return Err(anyhow!(
             "stored evidence SHA-256 digests do not match captured bytes"
         ));
     }
+    let mut promoted = 0usize;
     for finding in store.list_findings(id)? {
-        // A finding without an id can never be replayed.
-        if finding.id.trim().is_empty() {
-            continue;
-        }
-        let Some(canary) = canaries.get(&finding.id) else {
-            continue;
+        // A finding without an id, or without a tool capture, can never be
+        // replayed regardless of how self-consistent its LLM fields look.
+        let (verified, capture_hash, advisory_match) = if finding.id.trim().is_empty() {
+            (false, None, false)
+        } else {
+            match store.get_capture(&finding.id)? {
+                None => (false, None, false),
+                Some(capture) => {
+                    let canary = capture_canary(&capture);
+                    let response = String::from_utf8_lossy(&capture.response_bytes);
+                    let mut accepted = response.contains(&canary) && has_success_status(&response);
+                    // Secondary signal: a classic self-graded `<html` echo with
+                    // no canary is not independent evidence.
+                    if accepted && is_self_graded_marker(&response, &canary) {
+                        accepted = false;
+                    }
+                    // ROE constraints invalidate findings that claim forbidden
+                    // techniques in their title/description.
+                    let technique =
+                        format!("{} {}", finding.title, finding.description).to_ascii_lowercase();
+                    if accepted
+                        && !roe.allow_state_change
+                        && ["state chang", "modify data", "destructive", "dos "]
+                            .iter()
+                            .any(|token| technique.contains(token))
+                    {
+                        accepted = false;
+                    }
+                    // Advisory only: note whether the LLM-supplied response
+                    // happened to match the captured bytes. Never a verdict.
+                    let matches = finding
+                        .response
+                        .as_deref()
+                        .is_some_and(|text| text.as_bytes() == capture.response_bytes.as_slice());
+                    let digest = capture_digest(&capture, &canary);
+                    (accepted, Some(digest), matches)
+                }
+            }
         };
-        let Some(expected_hash) = evidence_hashes.get(&finding.id) else {
-            continue;
-        };
-        if expected_hash.len() != 64 || !expected_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
+
+        // Eval trace: a verifier verdict and a finding record per candidate.
+        trace.record(
+            store,
+            "verifier",
+            json!({
+                "candidate": redact(&finding.id),
+                "verified": verified,
+                "rejected": !verified,
+            }),
+        );
+        trace.record(
+            store,
+            "finding",
+            json!({
+                "id": redact(&finding.id),
+                "title": redact(&finding.title),
+                "severity": redact(&finding.severity),
+                "verified": verified,
+                "capture_hash": capture_hash.as_deref().map(redact),
+            }),
+        );
+
+        if !verified {
             continue;
         }
-        // Replay is over bytes persisted at capture time, not live arguments.
-        let response = finding.response.clone().unwrap_or_default();
-        if !response.contains(canary) || !has_success_status(&response) {
-            continue;
-        }
-        // Reject self-graded cases: a response that merely echoes the classic
-        // `<html` marker supplied by the model is not sufficient evidence.
-        if is_self_graded_marker(&response, canary) {
-            continue;
-        }
-        // ROE constraints that forbid state change or fuzzing invalidate any
-        // finding whose evidence claims those techniques.
-        let technique = format!("{} {}", finding.title, finding.description).to_ascii_lowercase();
-        if !roe.allow_state_change
-            && ["state chang", "modify data", "destructive", "dos "]
-                .iter()
-                .any(|token| technique.contains(token))
-        {
-            continue;
-        }
-        let detail = format!("deterministic canary replay; sha256={expected_hash}");
+        let hash = capture_hash.expect("verified finding has a capture hash");
+        let detail = format!(
+            "deterministic tool-capture canary replay; sha256={hash}; llm_response_matches_capture={advisory_match}"
+        );
         store.set_finding_validation(&finding.id, "validated", Some(&detail))?;
+        promoted += 1;
     }
-    Ok(store.verified_findings(id)?.len())
+    Ok(promoted)
 }
 
 fn has_success_status(response: &str) -> bool {
@@ -2255,11 +2392,16 @@ fn build_tools(
             continue;
         }
         // The generic HTTP tool can issue arbitrary state-changing methods.
-        // `ToolOptions` has no `allowed_methods` gate, so a no-state-change ROE
-        // fails closed by withholding `http_request` entirely; the read-only
-        // `http_probe` and `dns_lookup` tools stay available. Callers document
-        // this decision with an Action event.
+        // A no-state-change ROE fails closed by withholding `http_request`
+        // entirely; the read-only `http_probe` and `dns_lookup` tools stay
+        // available. Callers document this decision with an Action event.
         if !roe.allow_state_change && name == "http_request" {
+            continue;
+        }
+        // B2: `validate_poc` replays a full HTTP request and is now classified
+        // as `network-write`. The brief must explicitly allow state changes
+        // before the tool is exposed at all.
+        if name == "validate_poc" && !roe.allow_state_change {
             continue;
         }
         // `deny_destructive` is unconditional in the policy, so destructive
@@ -2306,6 +2448,31 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    /// Persist an authoritative tool capture for a finding (B1).
+    fn capture_for(store: &Store, finding: &agentbug_store::Finding, response: &str, canary: &str) {
+        store
+            .attach_capture(
+                &finding.id,
+                b"GET /?q=1 HTTP/1.1",
+                response.as_bytes(),
+                canary,
+            )
+            .expect("attach tool capture");
+    }
+
+    fn trace_kinds(db: &Path, engagement_id: &str) -> Vec<String> {
+        let conn = rusqlite::Connection::open(db).expect("open trace db");
+        let mut stmt = conn
+            .prepare("SELECT kind FROM trace_events WHERE engagement_id=?1")
+            .expect("prepare trace query");
+        stmt.query_map(rusqlite::params![engagement_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .expect("query trace events")
+        .map_while(Result::ok)
+        .collect()
     }
 
     const BOURSOBANK_BRIEF: &str = r#"
@@ -2468,6 +2635,59 @@ No DoS testing. Do not modify data. No disclosure.
     }
 
     #[test]
+    fn no_state_change_brief_removes_validate_poc_and_network_write_tools() {
+        let brief = "In scope:\n- example.com\nRules:\nNo state change. Read-only testing only.\n";
+        let roe = parse_roe(brief);
+        assert!(!roe.allow_state_change);
+        let profile = extract_profile_from_text(brief, "https://example.com/security");
+        let workspace =
+            std::env::temp_dir().join(format!("agentbug-roe-poc-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&workspace);
+
+        let default = build_tools(&workspace, &profile, &roe, &EngagementOptions::default())
+            .expect("build tools");
+        assert!(
+            default.get("validate_poc").is_none(),
+            "validate_poc must be withheld when the brief forbids state changes"
+        );
+        assert!(
+            default
+                .specs()
+                .iter()
+                .all(|spec| spec.risk != "network-write"),
+            "network-write tools must be absent without the operator opt-in"
+        );
+
+        // The brief may allow state changes, but the operator opt-in is a
+        // separate gate: validate_poc is still withheld without it.
+        let state_allowed = RoePolicy {
+            allow_state_change: true,
+            ..roe.clone()
+        };
+        let no_opt_in = build_tools(
+            &workspace,
+            &profile,
+            &state_allowed,
+            &EngagementOptions::default(),
+        )
+        .expect("build tools");
+        assert!(no_opt_in.get("validate_poc").is_none());
+
+        // With both authorisations the network-write tool is available.
+        let opted_in = build_tools(
+            &workspace,
+            &profile,
+            &state_allowed,
+            &EngagementOptions {
+                allow_network_write: true,
+                ..EngagementOptions::default()
+            },
+        )
+        .expect("build tools");
+        assert!(opted_in.get("validate_poc").is_some());
+    }
+
+    #[test]
     fn intrusive_and_network_write_tools_require_opt_in() {
         let profile = extract_profile_from_text(
             "In scope:\n- example.com\nRead-only testing only.\n",
@@ -2615,14 +2835,42 @@ No DoS testing. Do not modify data. No disclosure.
     }
 
     #[test]
+    fn finding_without_tool_capture_is_never_validated() {
+        let db = temp_db("no-capture");
+        let store = Store::open(&db).unwrap();
+        // The LLM supplies a perfectly self-consistent request, response and
+        // canary, but no tool ever captured those bytes. B1 must still refuse
+        // to promote the finding.
+        let canary = format!("agentbug-canary-{}", hex_digest(b"GET /?q=1 HTTP/1.1"));
+        let finding = stored_finding(
+            &store,
+            "s",
+            &format!("HTTP/1.1 200 OK\ncontent: {canary}\n<html>body</html>"),
+        );
+        assert!(finding.response.as_deref().unwrap().contains(&canary));
+        assert!(store.get_capture(&finding.id).unwrap().is_none());
+        let mut trace = TraceRun::new("s");
+        let count = verify_findings(&store, "s", &RoePolicy::default(), &mut trace)
+            .expect("verify findings");
+        assert_eq!(count, 0);
+        assert!(store.verified_findings("s").unwrap().is_empty());
+    }
+
+    #[test]
     fn self_graded_finding_is_rejected() {
         let db = temp_db("self-graded");
         let store = Store::open(&db).unwrap();
+        let canary = format!("agentbug-canary-{}", hex_digest(b"GET /?q=1 HTTP/1.1"));
         let finding = stored_finding(&store, "s", "HTTP/1.1 200 OK\n<html>expected marker</html>");
-        let (canary, hash) = capture_evidence(&store, &finding).unwrap();
-        let canaries = HashMap::from([(finding.id.clone(), canary)]);
-        let hashes = HashMap::from([(finding.id.clone(), hash)]);
-        let count = verify_findings(&store, "s", &canaries, &hashes, &RoePolicy::default())
+        capture_for(
+            &store,
+            &finding,
+            "HTTP/1.1 200 OK\n<html>expected marker</html>",
+            &canary,
+        );
+        capture_evidence(&store, &finding).unwrap();
+        let mut trace = TraceRun::new("s");
+        let count = verify_findings(&store, "s", &RoePolicy::default(), &mut trace)
             .expect("verify findings");
         assert_eq!(count, 0);
         assert!(store.verified_findings("s").unwrap().is_empty());
@@ -2632,24 +2880,23 @@ No DoS testing. Do not modify data. No disclosure.
     fn replay_uses_stored_bytes_with_deterministic_canary() {
         let db = temp_db("replay");
         let store = Store::open(&db).unwrap();
-        // The canary is derived from the stored request bytes, so the expected
-        // value is known before the finding is created.
+        // The canary is derived from the captured request bytes, so the
+        // expected value is known before the finding is created.
         let expected = format!("agentbug-canary-{}", hex_digest(b"GET /?q=1 HTTP/1.1"));
-        let finding = stored_finding(
-            &store,
-            "s",
-            &format!("HTTP/1.1 200 OK\ncontent: {expected}\n<html>body</html>"),
-        );
-        let response = finding.response.clone().unwrap();
+        let response = format!("HTTP/1.1 200 OK\ncontent: {expected}\n<html>body</html>");
+        let finding = stored_finding(&store, "s", &response);
         assert!(response.contains(&expected));
-        let (canary, hash) = capture_evidence(&store, &finding).unwrap();
+        capture_for(&store, &finding, &response, &expected);
+        let (canary, _) = capture_evidence(&store, &finding).unwrap();
         assert_eq!(canary, expected);
-        let canaries = HashMap::from([(finding.id.clone(), canary)]);
-        let hashes = HashMap::from([(finding.id.clone(), hash)]);
-        let count = verify_findings(&store, "s", &canaries, &hashes, &RoePolicy::default())
+        let mut trace = TraceRun::new("s");
+        let count = verify_findings(&store, "s", &RoePolicy::default(), &mut trace)
             .expect("verify findings");
         assert_eq!(count, 1);
         assert_eq!(store.verified_findings("s").unwrap().len(), 1);
+        let kinds = trace_kinds(&db, "s");
+        assert!(kinds.iter().any(|kind| kind == "verifier"));
+        assert!(kinds.iter().any(|kind| kind == "finding"));
     }
 
     #[test]
@@ -2660,11 +2907,14 @@ No DoS testing. Do not modify data. No disclosure.
         store
             .record_coverage("e", "https://example.com", "GET", "/")
             .unwrap();
-        let finding = stored_finding(&store, "e", &format!("HTTP/1.1 200 OK\ncontent: {canary}"));
+        let response = format!("HTTP/1.1 200 OK\ncontent: {canary}");
+        let finding = stored_finding(&store, "e", &response);
+        capture_for(&store, &finding, &response, &canary);
         let (minted, hash) = capture_evidence(&store, &finding).unwrap();
-        let canaries = HashMap::from([(finding.id.clone(), minted)]);
+        assert_eq!(minted, canary);
         let hashes = HashMap::from([(finding.id.clone(), hash.clone())]);
-        verify_findings(&store, "e", &canaries, &hashes, &RoePolicy::default()).unwrap();
+        let mut trace = TraceRun::new("e");
+        verify_findings(&store, "e", &RoePolicy::default(), &mut trace).unwrap();
         let verified = store.verified_findings("e").unwrap();
         assert_eq!(verified.len(), 1);
 
@@ -2699,6 +2949,76 @@ No DoS testing. Do not modify data. No disclosure.
         }
         assert!(report.contains(&hash));
         assert!(report.contains("https://example.com"));
+    }
+
+    #[test]
+    fn trace_events_are_written_for_eval_kinds() {
+        let db = temp_db("trace-kinds");
+        let store = Store::open(&db).unwrap();
+        let workspace = std::env::temp_dir().join(format!("agentbug-trace-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&workspace);
+        let replay = ReplayLog::new(&workspace, "trace-e").unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        let mut trace = TraceRun::new("trace-e");
+        trace.record(
+            &store,
+            "run_start",
+            json!({ "program_url": redact("https://example.com") }),
+        );
+
+        // One runner tool message produces an action trace, and durable token
+        // usage produces a usage trace.
+        let session = store.create_session("probe example.com").unwrap();
+        store.record_token_usage(&session.id, 12, 7, 0.03).unwrap();
+        store
+            .add_message_full(
+                &session.id,
+                "assistant",
+                "calling tool",
+                None,
+                Some(
+                    r#"[{"id":"c1","name":"http_probe","arguments":{"url":"https://example.com"}}]"#,
+                ),
+                None,
+            )
+            .unwrap();
+        store
+            .add_message_full(
+                &session.id,
+                "tool",
+                "ok=true 200",
+                Some("c1"),
+                None,
+                Some("http_probe"),
+            )
+            .unwrap();
+        observe_session(
+            &store,
+            "trace-e",
+            None,
+            &session.id,
+            &tx,
+            &replay,
+            &mut trace,
+        )
+        .unwrap();
+
+        // A captured finding produces finding + verifier traces.
+        let canary = format!("agentbug-canary-{}", hex_digest(b"GET /?q=1 HTTP/1.1"));
+        let response = format!("HTTP/1.1 200 OK\ncontent: {canary}");
+        let finding = stored_finding(&store, "trace-e", &response);
+        capture_for(&store, &finding, &response, &canary);
+        capture_evidence(&store, &finding).unwrap();
+        verify_findings(&store, "trace-e", &RoePolicy::default(), &mut trace).unwrap();
+
+        let kinds = trace_kinds(&db, "trace-e");
+        for expected in ["run_start", "action", "usage", "finding", "verifier"] {
+            assert!(
+                kinds.iter().any(|kind| kind == expected),
+                "missing trace kind {expected}: {kinds:?}"
+            );
+        }
     }
 
     #[test]

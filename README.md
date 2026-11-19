@@ -149,20 +149,23 @@ focused typecheck from a package directory (`bun typecheck`) per `AGENTS.md`.
 
 ## Evaluation scaffolding (no results)
 
-`eval/` contains a stdlib-only scorer, a Windows benchmark driver, a golden
-manifest example and a local end-to-end smoke test. It is **scaffolding**: no
-recall, precision, FPR or reproducibility figure is claimed here. An operator must
-run a real engagement against local testbeds, keep reports and replay logs under
-`eval/results/`, and record the outcome.
+`eval/` contains a stdlib-only scorer, a SQLite trace exporter, a Windows benchmark
+driver, a golden manifest example and a local end-to-end smoke test. It is
+**operator-recorded scaffolding**: no recall, precision, FPR or reproducibility
+figure is claimed here. An operator must run a real engagement against local
+testbeds, keep reports and replay logs under `eval/results/` (tracked, not
+gitignored), and record the outcome.
 
 ```powershell
 pwsh eval/run_benchmark.ps1          # dry run by default
 pwsh eval/run_benchmark.ps1 -Execute # isolated lab only
-pwsh eval/e2e_test.ps1               # local brief -> engage --brief-only -> report
-python eval/score.py --dir eval/results --manifest eval/golden.example.json --replay eval/results/<id>/replay.jsonl
+pwsh eval/e2e_test.ps1               # local brief -> report sections + score.py --strict
+python eval/export_trace.py eval/results/<id>/engagement.db eval/results/<id>/replay.jsonl --merge <workdir>/replay-<id>.jsonl
+python eval/score.py --dir eval/results/<id> --manifest eval/results/<id>/manifest.json --replay eval/results/<id>/replay.jsonl
 ```
 
-See `eval/README.md` for inputs, metrics and safe usage.
+See `eval/README.md` and `eval/results/README.md` for inputs, metrics and safe
+usage. Deferred scope is listed in `docs/REMAINING_GAPS.md`.
 
 ## Operational notes
 

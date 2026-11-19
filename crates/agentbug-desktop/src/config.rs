@@ -8,6 +8,7 @@ use std::path::Path;
 pub struct AppConfig {
     pub llm: LlmCfg,
     pub agent: AgentCfg,
+    pub policy: PolicyCfg,
     pub storage: StorageCfg,
     pub scope: agentbug_policy::ScopeConfig,
     pub network: NetworkCfg,
@@ -38,6 +39,43 @@ pub struct AgentCfg {
     pub max_estimated_tokens: u64,
     /// Escape hatch: skip every approval prompt. Default off.
     pub auto_approve_all: bool,
+}
+
+/// `[policy]` allow/deny lists and budget aliases. Layout is identical to the
+/// CLI `FileConfig` `[policy]` section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicyCfg {
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
+    #[serde(default)]
+    pub allowed_targets: Vec<String>,
+    #[serde(default)]
+    pub denied_targets: Vec<String>,
+    #[serde(default)]
+    pub max_steps_budget: usize,
+    #[serde(default)]
+    pub max_tool_calls_budget: usize,
+    #[serde(default)]
+    pub max_network_calls_budget: usize,
+    #[serde(default)]
+    pub requests_per_minute_budget: u64,
+    #[serde(default)]
+    pub max_tokens_budget: u64,
+}
+
+impl PolicyCfg {
+    pub fn budgets(&self) -> agentbug_policy::BudgetConfig {
+        agentbug_policy::BudgetConfig {
+            max_tool_calls: self.max_tool_calls_budget,
+            max_network_calls: self.max_network_calls_budget,
+            requests_per_minute: self.requests_per_minute_budget,
+            max_steps: self.max_steps_budget,
+            max_tokens: self.max_tokens_budget,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +166,39 @@ impl AppConfig {
         std::fs::write(path, text).with_context(|| format!("write config {}", path.display()))
     }
 
+    /// Effective budgets: a non-zero `[policy]` value wins, otherwise the
+    /// legacy `[agent]` scalar is used.
+    pub fn effective_budgets(&self) -> agentbug_policy::BudgetConfig {
+        let budgets = self.policy.budgets();
+        agentbug_policy::BudgetConfig {
+            max_steps: if budgets.max_steps > 0 {
+                budgets.max_steps
+            } else {
+                self.agent.max_steps
+            },
+            max_tool_calls: if budgets.max_tool_calls > 0 {
+                budgets.max_tool_calls
+            } else {
+                self.agent.max_tool_calls
+            },
+            max_network_calls: if budgets.max_network_calls > 0 {
+                budgets.max_network_calls
+            } else {
+                self.agent.max_network_calls
+            },
+            requests_per_minute: if budgets.requests_per_minute > 0 {
+                budgets.requests_per_minute
+            } else {
+                self.agent.requests_per_minute
+            },
+            max_tokens: if budgets.max_tokens > 0 {
+                budgets.max_tokens
+            } else {
+                self.agent.max_estimated_tokens
+            },
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         let url = self.llm.base_url.trim();
         let (scheme, authority) = url
@@ -186,6 +257,28 @@ pub fn resolve_api_key(raw: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
+// Kept byte-for-byte identical to the CLI config parity test.
+#[cfg(test)]
+pub(crate) const POLICY_CONFIG: &str = r#"
+[llm]
+api_key = "test-key"
+
+[agent]
+mode = "full_auto"
+max_steps = 7
+
+[policy]
+allowed_tools = ["http_request", "dns_lookup"]
+denied_tools = ["shell"]
+allowed_targets = ["example.com"]
+denied_targets = ["evil.example.com"]
+max_steps_budget = 11
+max_tool_calls_budget = 22
+max_network_calls_budget = 33
+requests_per_minute_budget = 44
+max_tokens_budget = 55
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +323,53 @@ allow_intrusive = true
         assert!(reloaded.network.allow_network_write);
         assert!(reloaded.network.allow_intrusive);
         assert!(reloaded.agent.auto_approve_all);
+    }
+
+    #[test]
+    fn policy_section_matches_cli_layout() {
+        let cfg: AppConfig = toml::from_str(POLICY_CONFIG).expect("parse config");
+        cfg.validate().expect("validate config");
+        assert_eq!(cfg.policy.allowed_tools, ["http_request", "dns_lookup"]);
+        assert_eq!(cfg.policy.denied_tools, ["shell"]);
+        assert_eq!(cfg.policy.allowed_targets, ["example.com"]);
+        assert_eq!(cfg.policy.denied_targets, ["evil.example.com"]);
+        let budgets = cfg.policy.budgets();
+        assert_eq!(budgets.max_steps, 11);
+        assert_eq!(budgets.max_tool_calls, 22);
+        assert_eq!(budgets.max_network_calls, 33);
+        assert_eq!(budgets.requests_per_minute, 44);
+        assert_eq!(budgets.max_tokens, 55);
+
+        let saved = toml::to_string_pretty(&cfg).expect("serialize config");
+        let reloaded: AppConfig = toml::from_str(&saved).expect("reparse config");
+        assert_eq!(reloaded.policy.allowed_tools, cfg.policy.allowed_tools);
+        assert_eq!(reloaded.policy.denied_targets, cfg.policy.denied_targets);
+        assert_eq!(reloaded.policy.max_tokens_budget, 55);
+    }
+
+    #[test]
+    fn effective_budgets_prefer_policy_over_agent_scalars() {
+        let cfg: AppConfig = toml::from_str(POLICY_CONFIG).expect("parse config");
+        let effective = cfg.effective_budgets();
+        assert_eq!(effective.max_steps, 11);
+        assert_eq!(effective.max_tool_calls, 22);
+        assert_eq!(effective.max_network_calls, 33);
+        assert_eq!(effective.requests_per_minute, 44);
+        assert_eq!(effective.max_tokens, 55);
+
+        let fallback = AppConfig::default();
+        let effective = fallback.effective_budgets();
+        assert_eq!(effective.max_steps, fallback.agent.max_steps);
+        assert_eq!(effective.max_tool_calls, fallback.agent.max_tool_calls);
+        assert_eq!(
+            effective.max_network_calls,
+            fallback.agent.max_network_calls
+        );
+        assert_eq!(
+            effective.requests_per_minute,
+            fallback.agent.requests_per_minute
+        );
+        assert_eq!(effective.max_tokens, fallback.agent.max_estimated_tokens);
     }
 
     #[test]

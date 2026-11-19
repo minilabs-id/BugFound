@@ -1,0 +1,7 @@
+{"kind":"run_start","run_id":"run-1","engagement_id":"example-synthetic"}
+{"kind":"action","run_id":"run-1","tool":"http_probe","target":"127.0.0.1:8080/search","ok":true}
+{"kind":"tested","run_id":"run-1","type":"open redirect","verdict":"rejected"}
+{"kind":"finding","run_id":"run-1","id":"F-001","type":"reflected XSS","cwe":"CWE-79","verified":true}
+{"kind":"verifier","run_id":"run-1","finding_id":"F-001","type":"reflected XSS","cwe":"CWE-79","verified":true}
+{"kind":"usage","run_id":"run-1","prompt_tokens":1200,"completion_tokens":300}
+{"kind":"report","run_id":"run-1","sha256":"2222222222222222222222222222222222222222222222222222222222222222"}

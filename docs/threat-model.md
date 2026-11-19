@@ -4,11 +4,13 @@ Ruang lingkup: agent bug-bounty self-hosted, single-operator / small team,
 berjalan di container/VM dengan egress terbatas, memakai LLM OpenAI-compatible.
 ID merujuk ke temuan di `PRODUCTION_PLAN.md` §3 dan item H di `HARDENING_PLAN.md`.
 
-Status: F-01…F-05 (blocker P0 lama) **sudah ditutup di kode** dan tidak lagi
-dianggap open; bukti call site ada di evidence matrix `PRODUCTION_PLAN.md` §2.
-F-06…F-17 sedang dieksekusi lewat H-01…H-12; status akhir dicatat oleh integrator
-setelah verification gate (`PRODUCTION_PLAN.md` §4). Tabel di bawah memakai kolom
-"Rujukan" untuk item hardening, bukan klaim "selesai" yang belum diverifikasi.
+Status: F-01…F-05 (blocker P0 lama) **ditutup di kode**, lalu diperketat lagi
+oleh pass B1–B14 (capture bytes + canary, `allowed_methods`, parser host numerik,
+proxy `0.0.0.0`, scope adapter); bukti call site ada di evidence matrix
+`PRODUCTION_PLAN.md` §2 dan ringkasan di `REMAINING_GAPS.md` §2. F-06…F-17
+ditutup lewat H-01…H-12; status akhir tetap dicatat oleh integrator setelah
+verification gate (`PRODUCTION_PLAN.md` §4). Kolom "Rujukan" merujuk ke item
+hardening, bukan klaim "selesai" yang belum diverifikasi.
 
 ## Mitigasi lintas (deployment)
 
@@ -18,11 +20,11 @@ dari environment bukan dari image. Rincian ada di `deployment.md`.
 
 | ID | Aset | Ancaman | Mitigasi di kode | Risiko residual | Rujukan |
 | --- | --- | --- | --- | --- | --- |
-| F-01 | Integritas host & workspace | `shell_exec` bisa jadi RCE lewat `git`/`cargo`/alias shell dan akses file di luar cwd | `shell_exec` risk `exec`, allowlist ketat hanya `echo`/`whoami`, env tanpa HOME/USERPROFILE, argumen divalidasi; `ExternalCommandTool` argv tanpa shell + scope check | Sedang — allowlist bukan sandbox; isolasi host tetap disarankan | TC-1, TC-7 |
-| F-02 | Validasi alamat & jalur egress | DNS pinning kalah saat proxy aktif → DNS rebinding / TOCTOU | `HttpRequestTool` memakai `dns_overrides`, `no_proxy`, blokir IP private/reserved | Sedang — proxy eksplisit tetap harus diaudit operator | H-02, H-12 (matrix #7) |
-| F-03 | Budget & kuota sesi | Counter in-memory reset saat resume/restart → limit efektif unbounded | Tabel `session_budgets`, `ensure_budget`/`budget_usage`, step index durable | Rendah — verifikasi ulang concurrency saat integrasi | H-01 (matrix #3) |
-| F-04 | Approval & session claim | Dua proses `approve` bisa sama-sama mengklaim & menjalankan aksi | `resolve_approval` berpredikat `status='pending'`, `claim_session`/`transition_state_owned` conditional + owner/lease | Rendah — race lintas proses diuji via tes store | H-01, H-10 (matrix #1, #2) |
-| F-05 | Kredensial & data sensitif | Secret bocor via JSON `"api_key"`, `Set-Cookie`, multi-`Bearer`, report/CLI/event/tool output | Satu `redact` dipakai di `report()`, CLI, event, dan output tool | Rendah — redaction berbasis pola, bukan jaminan semantik penuh | H-01 (matrix #8) |
+| F-01 | Integritas host & workspace | `shell_exec` bisa jadi RCE lewat `git`/`cargo`/alias shell dan akses file di luar cwd | `shell_exec` risk `exec`, allowlist ketat hanya `echo`/`whoami`, env tanpa HOME/USERPROFILE, argumen divalidasi; `ExternalCommandTool` argv tanpa shell + scope check; adapter external kini kena scope untuk semua placeholder dan process tree di-kill saat timeout; goal lock SHA-256 + deteksi injeksi | Sedang — allowlist bukan sandbox; isolasi host tetap disarankan | TC-1, TC-7, B9, B10, B12 |
+| F-02 | Validasi alamat & jalur egress | DNS pinning kalah saat proxy aktif → DNS rebinding / TOCTOU | `HttpRequestTool` memakai `dns_overrides`, `no_proxy`, blokir IP private/reserved; proxy menolak `0.0.0.0`; `DnsLookupTool` memakai `ToolOptions` (scope + IP blokir); parser host numerik ketat (hex/oktal/desimal); `trusted_local_targets` hanya bypass blok sintaktik, IP tetap diverifikasi | Sedang — proxy eksplisit tetap harus diaudit operator | H-02, H-12 (matrix #7), B6, B7, B8 |
+| F-03 | Budget & kuota sesi | Counter in-memory reset saat resume/restart → limit efektif unbounded | Tabel `session_budgets`, `ensure_budget`/`budget_usage`, step index durable; alias budget dari config CLI/desktop diteruskan; flag stop dihapus fisik saat resume sehingga tidak re-abort | Rendah — verifikasi ulang concurrency saat integrasi | H-01 (matrix #3), B2, B13 |
+| F-04 | Approval & session claim | Dua proses `approve` bisa sama-sama mengklaim & menjalankan aksi | `resolve_approval` berpredikat `status='pending'` + cek expiry; `park_with_approval` menyatukan approval + pending calls + park dalam satu transaksi; `claim_session`/`transition_state_owned` conditional + owner/lease; `expire_stale_approvals()` saat startup | Rendah — race lintas proses diuji via tes store | H-01, H-10 (matrix #1, #2), B3, B11 |
+| F-05 | Kredensial & data sensitif | Secret bocor via JSON `"api_key"`, `Set-Cookie`, multi-`Bearer`, report/CLI/event/tool output | Satu `redact` dipakai di `report()`, CLI, event, dan output tool; bukti berupa bytes mentah + canary disimpan lewat `attach_capture`/`get_capture`, bukan field yang diberikan LLM | Rendah — redaction berbasis pola, bukan jaminan semantik penuh | H-01 (matrix #8), B1 |
 | F-06 | Jaringan internal / metadata cloud | Blokir IP belum mencakup 6to4/Teredo/NAT64 | Blokir IPv4 private + sebagian IPv6 di `HttpRequestTool` | Sedang — matrix IPv6 perlu diverifikasi | H-12 (matrix #7) |
 | F-07 | State machine sesi | Recovery dapat menimpa state `interrupted`/live menjadi `completed` | `transition_state_owned` + owner/lease guard di store | Rendah — pastikan semua transisi melewati guard | H-03 (matrix #1) |
 | F-08 | Batch tool call | `[A, B, C]`: A butuh approval → B/C hilang setelah resume | Batch deferred dipersist bersama approval | Sedang — uji `[ask, allow, allow]` saat integrasi | H-03 (matrix #1, #13) |
@@ -46,9 +48,29 @@ guardrail khusus engagement (ROE fail-closed, verifier deterministik, local-only
 | --- | --- | --- | --- | --- | --- |
 | F-19 | Ekstraksi ROE dari halaman program | **ROE extraction poisoning**: teks menyisipkan scope melebar / menekan aturan | Brief di-snapshot; `roe_overrides` + scope fail-closed; untrusted framing | Sedang — validasi deterministik harus dipakai sebelum tiap aksi jaringan | H-02 (matrix #14) |
 | F-20 | Halaman program / pemilihan target | **Login portal / honeypot** memicu probe tidak sah & finding palsu | Scope gate, verifier deterministik, local report only | Sedang — budget terbuang & finding palsu | H-04, H-11 |
-| F-21 | Validasi finding | **False positive dari LLM self-grading** | Verifier deterministik (`validate_poc`) sebagai gerbang; evidence SHA-256 | Rendah — self-graded finding ditolak | H-04, H-05 (matrix #9, #10) |
+| F-21 | Validasi finding | **False positive dari LLM self-grading** | Verifier deterministik membaca bytes tersimpan (`get_capture`) + canary oracle; `validate_poc` hanyalah tool, **bukan gerbang otoritatif**, dan difilter saat ROE melarang state change; evidence SHA-256 | Rendah — self-graded finding ditolak; penerimaan akhir tetap butuh review operator | H-04, H-05 (matrix #9, #10), B1, B5 |
 | F-22 | Kredensial lintas target | **Credential reuse across targets** | API key dari environment, redactor, cooldown per target | Sedang — rotasi kunci tetap tanggung jawab operator | H-01 (matrix #8) |
 | F-23 | Reasoning agent / halaman program | **Prompt injection dari program page** mengubah goal/scope | Goal lock + framing `<untrusted_tool_output>` + event hash chain | Sedang — tidak ada jalur auto-submit | H-02, H-05 (matrix #11) |
+
+### Ancaman yang ditutup oleh pass B1–B14
+
+Pass remaining-gap menambah kontrol berikut; detail implementasi ada di
+`REMAINING_GAPS.md` §2 dan kontrak di `B1_B14_FIX_PLAN.md`.
+
+| ID | Ancaman baru / residual | Mitigasi |
+| --- | --- | --- |
+| B1 | Verifier mempercayai field LLM, sehingga PoC palsu lolos | `attach_capture` / `get_capture`: request+response bytes dan canary disimpan tool, verifier mereplay bytes itu |
+| B2 | Resume menimpa flag stop sehingga sesi langsung abort lagi | `clear_session_flag` menghapus flag secara fisik saat resume |
+| B3 | Approval dan pending call tidak atomik, expiry tidak dicek | `park_with_approval` transaksional + `resolve_approval` cek expiry |
+| B4 | `http_request` mengirim method berubah state tanpa izin ROE | `ToolOptions.allowed_methods` ditegakkan `HttpRequestTool`; engagement tetap menyembunyikan tool bila `allow_state_change=false` |
+| B5 | Tool `validate_poc` dianggap otoritatif / dipakai tanpa izin state change | Risk `network-write`, difilter bila state change dilarang; keputusan akhir verifier + operator |
+| B6 | Obfuskasi host numerik (hex/oktal/desimal) menembus scope | Parser host ketat; `DnsLookupTool` memakai `ToolOptions` |
+| B7 | `trusted_local_targets` dipakai untuk bypass IP check | Bypass hanya sintaktik; IP hasil resolusi tetap diverifikasi |
+| B8 | Proxy `0.0.0.0` menyebabkan egress ke alamat tak terduga | Proxy menolak `0.0.0.0` |
+| B9/B10 | Adapter recon target melenceng / child process hidup setelah timeout | Revalidasi tiap target, scope semua placeholder, kill process tree |
+| B11 | `task_put`/`clue_put` hanya echo; approval basi tetap hidup | Persist ke tasks/clues; `expire_stale_approvals()` saat startup |
+| B12 | Goal bisa diubah prompt injection | Goal lock SHA-256 + detector regex |
+| B13/B14 | Replay tidak bisa diaudit / metrik tidak bisa dihitung | Trace events `run_start`/`action`/`finding`/`usage`/`verifier` + exporter; e2e cek isi report; tidak ada klaim baseline/performa |
 
 ### Pemetaan ancaman engagement ke guardrail
 
@@ -56,7 +78,7 @@ guardrail khusus engagement (ROE fail-closed, verifier deterministik, local-only
 | --- | --- | --- |
 | F-19 ROE poisoning | Scope parse + fail-closed + `roe_overrides` | Untrusted framing (F-17), re-approval saat scope berubah |
 | F-20 login portal / honeypot | Scope gate + fail-closed pada target ambigu | Verifier deterministik, local-only, egress isolation |
-| F-21 false positive self-grading | `validate_poc` sebagai gerbang penerimaan | Evidence hash, metrik presisi/FPR di evaluasi |
+| F-21 false positive self-grading | Verifier bytes + canary (`get_capture`), bukan argumen LLM | Evidence hash, `verifier` events, metrik presisi/FPR; `validate_poc` bukan otoritas, review operator tetap wajib |
 | F-22 credential reuse | Isolasi & larangan reuse kredensial lintas target | Redactor + env allowlist + rotasi |
 | F-23 prompt injection program page | Goal lock + untrusted framing + re-approval | Tanpa auto-submit, event hash chain, approval |
 
@@ -71,8 +93,8 @@ saat hardening. Steer dan wake-coalescing tidak diimplementasikan/diklaim
 
 ## Catatan pemetaan
 
-- F-01…F-05 tidak lagi open; bukti ada di evidence matrix. Finalisasi lewat
-  verification gate, bukan lewat teks status di dokumen ini.
+- F-01…F-05 tidak lagi open; bukti ada di evidence matrix dan diperkuat oleh
+  B1–B14. Finalisasi lewat verification gate, bukan lewat teks status di dokumen ini.
 - F-06…F-17 masuk eksekusi H-01…H-12; sampai diverifikasi, risiko residual di atas
   berlaku.
 - F-19…F-23 adalah ancaman khusus autonomous engagement. Guardrail wajibnya:

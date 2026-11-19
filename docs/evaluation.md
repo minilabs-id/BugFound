@@ -1,7 +1,9 @@
 # AgentBug Internal Benchmark Plan
 
-Status: internal plan. All benchmarks run against **local, licensed testbeds**. No live
-bug-bounty program is ever a benchmark target.
+Status: internal plan and operator-run harness, **not a set of recorded results**.
+All benchmarks run against **local, licensed testbeds**. No live bug-bounty
+program is ever a benchmark target. The plain-agent baseline in §5 and the
+performance/fuzz items in `REMAINING_GAPS.md` remain deferred.
 
 ## 1. Purpose
 
@@ -27,12 +29,18 @@ row in a DB, or a verifier script). Ground truth is never shown to the agent.
 
 1. Start the target testbed in the isolated network; confirm reachability.
 2. Create a task config in `eval/targets.example.yml` (URL, expected classes).
-3. Run the harness: `bash eval/run_benchmark.sh --execute` (dry-run is the default).
+3. Run the Windows driver `pwsh eval/run_benchmark.ps1 -Execute` (dry-run is the
+   default) or the POSIX driver `bash eval/run_benchmark.sh --execute`.
 4. Each run executes `agentbug engage --url <url> --cwd <workdir>` and writes a report
    under `eval/results/<target>/report.md`.
-5. Score with `python3 eval/score.py --dir eval/results`.
-6. Verify each reported finding against the ground-truth oracle; record verdicts.
-7. Produce a replay log (Cochise) for every run (see §6).
+5. The driver copies the engagement's `workspace/replay-<id>.jsonl` into the
+   result directory, exports SQLite `trace_events` with `eval/export_trace.py`,
+   joins the two into `eval/results/<target>/replay.jsonl`, and records `score.json`.
+6. Recompute with `python eval/score.py --dir eval/results/<target> --manifest
+   eval/results/<target>/manifest.json --replay eval/results/<target>/replay.jsonl
+   --json --strict`.
+7. Verify each reported finding against the ground-truth oracle; record verdicts.
+   A run without a replay log is not a valid result.
 
 ## 4. Metrics
 
@@ -64,13 +72,19 @@ reproducibility) versus raw discovery ability (recall, time-to-first-finding).
 
 ## 6. Replay logs (required)
 
-Every benchmark run must emit a deterministic **Cochise** replay log containing:
+Every benchmark run must emit a deterministic **Cochise-style** replay JSONL
+(`workspace/replay-<id>.jsonl`, copied and joined by the driver) containing:
 
-- program URL, brief snapshot, extracted scope/ROE, and fail-closed decisions;
-- ordered tool calls with redacted arguments and results;
-- HTTP request/response pairs and evidence hashes;
-- model prompts/completions (secrets redacted) and token counts;
-- lifecycle events (pause/resume/abort) and the final report hash.
+- `run_start` with `run_id` (run boundary), plus program URL and brief snapshot
+  context and fail-closed decisions;
+- `action` events for ordered tool calls with redacted arguments and results;
+- `finding` and `verifier` events with stored request/response bytes + canary and
+  evidence hashes — the verifier never trusts LLM-supplied evidence fields;
+- `usage` events with **real API token counts** (no `len/4` estimates);
+- `report` with the final report hash and lifecycle context (pause/abort).
+
+`eval/score.py` also accepts the older `event`-keyed engagement log and maps its
+`started` / `finding` / `report_ready` spellings to these kinds.
 
 Replay logs are used to (a) reproduce a finding, (b) audit why a false positive was
 produced, and (c) diff AgentBug against the baseline. A run without a replay log is not
@@ -98,6 +112,14 @@ Thresholds are provisional; recalibrate after the first full run and record the 
 ## 9. Artifacts
 
 - `eval/targets.example.yml` — target/testbed inventory.
-- `eval/run_benchmark.sh` — safe (dry-run by default) benchmark driver.
-- `eval/score.py` — stdlib-only Markdown report scorer.
-- `eval/results/` — generated reports and replay logs (gitignored).
+- `eval/run_benchmark.ps1` / `eval/run_benchmark.sh` — safe (dry-run by default) drivers.
+- `eval/export_trace.py` — stdlib SQLite `trace_events` → replay JSONL exporter.
+- `eval/score.py` — stdlib-only Markdown report scorer and metrics calculator.
+- `eval/e2e_test.ps1` — local wiring test: report sections + `score.py --strict`.
+- `eval/results/` — **tracked, operator-recorded** reports, manifests, replays and
+  scores; see `eval/results/README.md`. It is not gitignored. The `example-*`
+  fixture is documentation only and is skipped by `--dir` scans.
+
+No recall, precision, FPR or timing figure is claimed by this repository. The
+scorer emits `claim: scaffolding only — no benchmark results asserted`; only an
+operator's recorded result under `eval/results/` can be discussed as a measurement.

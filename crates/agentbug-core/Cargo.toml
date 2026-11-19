@@ -13,6 +13,9 @@ tracing.workspace = true
 uuid.workspace = true
 async-trait.workspace = true
 url.workspace = true
+sha2.workspace = true
+regex.workspace = true
+chrono.workspace = true
 agentbug-llm = { path = "../agentbug-llm" }
 agentbug-tools = { path = "../agentbug-tools" }
 agentbug-policy = { path = "../agentbug-policy" }

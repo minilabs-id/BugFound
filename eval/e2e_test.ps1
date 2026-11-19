@@ -6,12 +6,13 @@
 .DESCRIPTION
     Starts a loopback-only HTTP server serving a small program brief, runs the
     read-only brief ingestion path (`engage --brief-only`), then runs the normal
-    offline engagement so a report file is written, and asserts that the report
-    exists. No external network, no live program, no submission path.
+    offline engagement so a report file is written. Asserts that the report
+    exists, contains the seven required sections, and passes `score.py --strict`.
+    No external network, no live program, no submission path.
 
-    This is scaffolding: it validates wiring, not benchmark quality. It does not
-    assert any recall/precision result. Keep generated files under eval/work/
-    (gitignored); real benchmark artifacts belong in eval/results/.
+    This is a wiring/format smoke test, not a benchmark: it asserts no
+    recall/precision/FPR claim. Keep generated files under eval/work/
+    (gitignored); operator-recorded artifacts belong in eval/results/.
 #>
 [CmdletBinding()]
 param(
@@ -99,7 +100,35 @@ try {
         throw "no report file found under $workDir after engage"
     }
     Write-Host "[e2e] report exists: $($report.FullName)"
-    Write-Host "[e2e] PASS - wiring smoke test only; no benchmark result asserted."
+
+    # The canonical report must contain every section that score.py checks.
+    $reportText = Get-Content -LiteralPath $report.FullName -Raw
+    $requiredSections = @(
+        'Executive Summary', 'Scope & ROE', 'Methodology', 'Findings',
+        'Coverage', 'Timeline', 'Appendices'
+    )
+    $headings = [regex]::Matches($reportText, '(?m)^##\s+(.+?)\s*$') |
+        ForEach-Object { $_.Groups[1].Value.Trim() }
+    $missing = @($requiredSections | Where-Object {
+        $section = $_
+        -not ($headings | Where-Object {
+            $_ -eq $section -or ($section -eq 'Scope & ROE' -and $_ -eq 'Scope')
+        })
+    })
+    if ($missing.Count -gt 0) {
+        throw "report is missing required sections: $($missing -join ', ')"
+    }
+    Write-Host "[e2e] required sections present: $($requiredSections -join ', ')"
+
+    # Format gate: strict scoring checks sections and finding fields. This is a
+    # structural assertion only; no benchmark metric or threshold is claimed.
+    $scorer = Join-Path $scriptDir 'score.py'
+    & python $scorer $report.FullName --strict
+    $scoreExit = $LASTEXITCODE
+    if ($scoreExit -ne 0) {
+        throw "score.py --strict rejected the report (exit $scoreExit)"
+    }
+    Write-Host "[e2e] score.py --strict PASS (format only; no benchmark result)."
 } finally {
     $env:AGENTBUG_API_KEY = $savedApiKey
     $env:OPENAI_API_KEY = $savedOpenAiKey

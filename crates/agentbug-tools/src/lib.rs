@@ -5,12 +5,13 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use tokio::time::{sleep, timeout, Duration};
 
@@ -42,6 +43,36 @@ pub struct ToolResult {
     pub structured: Option<Value>,
 }
 
+/// Authoritative evidence captured from a real outbound HTTP exchange. The
+/// bytes here are stored by core, not trusted from LLM-visible text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpCapture {
+    pub request: String,
+    pub response: String,
+    pub canary: String,
+}
+
+impl HttpCapture {
+    pub fn as_value(&self) -> Value {
+        json!({
+            "request": self.request,
+            "response": self.response,
+            "canary": self.canary,
+        })
+    }
+}
+
+/// Extract `(request, response, canary)` from a tool's `structured` value.
+/// Accepts either the whole `structured` object (`{"capture": {...}}`) or the
+/// capture object itself.
+pub fn capture_from_structured(v: &Value) -> Option<(String, String, String)> {
+    let capture = v.get("capture").unwrap_or(v);
+    let request = capture.get("request")?.as_str()?.to_string();
+    let response = capture.get("response")?.as_str()?.to_string();
+    let canary = capture.get("canary")?.as_str()?.to_string();
+    Some((request, response, canary))
+}
+
 /// Operator-supplied policy for tool construction. Defaults keep the runner
 /// locked down (no proxy, no trusted local targets, no external tools).
 #[derive(Clone, Default)]
@@ -63,6 +94,10 @@ pub struct ToolOptions {
     pub user_agent: Option<String>,
     /// Hard cap on outgoing HTTP requests per second (ROE enforcement).
     pub max_rps: Option<u64>,
+    /// When set, only these HTTP methods may be issued (case-insensitive).
+    /// Enforced centrally in `HttpRequestTool::run`, so every HTTP-backed tool
+    /// (including `validate_poc` and `http_fuzz`) inherits the same gate.
+    pub allowed_methods: Option<Vec<String>>,
     /// Shared rolling window used by the rate limiter (Clone/Default friendly).
     pub rate_window: Arc<Mutex<VecDeque<Instant>>>,
 }
@@ -214,35 +249,90 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
     }
 }
 
+fn is_local_name(host: &str) -> bool {
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+}
+
+/// Parse one component of an IPv4 authority. Browsers accept decimal, `0x`
+/// hexadecimal and leading-zero octal numbers; all three must be decoded so a
+/// private address cannot be smuggled past the string checks.
+fn parse_ipv4_number(part: &str) -> Option<u64> {
+    if part.is_empty() {
+        return None;
+    }
+    if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    if part.len() > 1 && part.starts_with('0') {
+        return u64::from_str_radix(&part[1..], 8).ok();
+    }
+    part.parse::<u64>().ok()
+}
+
+/// Parse every numeric IPv4 spelling a URL authority may take: a single packed
+/// number (`2130706433`, `0x7f000001`, `017700000001`) or a dotted combination
+/// whose final component may carry more than one byte (`127.1`). Returns
+/// `None` for ordinary hostnames and IPv6 literals.
+fn parse_numeric_host_ipv4(host: &str) -> Option<IpAddr> {
+    let h = host.trim().trim_matches(['[', ']']).trim_end_matches('.');
+    let parts: Vec<&str> = h.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let values: Vec<u64> = parts
+        .iter()
+        .map(|p| parse_ipv4_number(p))
+        .collect::<Option<Vec<_>>>()?;
+    let last = values.len() - 1;
+    if values[..last].iter().any(|v| *v > u64::from(u8::MAX)) {
+        return None;
+    }
+    let trailing_bytes = 4 - last;
+    let max_last = u64::from(u32::MAX >> (8 * (4 - trailing_bytes)));
+    if values[last] > max_last {
+        return None;
+    }
+    let high = values[..last]
+        .iter()
+        .fold(0u32, |acc, v| (acc << 8) | *v as u32);
+    let ip = if trailing_bytes == 4 {
+        values[last] as u32
+    } else {
+        (high << (8 * trailing_bytes)) | values[last] as u32
+    };
+    Some(IpAddr::V4(Ipv4Addr::from(ip)))
+}
+
+/// Numeric-address checks that apply even to trusted names. A blocked address
+/// is only permitted when that exact IP (or its CIDR/prefix) is trusted.
+fn validate_numeric_host(host: &str, trusted: &[String]) -> Result<()> {
+    let h = normalize_host(host);
+    let Some(ip) = h
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| parse_numeric_host_ipv4(&h))
+    else {
+        return Ok(());
+    };
+    if is_blocked_ip(ip) && !ip_is_explicitly_trusted(ip, trusted) {
+        anyhow::bail!("private/reserved target address is not allowed: {ip}");
+    }
+    Ok(())
+}
+
 /// String-level checks that do not need DNS. Fail closed on anything ambiguous.
 fn validate_host_string(host: &str) -> Result<()> {
-    let h = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    let h = normalize_host(host);
     if h.is_empty() {
         anyhow::bail!("url has no host");
     }
-    if h == "localhost"
-        || h.ends_with(".localhost")
-        || h.ends_with(".local")
-        || h.ends_with(".internal")
-    {
+    if is_local_name(&h) {
         anyhow::bail!("local/metadata targets are not allowed");
     }
-    if let Ok(ip) = h.parse::<IpAddr>() {
-        if is_blocked_ip(ip) {
-            anyhow::bail!("private/reserved target address is not allowed: {ip}");
-        }
-        return Ok(());
-    }
-    // Decimal IP notation (e.g. 2130706433) bypasses naive string checks.
-    if h.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        if let Ok(n) = h.replace('.', "").parse::<u32>() {
-            let ip = IpAddr::V4(Ipv4Addr::from(n));
-            if is_blocked_ip(ip) {
-                anyhow::bail!("encoded private/reserved target address is not allowed: {ip}");
-            }
-        }
-    }
-    Ok(())
+    validate_numeric_host(&h, &[])
 }
 
 fn normalize_host(host: &str) -> String {
@@ -311,13 +401,29 @@ fn host_is_trusted(host: &str, trusted: &[String]) -> bool {
         .any(|entry| trusted_entry_matches(entry, &host))
 }
 
-/// Consult the explicit allowlist first; only then apply the default blocks.
-/// Local/metadata targets stay blocked unless an operator listed them.
+/// Whether an IP itself (not just a hostname resolving to it) was explicitly
+/// trusted by the operator. Trusted names do not authorise private IPs.
+fn ip_is_explicitly_trusted(ip: IpAddr, trusted: &[String]) -> bool {
+    let text = ip.to_string();
+    trusted
+        .iter()
+        .any(|entry| trusted_entry_matches(entry, &text))
+}
+
+/// Trust bypasses only the syntactic local-name block. Numeric addresses and
+/// every address returned by DNS are still verified independently.
 fn validate_host_with_options(host: &str, options: &ToolOptions) -> Result<()> {
-    if host_is_trusted(host, &options.trusted_local_targets) {
-        return Ok(());
+    let h = normalize_host(host);
+    if h.is_empty() {
+        anyhow::bail!("url has no host");
     }
-    validate_host_string(host)
+    let trusted = &options.trusted_local_targets;
+    if !host_is_trusted(&h, trusted) {
+        return validate_host_string(host);
+    }
+    // A trusted entry bypasses only the local-name block. Numeric addresses
+    // are still checked; only an explicitly trusted IP is exempt.
+    validate_numeric_host(&h, trusted)
 }
 
 /// Reduce a scope target to a comparable host string. URLs are reduced to
@@ -387,17 +493,28 @@ pub fn scope_target_allowed(target: &str, in_scope: &[String], out_of_scope: &[S
             .any(|entry| scope_entry_matches(entry, &target))
 }
 
-/// Resolve a trusted host without the public-address restriction. Only used
-/// for hosts the operator explicitly marked as trusted local targets.
-async fn resolve_trusted_host(host: &str) -> Result<std::net::SocketAddr> {
+/// Resolve a trusted host. Trust only bypasses the syntactic `.local`/
+/// `localhost` block; every returned address is still verified, and only an
+/// explicitly trusted IP is allowed to be private/reserved.
+async fn resolve_trusted_host(host: &str, options: &ToolOptions) -> Result<std::net::SocketAddr> {
     let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 0))
         .await
         .with_context(|| format!("resolve trusted host {host}"))?
         .collect();
-    addrs
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("trusted host resolved to no addresses: {host}"))
+    if addrs.is_empty() {
+        anyhow::bail!("trusted host resolved to no addresses: {host}");
+    }
+    for addr in &addrs {
+        if is_blocked_ip(addr.ip())
+            && !ip_is_explicitly_trusted(addr.ip(), &options.trusted_local_targets)
+        {
+            anyhow::bail!(
+                "trusted host resolved to a non-trusted private/reserved address: {}",
+                addr.ip()
+            );
+        }
+    }
+    Ok(addrs[0])
 }
 
 /// Resolve every address before connecting and pin the request to a validated IP.
@@ -714,8 +831,12 @@ async fn obey_rate_limit(options: &ToolOptions) {
 }
 
 /// Proxy configuration is operator-supplied and must stay local. Anything
-/// other than an http(s) proxy on a loopback host is rejected in `run()` so a
-/// bad configuration cannot silently route scoped traffic off-box.
+/// other than an http(s) proxy on a concrete loopback host is rejected in
+/// `run()` so a bad configuration cannot silently route scoped traffic off-box.
+/// `0.0.0.0` is rejected: it is a wildcard bind address, not a loopback
+/// destination. A configured proxy is a trusted egress boundary where DNS
+/// pinning does not apply, so scope and host validation are always enforced
+/// in code before a proxied request is issued.
 fn validate_proxy_url(options: &ToolOptions) -> Result<()> {
     if !options.allow_proxy {
         return Ok(());
@@ -736,10 +857,105 @@ fn validate_proxy_url(options: &ToolOptions) -> Result<()> {
         .trim_matches(['[', ']'])
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    if matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "0.0.0.0") {
+    if matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1") {
         Ok(())
     } else {
         anyhow::bail!("proxy_url host must be loopback, got '{host}'")
+    }
+}
+
+/// A fail-closed denial returned as a structured `ToolResult` rather than an
+/// error, so callers can inspect the machine-readable reason.
+fn denial_result(reason: &str, fields: Value) -> ToolResult {
+    let mut map = serde_json::Map::new();
+    map.insert("ok".into(), Value::Bool(false));
+    map.insert("error".into(), Value::String(reason.to_string()));
+    if let Value::Object(extra) = fields {
+        for (key, value) in extra {
+            map.insert(key, value);
+        }
+    }
+    ToolResult {
+        ok: false,
+        output: truncate(reason),
+        structured: Some(Value::Object(map)),
+    }
+}
+
+/// Render the outbound request in HTTP wire form. This is the authoritative
+/// request representation pinned into `HttpCapture`.
+fn build_request_repr(
+    method: &str,
+    url: &url::Url,
+    options: &ToolOptions,
+    headers: Option<&serde_json::Map<String, Value>>,
+    body: Option<&str>,
+) -> String {
+    let host = url.host_str().unwrap_or("");
+    let authority = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    let target = match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    };
+    let mut text = format!(
+        "{method} {target} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: {}\r\n",
+        options.user_agent.as_deref().unwrap_or("agentbug/0.1")
+    );
+    if let Some(headers) = headers {
+        for (name, value) in headers {
+            if let Some(value) = value.as_str() {
+                text.push_str(&format!("{name}: {value}\r\n"));
+            }
+        }
+    }
+    text.push_str("\r\n");
+    if let Some(body) = body {
+        text.push_str(body);
+    }
+    text
+}
+
+/// Render the selected response headers and capped body in HTTP wire form.
+fn build_response_repr(
+    status: u16,
+    headers: &serde_json::Map<String, Value>,
+    body: &str,
+) -> String {
+    let reason = reqwest::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|code| code.canonical_reason().map(str::to_string))
+        .unwrap_or_default();
+    let mut text = format!("HTTP/1.1 {status} {reason}\r\n");
+    for (name, value) in headers {
+        text.push_str(&format!("{}: {}\r\n", name, value.as_str().unwrap_or("")));
+    }
+    text.push_str("\r\n");
+    text.push_str(body);
+    text
+}
+
+/// Mint the capture canary from the exact request bytes plus a fresh nanosecond
+/// nonce. The nonce makes the token unguessable by the model: only the tool can
+/// mint one, and core stores the resulting bytes as evidence.
+fn canary_for(request: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut input = request.as_bytes().to_vec();
+    input.extend_from_slice(&nanos.to_be_bytes());
+    format!("agentbug-canary-{}", hex_encode(&Sha256::digest(&input)))
+}
+
+fn build_capture(request: String, response: String) -> HttpCapture {
+    let canary = canary_for(&request);
+    HttpCapture {
+        request,
+        response,
+        canary,
     }
 }
 
@@ -758,7 +974,7 @@ impl Tool for HttpRequestTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "http_request".into(),
-            description: "Perform an HTTP request to an in-scope target for reconnaissance/validation. Returns status, selected headers, and truncated body. Localhost/.local/metadata targets are blocked; engagement scope/policy is enforced by the agent.".into(),
+            description: "Perform an HTTP request to an in-scope target for reconnaissance/validation. Returns status, selected headers, a truncated body, and a byte-authoritative capture (request/response/canary). Localhost/.local/metadata targets are blocked; engagement scope and allowed_methods are enforced in code. A configured proxy is a trusted egress boundary where DNS pinning does not apply, so scope and host validation still run before any request.".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -783,6 +999,21 @@ impl Tool for HttpRequestTool {
             "http" | "https" => {}
             _ => anyhow::bail!("only http/https allowed"),
         }
+        let method = input
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET")
+            .to_ascii_uppercase();
+        // Central ROE method gate. Every HTTP-backed tool goes through this
+        // method, so the decision is inherited by validate_poc/http_fuzz/etc.
+        if let Some(allowed) = &self.options.allowed_methods {
+            if !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method)) {
+                return Ok(denial_result(
+                    "method_not_allowed",
+                    json!({"method": method, "allowed_methods": allowed}),
+                ));
+            }
+        }
         // Validate the proxy configuration and engagement scope before any
         // network work. Scope is enforced in code even when a proxy is in use,
         // because the DNS pin below does not apply to proxied requests.
@@ -797,7 +1028,7 @@ impl Tool for HttpRequestTool {
         let pinned_ip = if host.parse::<IpAddr>().is_ok() {
             None
         } else if host_is_trusted(host, &self.options.trusted_local_targets) {
-            Some(resolve_trusted_host(host).await?)
+            Some(resolve_trusted_host(host, &self.options).await?)
         } else {
             Some(resolve_public_ip(host).await?)
         };
@@ -817,11 +1048,6 @@ impl Tool for HttpRequestTool {
         } else {
             self.client.clone()
         };
-        let method = input
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("GET")
-            .to_uppercase();
         let timeout_ms = input
             .get("timeout_ms")
             .and_then(|v| v.as_u64())
@@ -834,7 +1060,12 @@ impl Tool for HttpRequestTool {
             "PUT" => client.put(parsed.clone()),
             "DELETE" => client.delete(parsed.clone()),
             "OPTIONS" => client.request(reqwest::Method::OPTIONS, parsed.clone()),
-            _ => anyhow::bail!("unsupported method"),
+            _ => {
+                return Ok(denial_result(
+                    "unsupported_method",
+                    json!({"method": method}),
+                ))
+            }
         };
         if let Some(hs) = input.get("headers").and_then(|v| v.as_object()) {
             for (k, v) in hs {
@@ -846,10 +1077,40 @@ impl Tool for HttpRequestTool {
         if let Some(body) = input.get("body").and_then(|v| v.as_str()) {
             req = req.body(body.to_string());
         }
+        // Build the authoritative request bytes before the send so both the
+        // success and error paths can pin the same evidence.
+        let request_repr = build_request_repr(
+            &method,
+            &parsed,
+            &self.options,
+            input.get("headers").and_then(|v| v.as_object()),
+            input.get("body").and_then(|v| v.as_str()),
+        );
         obey_rate_limit(&self.options).await;
-        let mut resp = timeout(Duration::from_millis(timeout_ms), req.send())
-            .await
-            .context("http timeout")??;
+        let mut resp = match timeout(Duration::from_millis(timeout_ms), req.send()).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(err)) => {
+                let message = redact(&err.to_string());
+                let capture = build_capture(request_repr, format!("(no response) {message}"));
+                let mut structured = json!({"ok": false, "error": message});
+                structured["capture"] = capture.as_value();
+                return Ok(ToolResult {
+                    ok: false,
+                    output: truncate(&format!("http request failed: {message}")),
+                    structured: Some(structured),
+                });
+            }
+            Err(_) => {
+                let capture = build_capture(request_repr, "(no response) http timeout".into());
+                let mut structured = json!({"ok": false, "error": "http timeout"});
+                structured["capture"] = capture.as_value();
+                return Ok(ToolResult {
+                    ok: false,
+                    output: "http timeout".into(),
+                    structured: Some(structured),
+                });
+            }
+        };
         let status = resp.status().as_u16();
         let mut headers = serde_json::Map::new();
         for (k, v) in resp.headers().iter().take(40) {
@@ -862,11 +1123,30 @@ impl Tool for HttpRequestTool {
             headers.insert(k.to_string(), Value::String(redact(&value)));
         }
         let (bytes, truncated) =
-            read_body_capped(&mut resp, Duration::from_millis(timeout_ms)).await?;
+            match read_body_capped(&mut resp, Duration::from_millis(timeout_ms)).await {
+                Ok(value) => value,
+                Err(err) => {
+                    let message = redact(&err.to_string());
+                    let capture = build_capture(
+                        request_repr,
+                        build_response_repr(status, &headers, &format!("(read error) {message}")),
+                    );
+                    let mut structured = json!({"ok": false, "status": status, "error": message});
+                    structured["capture"] = capture.as_value();
+                    return Ok(ToolResult {
+                        ok: false,
+                        output: truncate(&format!("http read failed: {message}")),
+                        structured: Some(structured),
+                    });
+                }
+            };
         let slice = &bytes[..bytes.len().min(MAX_HTTP_BODY_BYTES)];
         let body_text = redact(&String::from_utf8_lossy(slice));
+        let ok = (200..400).contains(&status);
+        // The plaintext output intentionally excludes `capture` so the canary
+        // is only carried in structured (where core can store the real bytes).
         let out = json!({
-            "ok": (200..400).contains(&status),
+            "ok": ok,
             "url": parsed.to_string(),
             "status": status,
             "headers": headers,
@@ -874,10 +1154,16 @@ impl Tool for HttpRequestTool {
             "body_truncated": truncated,
             "body_bytes": bytes.len()
         });
+        let capture = build_capture(
+            request_repr,
+            build_response_repr(status, &headers, &body_text),
+        );
+        let mut structured = out.clone();
+        structured["capture"] = capture.as_value();
         Ok(ToolResult {
-            ok: (200..400).contains(&status),
+            ok,
             output: truncate(&out.to_string()),
-            structured: Some(out),
+            structured: Some(structured),
         })
     }
 }
@@ -931,7 +1217,7 @@ impl Tool for ValidatePoCTool {
                 },
                 "required": ["finding_id", "url"]
             }),
-            risk: "network".into(),
+            risk: "network-write".into(),
         }
     }
 
@@ -994,7 +1280,7 @@ impl Tool for ValidatePoCTool {
         // authoritative oracle. Core runs an independent canary verifier and
         // is solely responsible for promoting a finding; this verdict never
         // changes finding state.
-        let structured = json!({
+        let mut structured = json!({
             "advisory": true,
             "finding_id": finding_id,
             "valid": valid,
@@ -1002,6 +1288,16 @@ impl Tool for ValidatePoCTool {
             "marker_found": marker_found,
             "url": url,
         });
+        // Forward the authoritative capture (and any ROE denial reason) from
+        // the replay so core can pin the exact bytes as finding evidence.
+        if let Some(http_structured) = response.structured.as_ref() {
+            if let Some(capture) = http_structured.get("capture") {
+                structured["capture"] = capture.clone();
+            }
+            if let Some(error) = http_structured.get("error") {
+                structured["error"] = error.clone();
+            }
+        }
         let output = if valid {
             format!(
                 "Advisory PoC result for finding {finding_id} ({url}): status {status}, marker found: {marker_found}. Independent verification required."
@@ -1022,10 +1318,20 @@ impl Tool for ValidatePoCTool {
 
 pub struct DnsLookupTool {
     timeout_ms: u64,
+    options: ToolOptions,
 }
 impl DnsLookupTool {
     pub fn new() -> Self {
-        Self { timeout_ms: 10000 }
+        Self::new_with_options(ToolOptions::default())
+    }
+
+    /// Construct the resolver with engagement scope and host policy. Both are
+    /// applied before the lookup, and every returned address is re-checked.
+    pub fn new_with_options(options: ToolOptions) -> Self {
+        Self {
+            timeout_ms: 10000,
+            options,
+        }
     }
 }
 impl Default for DnsLookupTool {
@@ -1061,6 +1367,19 @@ impl Tool for DnsLookupTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("missing host"))?;
         let host = host.trim();
+        let host_key = normalize_scope_target(host);
+        if !scope_target_allowed(&host_key, &self.options.scope_in, &self.options.scope_out) {
+            return Ok(denial_result(
+                "target_not_in_scope",
+                json!({"host": host, "target": host_key}),
+            ));
+        }
+        if let Err(err) = validate_host_with_options(&host_key, &self.options) {
+            return Ok(denial_result(
+                "host_not_allowed",
+                json!({"host": host, "reason": redact(&err.to_string())}),
+            ));
+        }
         let target = format!(
             "{}:0",
             host.trim_start_matches("http://")
@@ -1070,9 +1389,36 @@ impl Tool for DnsLookupTool {
         let addrs = tokio::time::timeout(std::time::Duration::from_millis(self.timeout_ms), fut)
             .await
             .context("dns timeout")??;
-        let mut ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
+        let mut ips: Vec<String> = Vec::new();
+        let mut blocked: Vec<String> = Vec::new();
+        for addr in addrs {
+            let ip = addr.ip();
+            if is_blocked_ip(ip)
+                && !ip_is_explicitly_trusted(ip, &self.options.trusted_local_targets)
+            {
+                blocked.push(ip.to_string());
+            }
+            ips.push(ip.to_string());
+        }
         ips.sort();
         ips.dedup();
+        blocked.sort();
+        blocked.dedup();
+        if !blocked.is_empty() {
+            return Ok(ToolResult {
+                ok: false,
+                output: truncate(&format!(
+                    "resolved {host} to blocked addresses: {}",
+                    blocked.join(", ")
+                )),
+                structured: Some(json!({
+                    "host": host,
+                    "ips": ips,
+                    "blocked_ips": blocked,
+                    "error": "blocked_ip",
+                })),
+            });
+        }
         let out = if ips.is_empty() {
             format!("no addresses resolved for {host}")
         } else {
@@ -1192,7 +1538,7 @@ impl Tool for SaveFindingTool {
         Ok(ToolResult {
             ok: true,
             output: truncate(&format!(
-                "finding recorded (pending persist): [{sev}] {title}"
+                "finding recorded (persisted by runner): [{sev}] {title}"
             )),
             structured: Some(input),
         })
@@ -1226,7 +1572,9 @@ impl Tool for RecordAssetTool {
         let value = input.get("value").and_then(|v| v.as_str()).unwrap_or("");
         Ok(ToolResult {
             ok: true,
-            output: truncate(&format!("asset recorded (pending persist): {kind}={value}")),
+            output: truncate(&format!(
+                "asset recorded (persisted by runner): {kind}={value}"
+            )),
             structured: Some(input),
         })
     }
@@ -1315,14 +1663,35 @@ impl Tool for EchoTool {
 pub struct PipelineTool {
     registry: ToolRegistry,
     cwd: PathBuf,
+    options: ToolOptions,
 }
 
 impl PipelineTool {
+    /// Compatibility constructor with an unconstrained policy. Callers that
+    /// own an engagement should prefer [`PipelineTool::from_filtered_registry`]
+    /// so intermediate targets are re-validated against its scope.
     pub fn new(registry: ToolRegistry, cwd: impl AsRef<Path>) -> Self {
+        Self::from_filtered_registry(registry, cwd, &ToolOptions::default())
+    }
+
+    /// Build a pipeline over an already filtered registry, carrying the
+    /// engagement policy so every intermediate target is re-checked.
+    pub fn from_filtered_registry(
+        registry: ToolRegistry,
+        cwd: impl AsRef<Path>,
+        options: &ToolOptions,
+    ) -> Self {
         Self {
             registry,
             cwd: cwd.as_ref().to_path_buf(),
+            options: options.clone(),
         }
+    }
+
+    /// Attach/replace the policy on an existing pipeline.
+    pub fn with_options(mut self, options: &ToolOptions) -> Self {
+        self.options = options.clone();
+        self
     }
 }
 
@@ -1359,6 +1728,13 @@ impl Tool for PipelineTool {
             let name = step
                 .as_str()
                 .ok_or_else(|| anyhow!("pipeline step names must be strings"))?;
+            // Re-validate on every step: an earlier tool may have produced an
+            // out-of-scope intermediate target from untrusted output.
+            if !scope_target_allowed(&target, &self.options.scope_in, &self.options.scope_out) {
+                anyhow::bail!("pipeline target '{target}' is not permitted by scope policy");
+            }
+            validate_host_with_options(&target, &self.options)
+                .with_context(|| format!("pipeline target '{target}' failed host validation"))?;
             let tool = self
                 .registry
                 .get(name)
@@ -1536,6 +1912,32 @@ impl ExternalCommandTool {
     }
 }
 
+/// Kill a timed-out adapter and every process it spawned. On Windows
+/// `taskkill /T /F` walks the process tree. On Unix the child is started as a
+/// process-group leader, so `kill(-pid)` signals the whole group; the direct
+/// child is killed afterwards as a best-effort fallback and reaped.
+fn kill_process_tree(child: &mut tokio::process::Child) {
+    let Some(pid) = child.id().map(|pid| pid.to_string()) else {
+        return;
+    };
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid, "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .arg(format!("-{pid}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 #[async_trait]
 impl Tool for ExternalCommandTool {
     fn spec(&self) -> ToolSpec {
@@ -1568,15 +1970,20 @@ impl Tool for ExternalCommandTool {
             }
         }
         let cwd = resolve_cwd(&self.cwd).unwrap_or_else(|_| self.cwd.clone());
-        let mut child = Command::new(&self.command)
+        let mut command = Command::new(&self.command);
+        command
             .args(&args)
             .current_dir(cwd)
             .env_clear()
             .envs(safe_process_env())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawn external command")?;
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().context("spawn external command")?;
         // Poll for completion instead of spawn_blocking(output()): on timeout
         // we can now kill and reap the child rather than leaving it running.
         let deadline = Instant::now() + self.timeout;
@@ -1585,6 +1992,8 @@ impl Tool for ExternalCommandTool {
                 Some(_) => break child.wait_with_output().await.context("collect output")?,
                 None => {
                     if Instant::now() >= deadline {
+                        kill_process_tree(&mut child);
+                        // Fallback for the direct child (also reaps it).
                         let _ = child.kill().await;
                         anyhow::bail!("external command timeout");
                     }
@@ -1631,19 +2040,23 @@ pub fn try_default_registry_with_options(
     reg.register(Arc::new(FsWriteTool::new(cwd)?));
     reg.register(Arc::new(ShellExecTool::new(cwd)?));
     reg.register(Arc::new(HttpRequestTool::with_options(options.clone())));
-    reg.register(Arc::new(DnsLookupTool::new()));
+    reg.register(Arc::new(DnsLookupTool::new_with_options(options.clone())));
     reg.register(Arc::new(SaveFindingTool));
     reg.register(Arc::new(RecordAssetTool));
     reg.register(Arc::new(SaveArtifactTool::new(cwd)?));
     reg.register(Arc::new(EchoTool));
     reg.register(Arc::new(ValidatePoCTool::with_options(options.clone())));
     if options.enable_external_tools {
-        reg.register(Arc::new(PipelineTool::new(reg.clone(), cwd)));
+        reg.register(Arc::new(PipelineTool::from_filtered_registry(
+            reg.clone(),
+            cwd,
+            &options,
+        )));
     }
     // Aliases for convenience / common tool names.
     let fs_read = Arc::new(FsReadTool::new(cwd)?);
     let fs_write = Arc::new(FsWriteTool::new(cwd)?);
-    let dns = Arc::new(DnsLookupTool::new());
+    let dns = Arc::new(DnsLookupTool::new_with_options(options.clone()));
     reg.register_alias("read_file", fs_read.clone());
     reg.register_alias("read", fs_read);
     reg.register_alias("fs_write", fs_write.clone());
@@ -2999,7 +3412,7 @@ impl Tool for TaskPutTool {
         Ok(ToolResult {
             ok: true,
             output: truncate(&format!(
-                "task queued (pending persist): {}",
+                "task queued (persisted by runner): {}",
                 task["statement"]
             )),
             structured: Some(json!({"ok": true, "task": task})),
@@ -3039,7 +3452,10 @@ impl Tool for CluePutTool {
         });
         Ok(ToolResult {
             ok: true,
-            output: truncate(&format!("clue queued (pending persist): {}", clue["key"])),
+            output: truncate(&format!(
+                "clue queued (persisted by runner): {}",
+                clue["key"]
+            )),
             structured: Some(json!({"ok": true, "clue": clue})),
         })
     }
@@ -3737,7 +4153,6 @@ mod tests {
             "http://127.0.0.1:3128",
             "http://localhost:8080",
             "http://[::1]:3128",
-            "https://0.0.0.0:443",
         ] {
             let options = ToolOptions {
                 allow_proxy: true,
@@ -3747,6 +4162,8 @@ mod tests {
             assert!(validate_proxy_url(&options).is_ok(), "{url}");
         }
         for url in [
+            "https://0.0.0.0:443",
+            "http://0.0.0.0:3128",
             "ftp://127.0.0.1:21",
             "http://evil.example.com:8080",
             "http://192.168.1.10:8080",
@@ -3805,7 +4222,7 @@ mod tests {
     fn validate_poc_tool_has_expected_spec() {
         let spec = ValidatePoCTool::new().spec();
         assert_eq!(spec.name, "validate_poc");
-        assert_eq!(spec.risk, "network");
+        assert_eq!(spec.risk, "network-write");
         assert_eq!(spec.input_schema["required"], json!(["finding_id", "url"]));
         assert!(spec.input_schema["properties"]["finding_id"].is_object());
         assert!(spec.input_schema["properties"]["headers"].is_object());
@@ -4485,6 +4902,239 @@ mod tests {
             "{raw}"
         );
         assert!(raw.contains("hello=world"), "{raw}");
+    }
+
+    // ---- B1: allowed_methods gate -------------------------------------------
+
+    #[tokio::test]
+    async fn allowed_methods_are_enforced_centrally_and_case_insensitively() {
+        let options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            allowed_methods: Some(vec!["get".to_string(), "HEAD".to_string()]),
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+
+        let denied = tool
+            .run(json!({"url": "http://127.0.0.1:9/", "method": "POST"}))
+            .await
+            .unwrap();
+        assert!(!denied.ok);
+        let data = denied.structured.unwrap();
+        assert_eq!(data["error"], json!("method_not_allowed"));
+        assert_eq!(data["method"], json!("POST"));
+
+        let (url, server) = serve_once("ok".to_string()).await;
+        let allowed = tool
+            .run(json!({"url": url, "method": "get"}))
+            .await
+            .unwrap();
+        assert!(allowed.ok, "lowercase get should be accepted");
+        server.await.unwrap();
+    }
+
+    // ---- B2: authoritative capture ------------------------------------------
+
+    #[test]
+    fn capture_from_structured_extracts_all_parts() {
+        let value = json!({"capture": {"request": "r", "response": "s", "canary": "c"}});
+        assert_eq!(
+            capture_from_structured(&value).unwrap(),
+            (String::from("r"), String::from("s"), String::from("c"))
+        );
+        assert_eq!(capture_from_structured(&json!({"capture": {}})), None);
+        // The capture object itself is accepted too.
+        let direct = json!({"request": "r", "response": "s", "canary": "c"});
+        assert!(capture_from_structured(&direct).is_some());
+    }
+
+    #[tokio::test]
+    async fn http_capture_records_request_response_and_canary() {
+        let (url, server) = serve_once("body-marker".to_string()).await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": url,
+                "method": "POST",
+                "headers": {"X-Trace": "abc"},
+                "body": "k=v"
+            }))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let structured = result.structured.unwrap();
+        let (request, response, canary) = capture_from_structured(&structured).unwrap();
+        assert!(canary.starts_with("agentbug-canary-"));
+        assert_eq!(canary.len(), "agentbug-canary-".len() + 64);
+        assert!(request.contains("POST / HTTP/1.1"), "{request}");
+        assert!(request.contains("X-Trace: abc"), "{request}");
+        assert!(request.contains("k=v"), "{request}");
+        assert!(response.contains("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("body-marker"), "{response}");
+        // The canary must stay out of the plaintext (LLM-visible) output.
+        assert!(!result.output.contains(&canary));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_transport_error_still_carries_capture() {
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        // Port 9 has no listener: the connection fails before any response.
+        let result = tool
+            .run(json!({"url": "http://127.0.0.1:9/"}))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        let structured = result.structured.unwrap();
+        let (request, response, canary) = capture_from_structured(&structured).unwrap();
+        assert!(request.contains("GET / HTTP/1.1"), "{request}");
+        assert!(response.contains("(no response)"), "{response}");
+        assert!(canary.starts_with("agentbug-canary-"));
+    }
+
+    // ---- B3/B4/B5: DNS, numeric hosts and trusted-target verification --------
+
+    #[tokio::test]
+    async fn dns_lookup_enforces_scope_and_rejects_blocked_addresses() {
+        let scoped = DnsLookupTool::new_with_options(ToolOptions {
+            scope_in: vec!["example.com".to_string()],
+            ..ToolOptions::default()
+        });
+        let denied = scoped.run(json!({"host": "evil.org"})).await.unwrap();
+        assert!(!denied.ok);
+        assert_eq!(
+            denied.structured.unwrap()["error"],
+            json!("target_not_in_scope")
+        );
+
+        // A trusted hostname clears the syntactic block, but its loopback
+        // address must still fail the independent IP check.
+        let trusted = DnsLookupTool::new_with_options(ToolOptions {
+            trusted_local_targets: vec!["localhost".to_string()],
+            ..ToolOptions::default()
+        });
+        let blocked = trusted.run(json!({"host": "localhost"})).await.unwrap();
+        assert!(!blocked.ok);
+        let data = blocked.structured.unwrap();
+        assert_eq!(data["error"], json!("blocked_ip"));
+        assert!(data["blocked_ips"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|ip| ip == "127.0.0.1" || ip == "::1"));
+    }
+
+    #[test]
+    fn numeric_host_forms_are_normalized_and_blocked() {
+        for host in [
+            "127.0.0.1",
+            "2130706433",
+            "0x7f000001",
+            "0x7f.0x0.0x0.0x1",
+            "0177.0.0.1",
+            "127.1",
+            "0.0.0.0",
+            "0x0a0a0001", // 10.10.0.1
+            "012.0.0.1",  // 10.0.0.1
+        ] {
+            assert!(validate_host_string(host).is_err(), "{host}");
+            assert!(
+                validate_host_with_options(host, &ToolOptions::default()).is_err(),
+                "{host}"
+            );
+        }
+        // Public forms, including hex, remain reachable.
+        assert!(validate_host_string("8.8.8.8").is_ok());
+        assert!(validate_host_string("0x8.8.8.8").is_ok());
+        assert!(validate_host_string("example.com").is_ok());
+    }
+
+    #[tokio::test]
+    async fn trusted_host_still_verifies_resolved_ips() {
+        let options = ToolOptions {
+            trusted_local_targets: vec!["localhost".to_string()],
+            ..ToolOptions::default()
+        };
+        // A trusted name must not authorise the private IP DNS returns for it.
+        assert!(resolve_trusted_host("localhost", &options).await.is_err());
+
+        let ip_options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            ..ToolOptions::default()
+        };
+        assert!(validate_host_with_options("127.0.0.1", &ip_options).is_ok());
+        assert!(validate_host_with_options("10.0.0.1", &ip_options).is_err());
+        let resolved = resolve_trusted_host("127.0.0.1", &ip_options)
+            .await
+            .unwrap();
+        assert_eq!(resolved.ip().to_string(), "127.0.0.1");
+    }
+
+    // ---- B7/B9: pipeline revalidation and PoC capture ------------------------
+
+    #[tokio::test]
+    async fn pipeline_revalidates_every_intermediate_target() {
+        let dir = std::env::temp_dir().join(format!("mbt-pipe-scope-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(StepTool));
+        let options = ToolOptions {
+            scope_in: vec!["example.com".to_string()],
+            ..ToolOptions::default()
+        };
+        let tool = PipelineTool::from_filtered_registry(registry, &dir, &options);
+        // Step 1 receives the in-scope target; StepTool emits
+        // "value-example.com", which is not under example.com and must be
+        // rejected before step 2 spawns.
+        let err = tool
+            .run(json!({"steps": ["step", "step"], "target": "example.com"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("scope policy"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn validate_poc_forwards_capture_and_inherits_method_gate() {
+        let options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            allowed_methods: Some(vec!["GET".to_string()]),
+            ..ToolOptions::default()
+        };
+        let tool = ValidatePoCTool::with_options(options);
+        let denied = tool
+            .run(json!({
+                "finding_id": "f-1",
+                "url": "http://127.0.0.1:9/",
+                "method": "POST"
+            }))
+            .await
+            .unwrap();
+        assert!(!denied.ok);
+        assert_eq!(
+            denied.structured.unwrap()["error"],
+            json!("method_not_allowed")
+        );
+
+        let (url, server) = serve_once("marker".to_string()).await;
+        let tool = ValidatePoCTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "finding_id": "f-2",
+                "url": url,
+                "method": "GET",
+                "expected_status": 200,
+                "marker": "marker"
+            }))
+            .await
+            .unwrap();
+        let data = result.structured.unwrap();
+        assert_eq!(data["valid"], json!(true));
+        let (request, response, canary) = capture_from_structured(&data).unwrap();
+        assert!(canary.starts_with("agentbug-canary-"));
+        assert!(request.contains("GET /"));
+        assert!(response.contains("marker"));
+        server.await.unwrap();
     }
 
     fn uuid_like() -> String {

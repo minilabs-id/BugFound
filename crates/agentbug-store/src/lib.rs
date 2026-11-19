@@ -194,6 +194,17 @@ pub struct PendingCall {
     pub args_json: String,
 }
 
+/// Authoritative, tool-captured request/response bytes for a finding. The
+/// verifier reads this rather than trusting LLM-supplied evidence fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCapture {
+    pub finding_id: String,
+    pub request_bytes: Vec<u8>,
+    pub response_bytes: Vec<u8>,
+    pub canary: String,
+    pub created_at: String,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -314,6 +325,10 @@ impl Store {
              CREATE TABLE IF NOT EXISTS session_flags(
                session_id TEXT NOT NULL, flag TEXT NOT NULL, created_at TEXT NOT NULL,
                PRIMARY KEY(session_id,flag)
+             );
+             CREATE TABLE IF NOT EXISTS tool_captures(
+               finding_id TEXT PRIMARY KEY, request_bytes BLOB NOT NULL,
+               response_bytes BLOB NOT NULL, canary TEXT NOT NULL, created_at TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
              CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
@@ -711,24 +726,31 @@ impl Store {
             expires_at: Some(expires_at),
         };
         let conn = self.conn.lock().unwrap();
+        Self::insert_approval(&conn, &a)?;
+        Ok(a)
+    }
+
+    /// Insert an approval row inside an existing transaction. Shared by the
+    /// single-approval API and the atomic park path.
+    fn insert_approval(conn: &Connection, approval: &Approval) -> Result<()> {
         conn.execute(
             "INSERT INTO approvals(id,session_id,action,status,reason,tool_name,args_json,risk,created_at,tool_call_id,expires_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
-                a.id,
-                a.session_id,
-                a.tool_name,
-                a.status,
-                a.reason,
-                a.tool_name,
-                a.args_json,
-                a.risk,
-                a.created_at,
-                a.tool_call_id,
-                a.expires_at,
+                approval.id,
+                approval.session_id,
+                approval.tool_name,
+                approval.status,
+                approval.reason,
+                approval.tool_name,
+                approval.args_json,
+                approval.risk,
+                approval.created_at,
+                approval.tool_call_id,
+                approval.expires_at,
             ],
         )?;
-        Ok(a)
+        Ok(())
     }
 
     pub fn get_pending_approval(&self, session_id: &str) -> Result<Option<Approval>> {
@@ -799,14 +821,15 @@ impl Store {
         Ok(affected)
     }
 
-    /// Resolve an approval only if it is still pending. Two concurrent
-    /// resolvers cannot both approve the same action.
+    /// Resolve an approval only if it is still pending and unexpired. Two
+    /// concurrent resolvers cannot both approve the same action.
     pub fn resolve_approval(&self, id: &str, status: &str, reason: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let affected = conn.execute(
             "UPDATE approvals SET status=?2, reason=COALESCE(?3, reason)
-             WHERE id=?1 AND status='pending'",
-            params![id, status, reason],
+             WHERE id=?1 AND status='pending'
+               AND (expires_at IS NULL OR expires_at > ?4)",
+            params![id, status, reason, now()],
         )?;
         if affected == 0 {
             return Err(anyhow::anyhow!(
@@ -1112,6 +1135,88 @@ impl Store {
         let mut out = vec![];
         for r in rows {
             out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Attach authoritative raw tool bytes for a finding. Re-attaching replaces
+    /// the prior capture so retrying a tool call cannot leave stale evidence.
+    pub fn attach_capture(
+        &self,
+        finding_id: &str,
+        request: &[u8],
+        response: &[u8],
+        canary: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tool_captures(finding_id,request_bytes,response_bytes,canary,created_at)
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(finding_id) DO UPDATE SET
+               request_bytes=excluded.request_bytes, response_bytes=excluded.response_bytes,
+               canary=excluded.canary, created_at=excluded.created_at",
+            params![finding_id, request, response, canary, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Read the authoritative bytes recorded for a finding, if any.
+    pub fn get_capture(&self, finding_id: &str) -> Result<Option<ToolCapture>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT finding_id,request_bytes,response_bytes,canary,created_at
+             FROM tool_captures WHERE finding_id=?1",
+        )?;
+        let row = stmt
+            .query_row(params![finding_id], |r| {
+                Ok(ToolCapture {
+                    finding_id: r.get(0)?,
+                    request_bytes: r.get(1)?,
+                    response_bytes: r.get(2)?,
+                    canary: r.get(3)?,
+                    created_at: r.get(4)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Findings with the given status for a session, oldest first.
+    pub fn list_findings_by_status(&self, session_id: &str, status: &str) -> Result<Vec<Finding>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash,validated_at,validation_detail
+             FROM findings WHERE session_id=?1 AND status=?2 ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id, status], |r| {
+            Ok(Finding {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                title: r.get(2)?,
+                severity: r.get(3)?,
+                asset: r.get(4)?,
+                vuln_type: r.get(5)?,
+                description: r.get(6)?,
+                reproduction: r.get(7)?,
+                impact: r.get(8)?,
+                remediation: r.get(9)?,
+                evidence: r.get(10)?,
+                status: r.get(11)?,
+                created_at: r.get(12)?,
+                updated_at: r.get(13)?,
+                request: r.get(14)?,
+                response: r.get(15)?,
+                cvss: r.get(16)?,
+                cwe: r.get(17)?,
+                dedupe_key: r.get(18)?,
+                evidence_hash: r.get(19)?,
+                validated_at: r.get(20)?,
+                validation_detail: r.get(21)?,
+            })
+        })?;
+        let mut out = vec![];
+        for row in rows {
+            out.push(row?);
         }
         Ok(out)
     }
@@ -1462,6 +1567,17 @@ impl Store {
         calls: &[(Option<&str>, &str, S)],
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        Self::insert_pending_calls(&conn, session_id, approval_id, calls)
+    }
+
+    /// Insert deferred tool calls inside an existing transaction. Shared by
+    /// the standalone API and the atomic park path.
+    fn insert_pending_calls<S: AsRef<str>>(
+        conn: &Connection,
+        session_id: &str,
+        approval_id: &str,
+        calls: &[(Option<&str>, &str, S)],
+    ) -> Result<()> {
         for (seq, (tool_call_id, name, args_json)) in calls.iter().enumerate() {
             conn.execute(
                 "INSERT INTO pending_tool_calls(id,session_id,approval_id,tool_call_id,name,args_json,seq)
@@ -1478,6 +1594,60 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+
+    /// Park a session behind an approval in a single SQLite transaction: the
+    /// approval row, the deferred tool calls, and the guarded state change all
+    /// commit together or none of them do.
+    pub fn park_with_approval(
+        &self,
+        approval: &Approval,
+        tail: &[(Option<&str>, &str, &str)],
+        session_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            // The parked approval must be pending and carry a TTL even when the
+            // caller supplied a partially populated Approval value.
+            let row = Approval {
+                id: approval.id.clone(),
+                session_id: approval.session_id.clone(),
+                tool_name: approval.tool_name.clone(),
+                args_json: approval.args_json.clone(),
+                risk: approval.risk.clone(),
+                status: "pending".to_string(),
+                reason: approval.reason.clone(),
+                created_at: if approval.created_at.is_empty() {
+                    now()
+                } else {
+                    approval.created_at.clone()
+                },
+                tool_call_id: approval.tool_call_id.clone(),
+                expires_at: Some(match &approval.expires_at {
+                    Some(expires_at) => expires_at.clone(),
+                    None => (Utc::now() + Duration::seconds(900)).to_rfc3339(),
+                }),
+            };
+            Self::insert_approval(&conn, &row)?;
+            Self::insert_pending_calls(&conn, session_id, &row.id, tail)?;
+            conn.execute(
+                "UPDATE sessions SET state='waiting_approval', owner_id=NULL,
+                 lease_expires_at=NULL, updated_at=?2 WHERE id=?1",
+                params![session_id, now()],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Take (and remove) the pending tail in one transaction so a resumed run
@@ -1712,6 +1882,17 @@ impl Store {
         conn.execute(
             "INSERT OR IGNORE INTO session_flags(session_id,flag,created_at) VALUES(?1,?2,?3)",
             params![session_id, flag, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Physically remove a session flag so a resumed run does not re-trigger
+    /// the behavior it guarded (for example a stop/pause flag).
+    pub fn clear_session_flag(&self, session_id: &str, flag: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM session_flags WHERE session_id=?1 AND flag=?2",
+            params![session_id, flag],
         )?;
         Ok(())
     }
@@ -3469,5 +3650,248 @@ mod tests {
         assert!(verified.contains(&confirmed.id));
         assert!(!verified.contains(&open.id));
         assert!(!verified.contains(&rejected.id));
+    }
+
+    #[test]
+    fn tool_capture_round_trip_and_tamper() {
+        let store = Store::open(":memory:").unwrap();
+        let session = store.create_session("g").unwrap();
+        let finding = store
+            .add_finding(
+                &session.id,
+                "SSRF",
+                "high",
+                None,
+                None,
+                "desc",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(store.get_capture(&finding.id).unwrap().is_none());
+        assert!(store.get_capture("unknown").unwrap().is_none());
+
+        let request = b"GET /probe HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let response = b"HTTP/1.1 200 OK\r\n\r\ncanary-42";
+        store
+            .attach_capture(&finding.id, request, response, "canary-42")
+            .unwrap();
+        let capture = store.get_capture(&finding.id).unwrap().unwrap();
+        assert_eq!(capture.finding_id, finding.id);
+        assert_eq!(capture.request_bytes, request);
+        assert_eq!(capture.response_bytes, response);
+        assert_eq!(capture.canary, "canary-42");
+        assert!(!capture.created_at.is_empty());
+
+        // Re-attaching replaces rather than duplicates the capture.
+        store
+            .attach_capture(&finding.id, b"POST /probe", b"HTTP/1.1 500", "canary-99")
+            .unwrap();
+        let capture = store.get_capture(&finding.id).unwrap().unwrap();
+        assert_eq!(capture.request_bytes, b"POST /probe");
+        assert_eq!(capture.response_bytes, b"HTTP/1.1 500");
+        assert_eq!(capture.canary, "canary-99");
+
+        // The stored row is authoritative: direct tampering is visible to the
+        // verifier, so an LLM-supplied "canary" can never vouch for a finding.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE tool_captures SET response_bytes=?2, canary='forged' WHERE finding_id=?1",
+                params![
+                    finding.id,
+                    b"HTTP/1.1 200 OK\r\n\r\nnot the canary".as_slice()
+                ],
+            )
+            .unwrap();
+        }
+        let tampered = store.get_capture(&finding.id).unwrap().unwrap();
+        assert_eq!(tampered.canary, "forged");
+        assert_ne!(tampered.response_bytes, response);
+        assert!(!String::from_utf8_lossy(&tampered.response_bytes).contains("canary-42"));
+    }
+
+    #[test]
+    fn clear_session_flag_removes_only_the_target_flag() {
+        let store = Store::open(":memory:").unwrap();
+        let s = store.create_session("g").unwrap();
+        let other = store.create_session("other").unwrap();
+        store.set_session_flag(&s.id, "stop").unwrap();
+        store.set_session_flag(&s.id, "paused").unwrap();
+        store.set_session_flag(&other.id, "stop").unwrap();
+
+        store.clear_session_flag(&s.id, "stop").unwrap();
+        assert!(!store.has_session_flag(&s.id, "stop").unwrap());
+        assert!(store.has_session_flag(&s.id, "paused").unwrap());
+        assert!(store.has_session_flag(&other.id, "stop").unwrap());
+
+        // Clearing a missing flag is a no-op.
+        store.clear_session_flag(&s.id, "missing").unwrap();
+        assert!(!store.has_session_flag(&s.id, "missing").unwrap());
+    }
+
+    #[test]
+    fn park_with_approval_is_atomic() {
+        let store = Store::open(":memory:").unwrap();
+        let s = store.create_session("g").unwrap();
+        store.claim_session(&s.id, "owner", 60).unwrap();
+        let approval = Approval {
+            id: "ap-ok".into(),
+            session_id: s.id.clone(),
+            tool_name: "shell".into(),
+            args_json: "{}".into(),
+            risk: "network-write".into(),
+            status: "pending".into(),
+            reason: Some("needs approval".into()),
+            created_at: String::new(),
+            tool_call_id: Some("tc-1".into()),
+            expires_at: None,
+        };
+        let tail = [
+            (Some("tc-2"), "echo", "{\"x\":\"two\"}"),
+            (None, "echo", "{\"x\":\"three\"}"),
+        ];
+        store.park_with_approval(&approval, &tail, &s.id).unwrap();
+
+        let parked = store.get_session(&s.id).unwrap().unwrap();
+        assert_eq!(parked.state, "waiting_approval");
+        assert!(parked.owner_id.is_none());
+        assert!(parked.lease_expires_at.is_none());
+
+        let pending = store.get_pending_approval(&s.id).unwrap().unwrap();
+        assert_eq!(pending.id, "ap-ok");
+        assert_eq!(pending.status, "pending");
+        assert!(pending.expires_at.is_some());
+
+        let taken = store.take_pending_calls(&s.id, "ap-ok").unwrap();
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken[0].tool_call_id.as_deref(), Some("tc-2"));
+        assert_eq!(taken[0].args_json, "{\"x\":\"two\"}");
+        assert!(taken[1].tool_call_id.is_none());
+
+        // A duplicate approval id aborts the whole transaction: no deferred
+        // calls, no state change and no overwrite of the existing approval.
+        let s2 = store.create_session("g2").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO approvals(id,session_id,action,status,reason,tool_name,args_json,risk,created_at,tool_call_id,expires_at)
+                 VALUES('dupe',?1,'shell','pending','original','shell','{}','exec','2026-01-01T00:00:00Z',NULL,NULL)",
+                params![s2.id],
+            )
+            .unwrap();
+        }
+        let bad = Approval {
+            id: "dupe".into(),
+            session_id: s2.id.clone(),
+            tool_name: "shell".into(),
+            args_json: "{}".into(),
+            risk: "network-write".into(),
+            status: "pending".into(),
+            reason: Some("overwritten".into()),
+            created_at: now(),
+            tool_call_id: None,
+            expires_at: None,
+        };
+        assert!(store
+            .park_with_approval(
+                &bad,
+                &[(Some("tc-bad"), "echo", "{\"rollback\":true}")],
+                &s2.id
+            )
+            .is_err());
+        assert_eq!(store.get_session(&s2.id).unwrap().unwrap().state, "idle");
+        {
+            let conn = store.conn.lock().unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pending_tool_calls WHERE session_id=?1 AND args_json=?2",
+                    params![s2.id, "{\"rollback\":true}"],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0);
+            let reason: String = conn
+                .query_row("SELECT reason FROM approvals WHERE id='dupe'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(reason, "original");
+        }
+    }
+
+    #[test]
+    fn resolve_approval_rejects_expired() {
+        let store = Store::open(":memory:").unwrap();
+        let s = store.create_session("g").unwrap();
+        let expired = store
+            .create_approval_with_ttl(&s.id, "shell", "{}", "exec", "stale", None, -60)
+            .unwrap();
+        assert!(store
+            .resolve_approval(&expired.id, "approved", None)
+            .is_err());
+
+        // The rejected resolution leaves the row untouched and still pending.
+        let conn = store.conn.lock().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM approvals WHERE id=?1",
+                params![expired.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+        drop(conn);
+
+        // A null expiry remains resolvable for legacy rows.
+        let legacy_id = "no-expiry";
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO approvals(id,session_id,action,status,reason,tool_name,args_json,risk,created_at,tool_call_id,expires_at)
+                 VALUES(?1,?2,'shell','pending','legacy','shell','{}','exec','2026-01-01T00:00:00Z',NULL,NULL)",
+                params![legacy_id, s.id],
+            )
+            .unwrap();
+        }
+        store.resolve_approval(legacy_id, "approved", None).unwrap();
+    }
+
+    #[test]
+    fn list_findings_by_status_filters_by_session_and_status() {
+        let store = Store::open(":memory:").unwrap();
+        let s = store.create_session("g").unwrap();
+        let other = store.create_session("other").unwrap();
+        let first = store
+            .add_finding(
+                &s.id, "one", "high", None, None, "d", None, None, None, None,
+            )
+            .unwrap();
+        let second = store
+            .add_finding(
+                &s.id, "two", "high", None, None, "d", None, None, None, None,
+            )
+            .unwrap();
+        store
+            .add_finding(
+                &other.id, "three", "high", None, None, "d", None, None, None, None,
+            )
+            .unwrap();
+        store
+            .set_finding_validation(&second.id, "validated", None)
+            .unwrap();
+
+        let open = store.list_findings_by_status(&s.id, "open").unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, first.id);
+        let validated = store.list_findings_by_status(&s.id, "validated").unwrap();
+        assert_eq!(validated.len(), 1);
+        assert_eq!(validated[0].id, second.id);
+        assert!(store
+            .list_findings_by_status(&other.id, "validated")
+            .unwrap()
+            .is_empty());
     }
 }

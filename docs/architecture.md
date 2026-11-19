@@ -81,15 +81,18 @@ hardening item wires one of them, add a feature → call site → test row in
   without executing any tool.
 - **Planner** (`wstg_playbooks`, `prioritize_targets`): nine WSTG playbooks become
   durable tasks and hypotheses; coverage is recorded per target (`record_coverage`).
-- **Verifier & report**: `validate_poc` is the deterministic acceptance gate;
-  findings carry request/response evidence and SHA-256 hashes; the canonical
-  Markdown renderer emits Executive Summary, Scope & ROE, Methodology, Findings,
-  Coverage, Timeline and Appendices. Reports are local only — there is no
-  submission path to any platform.
-- **Trace & eval**: `append_trace` writes `trace_events`; `eval/run_benchmark.ps1`
-  exports them to `replay.jsonl` and `eval/score.py` computes recall, precision,
-  FPR, reproducibility and tokens-per-finding. Evaluation is scaffolding; no
-  results are asserted.
+- **Verifier & report**: the deterministic verifier replays tool-captured
+  request/response bytes plus a canary (`attach_capture` / `get_capture`);
+  `validate_poc` is a helper tool, **not** an authoritative acceptance gate, and
+  is filtered when the ROE forbids state changes. Findings carry evidence bytes
+  and SHA-256 hashes; the canonical Markdown renderer emits Executive Summary,
+  Scope & ROE, Methodology, Findings, Coverage, Timeline and Appendices. Reports
+  are local only — there is no submission path to any platform.
+- **Trace & eval**: `append_trace` writes `trace_events` (`run_start`, `action`,
+  `finding`, `usage`, `verifier`); `eval/export_trace.py` exports them and joins
+  the engagement replay into `replay.jsonl`, and `eval/score.py` computes recall,
+  precision, FPR, reproducibility and tokens-per-finding. Evaluation is
+  operator-recorded scaffolding; no results are asserted.
 
 ## Implemented hardening
 
@@ -103,7 +106,9 @@ sites and tests are in `docs/PRODUCTION_PLAN.md` §2.
 
 ## Remaining gaps
 
-OS-level isolation (container/VM with restricted egress), full concurrency and
-clustering beyond process-local claims, final closure of H-01…H-12 by their
-workstreams, and operator-recorded benchmark results. See `PRODUCTION_PLAN.md` §4
-for the verification gate and §5 for the readiness criteria.
+OS-level isolation (container/VM with restricted egress), clustering beyond
+process-local claims, a real browser engine, a live submission path, a
+performance benchmark and a maintained fuzz corpus are all deferred. H-01…H-14
+and B1–B14 have landed and are awaiting the verification gate; benchmark results
+must be recorded by an operator. See `REMAINING_GAPS.md` for the honest list,
+`PRODUCTION_PLAN.md` §4 for the gate and §5 for readiness criteria.

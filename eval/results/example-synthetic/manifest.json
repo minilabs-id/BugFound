@@ -1,0 +1,11 @@
+{
+  "project": "example-synthetic",
+  "note": "invented ground truth for an offline documentation fixture; not a benchmark",
+  "expected_vulns": [
+    {
+      "id": "F-001",
+      "type": "reflected XSS",
+      "cwe": "CWE-79"
+    }
+  ]
+}

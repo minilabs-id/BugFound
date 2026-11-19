@@ -1,10 +1,15 @@
 # AgentBug — Production Readiness & Evidence
 
-**Status:** hardening execution in progress (baseline audit 2026-11-19).
-**Source of truth for work items:** [`HARDENING_PLAN.md`](HARDENING_PLAN.md) (H-01…H-14).
-This document records the *evidence* for claims — a single feature → call site →
-test matrix — and the verification gate. It intentionally does **not** restate a
-"all done / N tests passed" verdict: those numbers were true of an earlier snapshot
+**Status:** hardening A1–A9 / B1–B5 closed; the B1–B14 remaining-gap pass has
+landed. Current suite is **180+ tests** (the authoritative count is whatever
+`cargo test --workspace` prints — see §4). No feature is "done" because a status
+line says so; it is done when its call site and test still exist at verification.
+**Sources of truth for work items:** [`HARDENING_PLAN.md`](HARDENING_PLAN.md)
+(H-01…H-14) and [`B1_B14_FIX_PLAN.md`](B1_B14_FIX_PLAN.md) (B1–B14), with the
+honest deferred scope in [`REMAINING_GAPS.md`](REMAINING_GAPS.md). This document
+records the *evidence* for claims — a feature → call site → test matrix — and
+the verification gate. It intentionally does not treat an older "all done / N
+tests passed" verdict as current: those numbers were true of an earlier snapshot
 and are not a substitute for running the current checks.
 
 No benchmark result is claimed anywhere in this repository. `eval/` is scaffolding;
@@ -25,7 +30,7 @@ guards it. A claim without a call site in the matrix below is not a claim.
 | WS1 | `agentbug-core/**` | H-03, H-08, H-09 | Owned by core workstream; verify at integration |
 | WS2 | `agentbug-engagement/**` | H-01, H-02, H-04, H-06, H-10, H-11 | Owned by engagement workstream; verify at integration |
 | WS3 | `agentbug-tools/**`, `agentbug-store/**` | H-04/H-05 evidence, H-06 renderer, H-12 | Owned by tools/store workstream; verify at integration |
-| WS4 | `eval/**`, `docs/**`, `README.md`, `.gitignore`, `LICENSE`, `.github/**`, `rust-toolchain.toml` | **H-07, H-13, H-14** | Delivered here: scorer + Windows drivers + golden manifest + license/toolchain pin + truthful docs. No results asserted. |
+| WS4 | `eval/**`, `docs/**`, `README.md`, `.gitignore`, `LICENSE`, `.github/**`, `rust-toolchain.toml` | **H-07, H-13, H-14, B14** | Delivered here: scorer + trace exporter + Windows drivers + golden manifest + operator-recorded results README + offline synthetic fixture + e2e content check + license/toolchain pin + truthful docs. No results asserted. |
 
 The principles applied by WS4: truth over features (a claim must have a call
 site), no self-grading verifier, evidence as bytes + SHA-256, evaluation that can
@@ -52,7 +57,7 @@ module; they are not a count of passing tests.
 | 7 | HTTP egress control (DNS pin, no redirects, private-range block) | `agentbug-tools::HttpRequestTool` (`dns_overrides`, `no_proxy`) | tools unit tests for reserved IP matrix |
 | 8 | Redaction at every egress boundary | `agentbug-store::redact`, used by `report()` and CLI output paths | store redaction unit tests (JSON, header, multi-bearer, PII) |
 | 9 | Evidence bytes + SHA-256 | `agentbug-store::add_finding_with_evidence`; `agentbug-engagement` `Sha256::digest` at report write | store evidence unit tests; `eval/score.py` evidence-hash check |
-| 10 | Deterministic PoC verifier | `agentbug-tools::validate_poc` tool | `validate_poc_tool_has_expected_spec` |
+| 10 | Deterministic PoC verifier | `agentbug-engagement` verifier over `agentbug-store::get_capture` bytes + canary; `validate_poc` is a helper tool, not the authority | `validate_poc_tool_has_expected_spec`; verifier/capture tests from B1/B5 |
 | 11 | Tamper-evident event chain | `agentbug-store::verify_event_chain`; CLI `Commands::VerifyLog` | store chain-integrity unit tests |
 | 12 | Canonical Markdown report | `agentbug-tools::render_canonical_report` (`ReportInput`); `agentbug-engagement::build_canonical_report` | `eval/score.py --strict` (Executive Summary, Scope & ROE, Methodology, Findings, Coverage, Timeline, Appendices) |
 | 13 | Autonomous engagement (brief → plan → report, local only) | `agentbug-engagement::engage`, `engage_brief_only`, `EngagementStatus`; CLI `Commands::Engage`, `Commands::Engagement` | `engagement_integration.rs`; `eval/e2e_test.ps1` |
@@ -60,9 +65,9 @@ module; they are not a count of passing tests.
 | 15 | Coverage ledger + hypotheses + planner | `agentbug-store::record_coverage`, `add_hypothesis`; `agentbug-core::prioritize_targets`; `wstg_playbooks` | `engagement_integration.rs::planner_has_supported_playbook_count`; CLI `status`, `hypothesis`, `plan` |
 | 16 | Context compaction | `agentbug-core::CompactionV2::compact_messages` via `Runner::build_llm_messages` | `agentbug-core::compaction_summarizes_old_turns_and_keeps_recent_tail` |
 | 17 | Token / cost accounting | `agentbug-store::token_usage`; CLI `Commands::Tokens` | store usage unit tests; `score.py` reads `usage` events from replay |
-| 18 | Trace / replay events | `agentbug-store::append_trace`, `trace_events` table | `eval/run_benchmark.ps1` exports `trace_events` → `replay.jsonl`; `score.py` consumes it |
+| 18 | Trace / replay events | `agentbug-store::append_trace`, `trace_events` table; engagement replay log | `eval/export_trace.py` exports `trace_events` and joins `workspace/replay-<id>.jsonl` → `replay.jsonl`; `score.py` consumes `run_start`/`action`/`finding`/`usage`/`verifier` |
 | 19 | Desktop mission control | `agentbug-desktop` `main.rs` + `worker.rs` (Engagement tab, pause/resume/abort, report export) | `cargo test --workspace` covers shared crates; manual desktop smoke |
-| 20 | Evaluation harness (no results) | `eval/score.py`, `eval/run_benchmark.ps1`, `eval/e2e_test.ps1`, `eval/golden.example.json` | `python -m py_compile eval/score.py`; PowerShell syntax check; `eval/e2e_test.ps1` (wiring only) |
+| 20 | Evaluation harness (no results) | `eval/score.py`, `eval/export_trace.py`, `eval/run_benchmark.ps1`, `eval/e2e_test.ps1`, `eval/golden.example.json` | `python -m py_compile eval/score.py eval/export_trace.py`; PowerShell syntax check; `e2e_test.ps1` asserts report sections + `score.py --strict` (wiring only) |
 
 **Explicitly not advertised** (H-03 acceptance): `SubagentJobs`, `SkillLoader` and
 `UsageTracker` were removed from `agentbug-core` during hardening. The remaining
@@ -113,8 +118,8 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --release --workspace
-python -m py_compile eval/score.py
-python eval/score.py --dir eval/results --manifest eval/golden.example.json \
+python -m py_compile eval/score.py eval/export_trace.py
+python eval/score.py --dir eval/results/<id> --manifest eval/results/<id>/manifest.json \
     --replay eval/results/<id>/replay.jsonl --strict
 ```
 
@@ -122,7 +127,7 @@ Windows-only wiring (no WSL):
 
 ```powershell
 pwsh eval/run_benchmark.ps1          # dry run
-pwsh eval/e2e_test.ps1               # local brief -> engage --brief-only -> report exists
+pwsh eval/e2e_test.ps1               # local brief -> engage -> report sections + score.py --strict
 ```
 
 On Windows, `tsc` is the source of truth when `bun check` disagrees; reproduce with
@@ -134,13 +139,15 @@ On Windows, `tsc` is the source of truth when `bun check` disagrees; reproduce w
 
 AgentBug may be called production-ready only when:
 
-- H-01…H-14 are complete with accompanying tests (see `HARDENING_PLAN.md` §7).
+- H-01…H-14 and the B1–B14 remaining-gap fixes are complete with accompanying
+  tests (see `HARDENING_PLAN.md` §7 and `REMAINING_GAPS.md` §2).
 - The four Rust checks in §4 are green on CI Linux + Windows; toolchain pinned to
   `1.90.0` in `rust-toolchain.toml` and CI.
 - Every row in the evidence matrix resolves to a current call site and a test.
 - A production report passes `eval/score.py --strict`.
 - Real benchmark results (with replay + manifest) are recorded by an operator;
-  this repository ships only the harness and an example manifest.
+  this repository ships only the harness, an example manifest, and a clearly
+  labelled offline synthetic fixture.
 
 Until then the honest label is **hardened prototype**: single-node, requires OS
 isolation, shell gated behind allowlist, no auto-submit, no live-program benchmark

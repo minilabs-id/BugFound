@@ -291,6 +291,27 @@ impl DesktopApp {
     }
 }
 
+fn engagement_options(
+    config: &AppConfig,
+    mode: ModeChoice,
+) -> agentbug_engagement::EngagementOptions {
+    // H-01: carry the operator's mode, budgets and risk opt-ins into the
+    // engagement instead of using the permissive compatibility defaults.
+    // A non-zero `[policy]` budget value wins over the legacy `[agent]` one.
+    let budgets = config.effective_budgets();
+    agentbug_engagement::EngagementOptions {
+        mode: mode.into(),
+        max_steps: budgets.max_steps,
+        max_tool_calls: budgets.max_tool_calls,
+        max_network_calls: budgets.max_network_calls,
+        requests_per_minute: budgets.requests_per_minute,
+        max_estimated_tokens: budgets.max_tokens,
+        allow_network_write: config.network.allow_network_write,
+        allow_intrusive: config.network.allow_intrusive,
+        auto_approve_all: config.agent.auto_approve_all,
+    }
+}
+
 impl DesktopApp {
     fn start_engagement(&mut self) {
         if self.engage_worker.is_some() {
@@ -300,19 +321,7 @@ impl DesktopApp {
         let (tx, rx) = mpsc::channel();
         let url = self.engage_url.trim().to_string();
         let cwd = self.engage_cwd.trim().to_string();
-        // H-01: carry the operator's mode, budgets and risk opt-ins into the
-        // engagement instead of using the permissive compatibility defaults.
-        let options = agentbug_engagement::EngagementOptions {
-            mode: self.run_mode_choice.into(),
-            max_steps: self.config.agent.max_steps,
-            max_tool_calls: self.config.agent.max_tool_calls,
-            max_network_calls: self.config.agent.max_network_calls,
-            requests_per_minute: self.config.agent.requests_per_minute,
-            max_estimated_tokens: self.config.agent.max_estimated_tokens,
-            allow_network_write: self.config.network.allow_network_write,
-            allow_intrusive: self.config.network.allow_intrusive,
-            auto_approve_all: self.config.agent.auto_approve_all,
-        };
+        let options = engagement_options(&self.config, self.run_mode_choice);
         let storage = PathBuf::from(&self.config.storage.path);
         self.engage_db = storage.clone();
         self.engage_events.clear();
@@ -1002,4 +1011,21 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|_cc| Ok(Box::new(DesktopApp::new()) as Box<dyn eframe::App>)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engagement_options_carry_policy_budgets() {
+        let config: AppConfig = toml::from_str(crate::config::POLICY_CONFIG).expect("parse config");
+        let options = engagement_options(&config, ModeChoice::FullAuto);
+        assert_eq!(options.mode, Mode::FullAuto);
+        assert_eq!(options.max_steps, 11);
+        assert_eq!(options.max_tool_calls, 22);
+        assert_eq!(options.max_network_calls, 33);
+        assert_eq!(options.requests_per_minute, 44);
+        assert_eq!(options.max_estimated_tokens, 55);
+    }
 }

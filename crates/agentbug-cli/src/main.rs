@@ -218,6 +218,8 @@ struct FileConfig {
     #[serde(default)]
     agent: AgentFile,
     #[serde(default)]
+    policy: PolicyFile,
+    #[serde(default)]
     storage: StorageFile,
     #[serde(default)]
     scope: agentbug_policy::ScopeConfig,
@@ -284,6 +286,39 @@ impl FileConfig {
         }
         Ok(())
     }
+
+    /// Effective budgets: a non-zero `[policy]` value wins, otherwise the
+    /// legacy `[agent]` scalar (or the caller's default) is used.
+    fn effective_budgets(&self, default_max_steps: usize) -> agentbug_policy::BudgetConfig {
+        let budgets = self.policy.budgets();
+        agentbug_policy::BudgetConfig {
+            max_steps: if budgets.max_steps > 0 {
+                budgets.max_steps
+            } else {
+                self.agent.max_steps.unwrap_or(default_max_steps)
+            },
+            max_tool_calls: if budgets.max_tool_calls > 0 {
+                budgets.max_tool_calls
+            } else {
+                self.agent.max_tool_calls.unwrap_or(0)
+            },
+            max_network_calls: if budgets.max_network_calls > 0 {
+                budgets.max_network_calls
+            } else {
+                self.agent.max_network_calls.unwrap_or(0)
+            },
+            requests_per_minute: if budgets.requests_per_minute > 0 {
+                budgets.requests_per_minute
+            } else {
+                self.agent.requests_per_minute.unwrap_or(0)
+            },
+            max_tokens: if budgets.max_tokens > 0 {
+                budgets.max_tokens
+            } else {
+                self.agent.max_estimated_tokens.unwrap_or(0)
+            },
+        }
+    }
 }
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct LlmFile {
@@ -341,6 +376,39 @@ struct AgentFile {
     /// Explicit escape hatch: skip every approval prompt. Default off.
     #[serde(default)]
     auto_approve_all: bool,
+}
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+struct PolicyFile {
+    #[serde(default)]
+    allowed_tools: Vec<String>,
+    #[serde(default)]
+    denied_tools: Vec<String>,
+    #[serde(default)]
+    allowed_targets: Vec<String>,
+    #[serde(default)]
+    denied_targets: Vec<String>,
+    #[serde(default)]
+    max_steps_budget: usize,
+    #[serde(default)]
+    max_tool_calls_budget: usize,
+    #[serde(default)]
+    max_network_calls_budget: usize,
+    #[serde(default)]
+    requests_per_minute_budget: u64,
+    #[serde(default)]
+    max_tokens_budget: u64,
+}
+
+impl PolicyFile {
+    fn budgets(&self) -> agentbug_policy::BudgetConfig {
+        agentbug_policy::BudgetConfig {
+            max_tool_calls: self.max_tool_calls_budget,
+            max_network_calls: self.max_network_calls_budget,
+            requests_per_minute: self.requests_per_minute_budget,
+            max_steps: self.max_steps_budget,
+            max_tokens: self.max_tokens_budget,
+        }
+    }
 }
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 struct NetworkFile {
@@ -435,6 +503,48 @@ type RunnerParts = (
     AgentConfig,
 );
 
+fn policy_config(cfg: &FileConfig, mode: Mode) -> agentbug_policy::PolicyConfig {
+    let budgets = cfg.policy.budgets();
+    agentbug_policy::PolicyConfig {
+        mode,
+        scope: cfg.scope.clone(),
+        allowed_tools: cfg.policy.allowed_tools.clone(),
+        denied_tools: cfg.policy.denied_tools.clone(),
+        allowed_targets: cfg.policy.allowed_targets.clone(),
+        denied_targets: cfg.policy.denied_targets.clone(),
+        budgets: budgets.clone(),
+        rate_limits: budgets,
+        ..Default::default()
+    }
+}
+
+fn agent_config(cfg: &FileConfig, mode: Mode) -> AgentConfig {
+    let budgets = cfg.effective_budgets(20);
+    AgentConfig {
+        mode,
+        max_steps: cfg.agent.max_steps.unwrap_or(20),
+        system_prompt: cfg
+            .agent
+            .system_prompt
+            .clone()
+            .or_else(|| cfg.agent.system.clone()),
+        system: cfg.agent.system.clone(),
+        max_tool_calls: cfg.agent.max_tool_calls.unwrap_or(0),
+        max_network_calls: cfg.agent.max_network_calls.unwrap_or(0),
+        requests_per_minute: cfg.agent.requests_per_minute.unwrap_or(0),
+        auto_approve_tools: cfg.agent.auto_approve_tools.clone(),
+        auto_approve_all: cfg.agent.auto_approve_all,
+        max_estimated_tokens: cfg.agent.max_estimated_tokens.unwrap_or(0),
+        cost_per_1k_input: cfg.llm.cost_per_1k_input,
+        cost_per_1k_output: cfg.llm.cost_per_1k_output,
+        budgets: budgets.clone(),
+        budget: budgets.clone(),
+        rate_limits: budgets.clone(),
+        rate_limit: budgets,
+        ..Default::default()
+    }
+}
+
 fn build_runner(cfg: &FileConfig, cwd: &str, mode: Mode, open_store: bool) -> Result<RunnerParts> {
     let api_key = resolve_api_key(&cfg.llm.api_key)?;
     let llm_cfg = LlmConfig {
@@ -465,30 +575,8 @@ fn build_runner(cfg: &FileConfig, cwd: &str, mode: Mode, open_store: bool) -> Re
         ..Default::default()
     };
     let tools = try_default_registry_with_options(cwd, options)?;
-    let policy = agentbug_core::build_policy_config(agentbug_policy::PolicyConfig {
-        mode,
-        scope: cfg.scope.clone(),
-        ..Default::default()
-    });
-    let agent = AgentConfig {
-        mode,
-        max_steps: cfg.agent.max_steps.unwrap_or(20),
-        system_prompt: cfg
-            .agent
-            .system_prompt
-            .clone()
-            .or_else(|| cfg.agent.system.clone()),
-        system: cfg.agent.system.clone(),
-        max_tool_calls: cfg.agent.max_tool_calls.unwrap_or(0),
-        max_network_calls: cfg.agent.max_network_calls.unwrap_or(0),
-        requests_per_minute: cfg.agent.requests_per_minute.unwrap_or(0),
-        auto_approve_tools: cfg.agent.auto_approve_tools.clone(),
-        auto_approve_all: cfg.agent.auto_approve_all,
-        max_estimated_tokens: cfg.agent.max_estimated_tokens.unwrap_or(0),
-        cost_per_1k_input: cfg.llm.cost_per_1k_input,
-        cost_per_1k_output: cfg.llm.cost_per_1k_output,
-        ..Default::default()
-    };
+    let policy = agentbug_core::build_policy_config(policy_config(cfg, mode));
+    let agent = agent_config(cfg, mode);
     let store = if open_store {
         Some(Store::open(&cfg.storage.path)?)
     } else {
@@ -518,13 +606,14 @@ fn print_approval_summary(store: &Store, session: &str) {
 /// H-01: build engagement limits from the operator's config instead of using
 /// the permissive compatibility defaults.
 fn engagement_options(cfg: &FileConfig) -> agentbug_engagement::EngagementOptions {
+    let budgets = cfg.effective_budgets(60);
     agentbug_engagement::EngagementOptions {
         mode: resolve_mode(None, cfg.agent.mode.as_deref()),
-        max_steps: cfg.agent.max_steps.unwrap_or(60),
-        max_tool_calls: cfg.agent.max_tool_calls.unwrap_or(0),
-        max_network_calls: cfg.agent.max_network_calls.unwrap_or(0),
-        requests_per_minute: cfg.agent.requests_per_minute.unwrap_or(0),
-        max_estimated_tokens: cfg.agent.max_estimated_tokens.unwrap_or(0),
+        max_steps: budgets.max_steps,
+        max_tool_calls: budgets.max_tool_calls,
+        max_network_calls: budgets.max_network_calls,
+        requests_per_minute: budgets.requests_per_minute,
+        max_estimated_tokens: budgets.max_tokens,
         allow_network_write: cfg.network.allow_network_write,
         allow_intrusive: cfg.network.allow_intrusive,
         auto_approve_all: cfg.agent.auto_approve_all,
@@ -579,6 +668,18 @@ mode = "ask"          # ask | full_auto
 max_steps = 20
 # Escape hatch: skip every approval prompt (off by default).
 auto_approve_all = false
+
+# Policy allow/deny lists and budgets. Budgets are aliases: 0 = unlimited.
+[policy]
+allowed_tools = []
+denied_tools = []
+allowed_targets = []
+denied_targets = []
+max_steps_budget = 0
+max_tool_calls_budget = 0
+max_network_calls_budget = 0
+requests_per_minute_budget = 0
+max_tokens_budget = 0
 
 [network]
 # Explicit opt-ins needed for state-changing / intrusive engagements.
@@ -1087,6 +1188,27 @@ allow_network_write = true
 allow_intrusive = true
 "#;
 
+    // Kept byte-for-byte identical to the desktop config parity test.
+    const POLICY_CONFIG: &str = r#"
+[llm]
+api_key = "test-key"
+
+[agent]
+mode = "full_auto"
+max_steps = 7
+
+[policy]
+allowed_tools = ["http_request", "dns_lookup"]
+denied_tools = ["shell"]
+allowed_targets = ["example.com"]
+denied_targets = ["evil.example.com"]
+max_steps_budget = 11
+max_tool_calls_budget = 22
+max_network_calls_budget = 33
+requests_per_minute_budget = 44
+max_tokens_budget = 55
+"#;
+
     #[test]
     fn engagement_opt_ins_are_parsed_and_forwarded() {
         let cfg: FileConfig = toml::from_str(OPT_IN_CONFIG).expect("parse config");
@@ -1110,5 +1232,63 @@ allow_intrusive = true
         assert!(!options.allow_network_write);
         assert!(!options.allow_intrusive);
         assert!(!options.auto_approve_all);
+    }
+
+    #[test]
+    fn policy_fields_are_forwarded_into_policy_config() {
+        let cfg: FileConfig = toml::from_str(POLICY_CONFIG).expect("parse config");
+        cfg.validate().expect("validate config");
+        let policy = policy_config(&cfg, Mode::FullAuto);
+        assert_eq!(policy.allowed_tools, ["http_request", "dns_lookup"]);
+        assert_eq!(policy.denied_tools, ["shell"]);
+        assert_eq!(policy.allowed_targets, ["example.com"]);
+        assert_eq!(policy.denied_targets, ["evil.example.com"]);
+        let effective = agentbug_core::build_policy_config(policy.clone()).effective_budgets();
+        assert_eq!(effective.max_steps, 11);
+        assert_eq!(effective.max_tool_calls, 22);
+        assert_eq!(effective.max_network_calls, 33);
+        assert_eq!(effective.requests_per_minute, 44);
+        assert_eq!(effective.max_tokens, 55);
+        assert_eq!(policy.budgets.max_steps, 11);
+        assert_eq!(policy.rate_limits.max_tokens, 55);
+    }
+
+    #[test]
+    fn budget_aliases_are_wired_into_agent_config() {
+        let cfg: FileConfig = toml::from_str(POLICY_CONFIG).expect("parse config");
+        let agent = agent_config(&cfg, Mode::FullAuto);
+        for alias in [
+            &agent.budgets,
+            &agent.budget,
+            &agent.rate_limits,
+            &agent.rate_limit,
+        ] {
+            assert_eq!(alias.max_steps, 11);
+            assert_eq!(alias.max_tool_calls, 22);
+            assert_eq!(alias.max_network_calls, 33);
+            assert_eq!(alias.requests_per_minute, 44);
+            assert_eq!(alias.max_tokens, 55);
+        }
+    }
+
+    #[test]
+    fn policy_budgets_are_forwarded_into_engagement_options() {
+        let cfg: FileConfig = toml::from_str(POLICY_CONFIG).expect("parse config");
+        let options = engagement_options(&cfg);
+        assert_eq!(options.max_steps, 11);
+        assert_eq!(options.max_tool_calls, 22);
+        assert_eq!(options.max_network_calls, 33);
+        assert_eq!(options.requests_per_minute, 44);
+        assert_eq!(options.max_estimated_tokens, 55);
+    }
+
+    #[test]
+    fn policy_section_round_trips() {
+        let cfg: FileConfig = toml::from_str(POLICY_CONFIG).expect("parse config");
+        let text = toml::to_string_pretty(&cfg).expect("serialize config");
+        let reloaded: FileConfig = toml::from_str(&text).expect("reparse config");
+        assert_eq!(reloaded.policy.allowed_tools, cfg.policy.allowed_tools);
+        assert_eq!(reloaded.policy.denied_targets, cfg.policy.denied_targets);
+        assert_eq!(reloaded.policy.max_tokens_budget, 55);
     }
 }

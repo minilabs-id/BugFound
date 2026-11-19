@@ -30,6 +30,20 @@ max_estimated_tokens = 0
 # Bypass per-tool approval for every tool (engagement runs only). Keep false.
 auto_approve_all = false
 
+# Policy: tool/target allow/deny lists and budget aliases.
+# Empty lists mean "no restriction"; a deny entry always wins over an allow entry.
+# Budgets are aliases for the [agent] limits: a non-zero value here wins, 0 = unlimited.
+[policy]
+allowed_tools = []
+denied_tools = []
+allowed_targets = []
+denied_targets = []
+max_steps_budget = 0
+max_tool_calls_budget = 0
+max_network_calls_budget = 0
+requests_per_minute_budget = 0
+max_tokens_budget = 0
+
 [storage]
 path = ".agentbug/agentbug.db"
 

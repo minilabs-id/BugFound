@@ -2,7 +2,9 @@
 
 Tanggal: 2026-11-19
 Sumber: audit tools/control plane (temuan 1–4 + correctness)
-Status: **selesai — 3 workstream paralel, 180 tes hijau**
+Status: **TC-1…TC-10 ditutup oleh 3 workstream paralel; suite saat ini 180+ tes.
+Jumlah pasti dan status hijau harus dibaca dari `cargo test --workspace`
+(`PRODUCTION_PLAN.md` §4), bukan dari status dokumen ini.**
 
 ## Target (must fix)
 
@@ -12,6 +14,14 @@ Status: **selesai — 3 workstream paralel, 180 tes hijau**
 | TC-2 | Resume approval lolos guard chain | Ekstrak `pre_execute_guards()` dan pakai di `run_loop`, `resume_after_approval`, `execute_deferred_call` | WS-CORE |
 | TC-3 | Pause/abort lintas-proses lambat | Flag stop durable per-session, dicek tiap step & sebelum tool spawn di Runner; `pause_at/abort_at` tulis flag + interrupt | WS-CORE + WS-ENG |
 | TC-4 | ROE tidak dieksekusi | `max_requests` → budget; `http_request` method gate via `allowed_methods`; buang tool `intrusive/network-write` saat opt-in false; FullAuto konsultasi risk | WS-TOOLS + WS-POLICY + WS-ENG |
+
+> **Status `allowed_methods` (diperbarui B4):** `ToolOptions.allowed_methods`
+> sekarang **diimplementasikan dan ditegakkan oleh `HttpRequestTool` (WS-TOOLS)**.
+> Klaim lama bahwa `ToolOptions` "tidak punya gate `allowed_methods`" sudah tidak
+> berlaku. Engagement tetap fails-closed secara berlapis: bila ROE melarang
+> perubahan state, tool `http_request` tidak didaftarkan sama sekali sedangkan
+> `http_probe` / `dns_lookup` tetap tersedia. Rincian ada di
+> `REMAINING_GAPS.md` §2 (B4, B5).
 
 ## Correctness tambahan
 

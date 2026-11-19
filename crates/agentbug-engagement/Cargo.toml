@@ -23,3 +23,6 @@ agentbug-llm = { path = "../agentbug-llm" }
 agentbug-policy = { path = "../agentbug-policy" }
 agentbug-store = { path = "../agentbug-store" }
 agentbug-tools = { path = "../agentbug-tools" }
+
+[dev-dependencies]
+rusqlite.workspace = true

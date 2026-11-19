@@ -17,12 +17,18 @@ Inputs
     --manifest  JSON: {"expected_vulns": [...]} (see eval/golden.example.json).
                 Entries may be strings or objects with id/type/cwe/aliases.
     --replay    JSONL, one event per line. Recognised kinds:
-                  run_start {run_id}
-                  finding    {run_id, id, type, cwe, verified}
-                  tested     {run_id, type, verdict}   (negative hypotheses)
-                  usage      {prompt_tokens, completion_tokens}
-                  report     {run_id, sha256}
-                Unknown kinds and malformed lines are ignored with a warning.
+                  run_start {run_id}                    (run boundary)
+                  action    {run_id, tool, target, ok}  (tool call / hypothesis)
+                  finding   {run_id, id, type, cwe, verified}
+                  tested    {run_id, type, verdict}     (negative hypotheses)
+                  verifier  {run_id, finding_id, verified, type, cwe}
+                  usage     {run_id, prompt_tokens, completion_tokens}
+                  report    {run_id, sha256}
+                ``event`` is accepted as an alias for ``kind`` (engagement
+                replay logs) and the trace-event spellings of the same concepts
+                are normalised. Unknown kinds and malformed lines are ignored
+                with a warning. trace_events can be exported with
+                eval/export_trace.py and joined into this replay log.
 
 Metrics (computed only when the relevant input is present)
     recall, precision, false_positive_rate (+ count and basis),
@@ -51,6 +57,30 @@ SECTION_ALIASES = {
     "Scope & ROE": ["scope & roe", "scope and roe", "scope"],
 }
 SEVERITIES = ["Critical", "High", "Medium", "Low", "None", "Unknown"]
+
+# Both the engagement replay log ("event") and trace_events ("kind") feed this
+# scorer; normalise their spellings once at load time.
+KIND_ALIASES = {
+    "started": "run_start",
+    "engagement.start": "run_start",
+    "finding.saved": "finding",
+    "token_usage": "usage",
+    "tokens": "usage",
+    "verify": "verifier",
+    "poc.verified": "verifier",
+    "report.ready": "report",
+    "report_ready": "report",
+    "report.exported": "report",
+    "probe": "tested",
+    "test": "tested",
+    "hypothesis": "tested",
+}
+
+
+def event_kind(event):
+    raw = event.get("kind", event.get("event", ""))
+    text = str(raw or "").strip().lower()
+    return KIND_ALIASES.get(text, text)
 
 CVSS_RE = re.compile(
     r"CVSS:3\.1/AV:[NALP]/AC:[LHP]/PR:[NLH]/UI:[NR]/S:[UC]/C:[NLH]/I:[NLH]/A:[NLH]"
@@ -179,9 +209,13 @@ def score_report(path):
 
 def discover(directory):
     found = []
-    for root, _dirs, files in os.walk(directory):
+    for root, dirs, files in os.walk(directory):
+        # Operator-recorded results are scored; synthetic examples shipped with
+        # the harness are documentation, not benchmark inputs.
+        dirs[:] = [name for name in dirs if not name.startswith("example-")]
         for name in files:
-            if name.lower().endswith(".md") and name.lower() != "readme.md":
+            lowered = name.lower()
+            if lowered.endswith(".md") and lowered != "readme.md" and not name.startswith("EXAMPLE-"):
                 found.append(os.path.join(root, name))
     return sorted(found)
 
@@ -220,6 +254,7 @@ def load_replay(path):
                 warnings.append("replay line %d: invalid JSON (%s)" % (line_number, error.msg))
                 continue
             if isinstance(event, dict):
+                event["kind"] = event_kind(event)
                 events.append(event)
             else:
                 warnings.append("replay line %d: expected an object" % line_number)
@@ -253,6 +288,44 @@ def _dedupe(reported):
     return unique
 
 
+def _event_tokens(event):
+    """API token counts from a usage event; no len/4 estimates."""
+    usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+    def first(*names):
+        for name in names:
+            value = event[name] if name in event else usage.get(name)
+            if value is not None:
+                return value
+        return 0
+    prompt = first("prompt_tokens", "input_tokens", "prompt")
+    completion = first("completion_tokens", "output_tokens", "completion")
+    try:
+        total = int(prompt or 0) + int(completion or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if total:
+        return total
+    try:
+        return int(first("total_tokens", "tokens") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _verifier_map(replay_events):
+    """Map finding id -> deterministic verifier verdict from trace events."""
+    verdicts = {}
+    for event in replay_events:
+        if event["kind"] != "verifier":
+            continue
+        finding_id = event.get("finding_id") or event.get("id")
+        if finding_id is None:
+            continue
+        verdicts[str(finding_id)] = not _is_false(
+            event.get("verified", event.get("verdict", True))
+        )
+    return verdicts
+
+
 def compute_metrics(results, ground_truth, replay_events):
     """Compute detection/reproducibility metrics dicts; values may be None."""
     index = defaultdict(set)
@@ -260,20 +333,26 @@ def compute_metrics(results, ground_truth, replay_events):
         for identifier in entry["identifiers"]:
             index[identifier].add(entry["key"])
 
+    verdicts = _verifier_map(replay_events)
     reported = []
     for result in results:
         reported.extend(result.get("reported", []))
     for event in replay_events:
-        if normalize(event.get("kind")) == "finding":
-            identifiers = identifiers_from(
-                [event.get("id"), event.get("type"), event.get("cwe")]
-                + list(event.get("aliases") or [])
-            )
-            reported.append({
-                "identifiers": identifiers,
-                "verified": not _is_false(event.get("verified", True)),
-                "source": "replay",
-            })
+        if event["kind"] != "finding":
+            continue
+        finding_id = event.get("id") or event.get("finding_id")
+        verdict = event.get("verified")
+        if verdict is None and finding_id is not None and str(finding_id) in verdicts:
+            verdict = verdicts[str(finding_id)]
+        identifiers = identifiers_from(
+            [finding_id, event.get("type"), event.get("cwe")]
+            + list(event.get("aliases") or [])
+        )
+        reported.append({
+            "identifiers": identifiers,
+            "verified": not _is_false(verdict if verdict is not None else True),
+            "source": "replay",
+        })
     for item in reported:
         item["keys"] = _match_keys(item["identifiers"], index)
         if _is_false(item.get("verified", True)):
@@ -292,18 +371,50 @@ def compute_metrics(results, ground_truth, replay_events):
 
     recall = len(covered & truth_keys) / len(truth_keys) if truth_keys else None
     denominator = len(true_positives) + len(false_positives)
-    precision = len(true_positives) / denominator if denominator else None
+    # Without ground truth there is no such thing as a true positive: leave the
+    # metric unavailable instead of printing a misleading 0.000.
+    precision = len(true_positives) / denominator if truth_keys and denominator else None
 
-    # FPR: prefer replay "tested" hypotheses (true negatives), else fall back to
-    # the false-discovery rate over reported findings and label the basis.
-    negatives = []
+    # FPR: explicit tested hypotheses first, then deterministic verifier
+    # rejections, then failed actions that carry a hypothesis identifier. A
+    # bare failed tool call (e.g. fs_read) is not a security negative.
+    tested_negatives = []
+    verifier_negatives = []
+    action_negatives = []
     for event in replay_events:
-        if normalize(event.get("kind")) not in ("tested", "hypothesis", "probe", "test"):
-            continue
-        identifiers = identifiers_from([event.get("type"), event.get("id"), event.get("cwe")])
-        if not _match_keys(identifiers, index):
-            negatives.append(identifiers)
+        kind = event["kind"]
+        if kind == "tested":
+            identifiers = identifiers_from([event.get("type"), event.get("id"), event.get("cwe")])
+            if identifiers:
+                tested_negatives.append(identifiers)
+        elif kind == "verifier" and _is_false(
+            event.get("verified", event.get("verdict", True))
+        ):
+            identifiers = identifiers_from([
+                event.get("type"), event.get("cwe"),
+                event.get("id"), event.get("finding_id"),
+            ])
+            if identifiers:
+                verifier_negatives.append(identifiers)
+        elif kind == "action" and _is_false(event.get("ok", True)):
+            identifiers = identifiers_from([
+                event.get("type"), event.get("hypothesis"), event.get("cwe"),
+            ])
+            if identifiers:
+                action_negatives.append(identifiers)
+
     reported_identifiers = [item["identifiers"] for item in reported]
+    negatives = []
+    fpr_basis = "unavailable"
+    for candidates, basis in (
+        (tested_negatives, "replay_tested_hypotheses"),
+        (verifier_negatives, "replay_verifier_verdicts"),
+        (action_negatives, "replay_failed_actions"),
+    ):
+        if candidates:
+            negatives = candidates
+            fpr_basis = basis
+            break
     if negatives:
         fp_negatives = sum(
             1 for identifiers in negatives
@@ -311,19 +422,19 @@ def compute_metrics(results, ground_truth, replay_events):
         )
         tn = len(negatives) - fp_negatives
         fpr = fp_negatives / (fp_negatives + tn) if (fp_negatives + tn) else None
-        fpr_basis = "replay_tested_hypotheses"
     elif precision is not None:
         fpr = 1.0 - precision
         fpr_basis = "reported_findings_fdr_proxy"
     else:
         fpr = None
-        fpr_basis = "unavailable"
 
     # Reproducibility: findings reproduced in every run and modal report hash.
     runs = defaultdict(lambda: {"findings": set(), "hashes": []})
     for event in replay_events:
+        kind = event["kind"]
+        if kind not in ("run_start", "finding", "report"):
+            continue
         run_id = str(event.get("run_id") or "default")
-        kind = normalize(event.get("kind"))
         if kind == "finding":
             identifiers = identifiers_from(
                 [event.get("id"), event.get("type"), event.get("cwe")]
@@ -355,16 +466,12 @@ def compute_metrics(results, ground_truth, replay_events):
         reproducibility = sum(parts) / len(parts)
 
     # Tokens per valid finding (API usage from replay; no len/4 estimates).
-    total_tokens = 0
-    for event in replay_events:
-        if normalize(event.get("kind")) == "usage":
-            try:
-                total_tokens += int(event.get("prompt_tokens") or 0)
-                total_tokens += int(event.get("completion_tokens") or 0)
-            except (TypeError, ValueError):
-                continue
+    usage_events = [event for event in replay_events if event["kind"] == "usage"]
+    total_tokens = sum(_event_tokens(event) for event in usage_events)
     valid_findings = len(true_positives) if truth_keys else len(reported)
-    tokens_per_finding = total_tokens / valid_findings if valid_findings else None
+    tokens_per_finding = (
+        total_tokens / valid_findings if usage_events and valid_findings else None
+    )
 
     return {
         "recall": recall,
@@ -387,9 +494,7 @@ def compute_metrics(results, ground_truth, replay_events):
             "precision": bool(truth_keys),
             "false_positive_rate": fpr is not None,
             "reproducibility": run_count >= 2,
-            "tokens_per_finding": any(
-                normalize(event.get("kind")) == "usage" for event in replay_events
-            ),
+            "tokens_per_finding": any(event["kind"] == "usage" for event in replay_events),
         },
     }
 

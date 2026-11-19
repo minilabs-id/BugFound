@@ -1524,7 +1524,7 @@ async fn duplicate_guard_uses_normalized_arguments() {
 }
 
 #[tokio::test]
-async fn resume_after_injection_flag_does_not_execute_approved_tool() {
+async fn resume_approve_clears_injection_flag_and_executes_tool() {
     let store = Store::open(":memory:").unwrap();
     let responses = vec![
         ChatResponse {
@@ -1564,12 +1564,13 @@ async fn resume_after_injection_flag_does_not_execute_approved_tool() {
 
     let out = runner.resume_session(&session.id, "approve").await.unwrap();
     assert_eq!(out, "finished");
+    // An explicit approval consumes the re-approval guard instead of replaying
+    // it forever, so the flagged context is allowed to proceed.
+    assert!(!store
+        .has_session_flag(&session.id, "injection_suspected")
+        .unwrap());
     let msgs = store.list_messages(&session.id).unwrap();
-    assert!(!msgs.iter().any(|m| m.content.contains("ran:echo hi")));
-    let events = store.list_events(&session.id, 100).unwrap();
-    assert!(events
-        .iter()
-        .any(|e| e.kind == "tool.denied" && e.message.contains("suspected prompt injection")));
+    assert!(msgs.iter().any(|m| m.content.contains("ran:echo hi")));
 }
 
 #[tokio::test]
@@ -1662,9 +1663,12 @@ async fn request_stop_aborts_runner_at_next_step() {
     assert_eq!(state.state, "interrupted");
     let events = store.list_events(&session.id, 100).unwrap();
     assert!(events.iter().any(|e| e.kind == "session.stopped"));
-    // `finish` consumes the stop flag; a later resume clears the ack and
-    // therefore starts with a clean slate.
+    // `finish` removes the durable stop row as well as acking in-process; a
+    // later resume therefore starts with a clean slate.
     assert!(agentbug_core::execution::ExecutionCoordinator::global().is_stop_acked(&session.id));
+    assert!(!store
+        .has_session_flag(&session.id, "stop_requested")
+        .unwrap());
 }
 
 #[tokio::test]
@@ -1915,4 +1919,87 @@ async fn stall_guard_ignores_coverage_only_progress() {
     assert_eq!(store.coverage_count(&session.id).unwrap(), 1);
     let events = store.list_events(&session.id, 100).unwrap();
     assert!(events.iter().any(|e| e.kind == "runner.stall_stop"));
+}
+
+#[tokio::test]
+async fn stop_flag_is_cleared_after_finish_and_resume_does_not_reabort() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("stop once").unwrap();
+    store.set_session_state(&session.id, "running").unwrap();
+    store.set_session_model(&session.id, "mock-model").unwrap();
+    store.add_message(&session.id, "user", "work").unwrap();
+    request_stop(&store, &session.id);
+    assert!(store
+        .has_session_flag(&session.id, "stop_requested")
+        .unwrap());
+
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new(
+            "mock-model",
+            vec![ChatResponse {
+                content: Some("done after stop".into()),
+                tool_calls: vec![],
+                model: "mock-model".into(),
+            }],
+        )),
+        base_tools_with_mock_exec(),
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            auto_approve_all: true,
+            max_steps: 5,
+            ..Default::default()
+        },
+    );
+
+    // First resume honors the durable stop request at the step boundary.
+    let err = runner
+        .resume_session(&session.id, "approve")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("aborted"));
+    let state = store.get_session(&session.id).unwrap().unwrap();
+    assert_eq!(state.state, "interrupted");
+    assert!(!store
+        .has_session_flag(&session.id, "stop_requested")
+        .unwrap());
+
+    // The stop row is gone, so a fresh resume runs to completion instead of
+    // re-aborting on a stale flag.
+    let out = runner.resume_session(&session.id, "approve").await.unwrap();
+    assert_eq!(out, "done after stop");
+    let state = store.get_session(&session.id).unwrap().unwrap();
+    assert_eq!(state.state, "completed");
+}
+
+#[tokio::test]
+async fn run_goal_expires_stale_approvals_before_claim() {
+    let store = Store::open(":memory:").unwrap();
+    let parked = store.create_session("old approval").unwrap();
+    store
+        .create_approval_with_ttl(&parked.id, "echo", "{}", "safe", "stale", None, -1)
+        .unwrap();
+
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new(
+            "mock-model",
+            vec![ChatResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                model: "mock-model".into(),
+            }],
+        )),
+        ToolRegistry::new(),
+        build_policy(Mode::Ask),
+        AgentConfig {
+            mode: Mode::Ask,
+            max_steps: 2,
+            ..Default::default()
+        },
+    );
+    assert_eq!(runner.run_goal("fresh run").await.unwrap(), "done");
+    // run_goal swept the expired row; a second sweep has nothing left to do.
+    assert_eq!(store.expire_stale_approvals().unwrap(), 0);
 }

@@ -5,7 +5,10 @@
 .DESCRIPTION
     Loops over the targets in targets.yml (or targets.example.yml), runs
     `agentbug.exe engage ...` for each local target, and saves the report, log,
-    replay JSONL and ground-truth manifest under eval/results/<id>/.
+    ground-truth manifest, trace export, joined replay JSONL and the scorer's
+    recorded score under eval/results/<id>/. The engagement replay
+    (workspace/replay-<id>.jsonl) is fed to `score.py --replay` after being
+    joined with trace_events exported from the SQLite DB.
 
     Without -Execute nothing is run and nothing is written. This is scaffolding:
     no benchmark result is asserted. An operator must run real engagements and
@@ -49,6 +52,8 @@ if ($Help) {
 }
 
 $scriptDir = $PSScriptRoot
+$exporter = Join-Path $scriptDir 'export_trace.py'
+$scorer = Join-Path $scriptDir 'score.py'
 if (-not $Targets) {
     $target = Join-Path $scriptDir 'targets.yml'
     if (-not (Test-Path -LiteralPath $target)) {
@@ -123,57 +128,6 @@ if ($inventory.Count -eq 0) {
     throw "no targets found in $Targets"
 }
 
-# Export trace_events from the engagement SQLite DB into score.py-compatible JSONL.
-$replayExporter = @'
-import json, sqlite3, sys
-
-db_path, out_path = sys.argv[1], sys.argv[2]
-conn = sqlite3.connect(db_path)
-conn.row_factory = sqlite3.Row
-rows = conn.execute(
-    "SELECT engagement_id, run_id, kind, payload_json, created_at "
-    "FROM trace_events ORDER BY rowid"
-).fetchall()
-with open(out_path, "w", encoding="utf-8") as handle:
-    for row in rows:
-        try:
-            payload = json.loads(row["payload_json"] or "{}")
-        except ValueError:
-            payload = {"raw": row["payload_json"]}
-        if not isinstance(payload, dict):
-            payload = {"value": payload}
-        event = {
-            "kind": row["kind"],
-            "run_id": row["run_id"],
-            "engagement_id": row["engagement_id"],
-            "created_at": row["created_at"],
-        }
-        event.update(payload)
-        handle.write(json.dumps(event, ensure_ascii=False) + "\n")
-        kind = row["kind"]
-        if kind.endswith("report.ready") or "sha256" in payload:
-            handle.write(json.dumps({
-                "kind": "report",
-                "run_id": row["run_id"],
-                "sha256": payload.get("sha256", ""),
-            }, ensure_ascii=False) + "\n")
-        if payload.get("finding_id") or payload.get("finding"):
-            handle.write(json.dumps({
-                "kind": "finding",
-                "run_id": row["run_id"],
-                "id": payload.get("finding_id", payload.get("finding")),
-                "type": payload.get("type"),
-                "cwe": payload.get("cwe"),
-            }, ensure_ascii=False) + "\n")
-        if "prompt_tokens" in payload or "completion_tokens" in payload:
-            handle.write(json.dumps({
-                "kind": "usage",
-                "run_id": row["run_id"],
-                "prompt_tokens": payload.get("prompt_tokens", 0),
-                "completion_tokens": payload.get("completion_tokens", 0),
-            }, ensure_ascii=False) + "\n")
-'@
-
 $summary = @()
 foreach ($target in $inventory) {
     $id = [string]$target['id']
@@ -200,6 +154,9 @@ foreach ($target in $inventory) {
     Write-Host "[$id] $Agentbug $($arguments -join ' ')"
     Write-Host "        report -> $report | replay -> $replay | log -> $log"
     if (-not $Execute) {
+        Write-Host "        export -> python $exporter <engagement.db> <trace.jsonl>"
+        Write-Host "        replay -> python $exporter <engagement.db> $replay --merge <workspace/replay-<id>.jsonl>"
+        Write-Host "        score  -> python $scorer --dir $targetDir --manifest $manifestPath --replay $replay --json"
         $summary += [pscustomobject]@{ Id = $id; Status = 'dry-run'; Report = $report }
         continue
     }
@@ -225,14 +182,38 @@ foreach ($target in $inventory) {
         if ($status -eq 'ok') { $status = 'no-report' }
     }
 
+    # The engagement writes workspace/replay-<engagement-id>.jsonl. Join it with
+    # the authoritative trace_events export: the trace DB wins for kinds both
+    # sources carry (no double-counted findings or tokens), the engagement log
+    # contributes brief/plan/lifecycle context the DB does not store here.
+    $engagementReplay = Get-ChildItem -LiteralPath $workDir -Recurse -File -Filter 'replay-*.jsonl' `
+        -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $trace = Join-Path $targetDir 'trace.jsonl'
+    $replayCopy = Join-Path $targetDir 'engagement-replay.jsonl'
+    if ($engagementReplay) {
+        Copy-Item -LiteralPath $engagementReplay.FullName -Destination $replayCopy -Force
+    }
     if (Test-Path -LiteralPath $dbPath) {
         try {
-            & python -c $replayExporter $dbPath $replay
+            & python $exporter $dbPath $trace
+            if ($engagementReplay) {
+                & python $exporter $dbPath $replay --merge $engagementReplay.FullName
+            } else {
+                & python $exporter $dbPath $replay
+                Write-Warning "[$id] no workspace/replay-*.jsonl found; trace-only replay"
+            }
         } catch {
             Write-Warning "[$id] could not export replay JSONL: $_"
         }
     } else {
         Write-Warning "[$id] engagement DB not found; replay not exported"
+    }
+
+    if (Test-Path -LiteralPath $replay) {
+        $score = Join-Path $targetDir 'score.json'
+        & python $scorer --dir $targetDir --manifest $manifestPath --replay $replay --json |
+            Set-Content -LiteralPath $score -Encoding UTF8
+        Write-Host "[$id] score -> $score (recorded for the operator; not a benchmark claim)"
     }
 
     $summary += [pscustomobject]@{ Id = $id; Status = $status; Report = $report }
@@ -244,4 +225,4 @@ $summary | Format-Table -AutoSize | Out-String | Write-Host
 if (-not $Execute) {
     Write-Host 'Dry run only - nothing executed. Re-run with -Execute to actually benchmark.'
 }
-Write-Host 'Scaffolding only: no results are asserted. Score with: python eval/score.py --dir eval/results --manifest <manifest.json> --replay <replay.jsonl>'
+Write-Host 'Scaffolding only: no results are asserted. Scores are recorded per target in eval/results/<id>/score.json for operator review.'

@@ -1,8 +1,11 @@
-# MiniBug (hardened MVP)
+# AgentBug (hardened MVP)
 
-MiniBug is a universal, LLM-agnostic agent core written in Rust, inspired by the
+AgentBug is a universal, LLM-agnostic agent core written in Rust, inspired by the
 OpenCode execution model. It is aimed at assisted bug-bounty work: scoped tool
 execution, durable sessions, evidence capture, and redacted reports.
+
+**Brand asset:** `assets/agentbug-logo.svg` (source) and `assets/agentbug-logo.png`
+are used as the desktop window icon and in-app logo.
 
 ## Features
 
@@ -43,13 +46,13 @@ execution, durable sessions, evidence capture, and redacted reports.
 
 ## Autonomous engagement flow
 
-MiniBug can run a full engagement from a single program URL. It fetches the public
+AgentBug can run a full engagement from a single program URL. It fetches the public
 program page, extracts scope and Rules of Engagement (ROE), queues tasks, explores
 in-scope assets, validates findings with a deterministic verifier, and drafts a
 standard report — all **locally**.
 
 ```sh
-minibug engage --url <program-url> --cwd ./engagement
+agentbug engage --url <program-url> --cwd ./engagement
 ```
 
 The same flow is available in the desktop **Engagement** tab (paste the program URL,
@@ -60,13 +63,13 @@ log.
 Non-negotiable guardrails:
 
 - **Local report only, no auto-submit.** The report is written under `--cwd` for
-  operator review. MiniBug never submits findings to a platform, email, or third
+  operator review. AgentBug never submits findings to a platform, email, or third
   party; there is no submission path.
 - **ROE fail-closed.** If the program page cannot be fetched or scope/ROE cannot be
   established, the engagement refuses to act. Any target not explicitly in scope is
   refused, and scope is re-evaluated before every network action (including after
   resume).
-- **Pause / abort at any time.** `minibug engage pause --engagement <id>` stops at the
+- **Pause / abort at any time.** `agentbug engage pause --engagement <id>` stops at the
   next safe boundary and is resumable with `... resume --engagement <id>`;
   `... abort --engagement <id>` is terminal. Both stop new tool calls immediately.
 - **Autonomy is still policy-bounded.** Budgets, scope, allowlists, tool risk labels,
@@ -85,7 +88,7 @@ tool runtime as the CLI; no browser or WebView2 is required.
 start-desktop.bat
 ```
 
-The window reads and writes `minibug.toml` in its working directory. Tabs:
+The window reads and writes `agentbug.toml` in its working directory. Tabs:
 **Engagement** (program URL, trace events, tasks, clues, findings, pause/resume/abort,
 report export), Sessions (messages/events/findings/assets/artifacts/coverage/report),
 New Run, Approvals (approve/deny with TTL shown), Config (all settings + scope), Tools
@@ -95,38 +98,38 @@ worker thread, so the UI stays responsive.
 The CLI remains available for scripting and automation:
 
 ```sh
-minibug init --force                       # write minibug.toml
-minibug engage --url <program-url> --cwd ./engagement  # autonomous engagement
-minibug engage pause --engagement <id>     # pause / resume / abort controls
-minibug engage resume --engagement <id>
-minibug engage abort --engagement <id>
-minibug engagement --id <id> --status      # inspect/control an engagement
-minibug run --goal "enumerate in-scope hosts" --cwd ./engagement
-minibug sessions
-minibug approve --session <id>             # or: minibug deny --session <id>
-minibug findings --session <id>
-minibug assets --session <id>
-minibug artifacts --session <id>
-minibug report --session <id> --output report.md
-minibug logs --session <id>
-minibug status --session <id>          # state, budget, coverage, hypotheses
-minibug approvals --session <id>       # pending approvals + expiry
-minibug doctor                         # validate config/env
-minibug scope-import --file brief.txt --program "Acme"
-minibug hypothesis --session <id> --add "IDOR on /api/users"
-minibug plan --session <id>              # uncovered in-scope targets
-minibug tools                            # external adapter availability
-minibug tokens --session <id>            # estimated tokens + cost
-minibug verify-log --session <id>        # event hash chain integrity
+agentbug init --force                       # write agentbug.toml
+agentbug engage --url <program-url> --cwd ./engagement  # autonomous engagement
+agentbug engage pause --engagement <id>     # pause / resume / abort controls
+agentbug engage resume --engagement <id>
+agentbug engage abort --engagement <id>
+agentbug engagement --id <id> --status      # inspect/control an engagement
+agentbug run --goal "enumerate in-scope hosts" --cwd ./engagement
+agentbug sessions
+agentbug approve --session <id>             # or: agentbug deny --session <id>
+agentbug findings --session <id>
+agentbug assets --session <id>
+agentbug artifacts --session <id>
+agentbug report --session <id> --output report.md
+agentbug logs --session <id>
+agentbug status --session <id>          # state, budget, coverage, hypotheses
+agentbug approvals --session <id>       # pending approvals + expiry
+agentbug doctor                         # validate config/env
+agentbug scope-import --file brief.txt --program "Acme"
+agentbug hypothesis --session <id> --add "IDOR on /api/users"
+agentbug plan --session <id>              # uncovered in-scope targets
+agentbug tools                            # external adapter availability
+agentbug tokens --session <id>            # estimated tokens + cost
+agentbug verify-log --session <id>        # event hash chain integrity
 ```
 
-Configuration example: `config/minibug.example.toml`. Set `scope.in_scope` for
+Configuration example: `config/agentbug.example.toml`. Set `scope.in_scope` for
 every real engagement; network tools deny targets outside scope.
 
 ## Build & test
 
 ```sh
-cd minibug
+cd agentbug
 cargo test --workspace
 cargo build --release
 ```

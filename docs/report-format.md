@@ -1,7 +1,7 @@
-# MiniBug Standard Report Format
+# AgentBug Standard Report Format
 
 Every engagement report conforms to this canonical template. The local report is a
-draft for human review — MiniBug never submits it (see `docs/engagement.md`).
+draft for human review — AgentBug never submits it (see `docs/engagement.md`).
 
 ## Template
 
@@ -9,7 +9,7 @@ Copy this template verbatim; keep the section order and headings. Replace bracke
 placeholders. The heading names matter: `eval/score.py` checks for them.
 
 ~~~markdown
-# MiniBug Engagement Report
+# AgentBug Engagement Report
 
 - Engagement ID: <id>
 - Program URL: <program-url>
@@ -118,7 +118,7 @@ gated or not used. Reference the playbooks/hypotheses where relevant.>
 
 ### Appendix E — Reproduction command
 
-`minibug engage --url <program-url> --cwd <engagement-dir>`
+`agentbug engage --url <program-url> --cwd <engagement-dir>`
 ~~~
 
 ## Finding field contract

@@ -1,4 +1,4 @@
-# MiniBug evaluation harness
+# AgentBug evaluation harness
 
 Internal benchmarking scaffolding for the autonomous engagement flow. See
 `../docs/evaluation.md` for the full plan, metrics, baseline, and replay requirements.

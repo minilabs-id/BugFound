@@ -1,10 +1,10 @@
-# MiniBug Autonomous Engagement — User Guide
+# AgentBug Autonomous Engagement — User Guide
 
-This guide covers the autonomous engagement flow: point MiniBug at a public bug-bounty
+This guide covers the autonomous engagement flow: point AgentBug at a public bug-bounty
 program URL and let it fetch the brief, derive scope and Rules of Engagement (ROE),
 queue tasks, explore in-scope assets, validate findings, and draft a standard report.
 
-> **Read this first.** MiniBug produces a **local report only**. It never submits a
+> **Read this first.** AgentBug produces a **local report only**. It never submits a
 > finding to a platform, by email, or to any third party. There is no auto-submit
 > path. Scope/ROE enforcement is **fail-closed**, and the run can be **paused** or
 > **aborted** at any time. See the safety rules below.
@@ -28,7 +28,7 @@ hash chain, so a run can be inspected and replayed after the fact.
 
 | Rule | What it means in practice |
 | --- | --- |
-| **Local report only** | The report is written inside `--cwd`. Review and submit it yourself. MiniBug has no submission adapter by design (see `PRODUCTION_PLAN.md` §7). |
+| **Local report only** | The report is written inside `--cwd`. Review and submit it yourself. AgentBug has no submission adapter by design (see `PRODUCTION_PLAN.md` §7). |
 | **No auto-submit** | No CLI flag or desktop button submits to HackerOne/Bugcrowd/Intigriti/etc. If a future build adds one, it must be opt-in and gated. |
 | **ROE fail-closed** | If the program page cannot be fetched, parsed, or its scope/ROE cannot be established, the engagement does not act on that target. A target that is not explicitly in scope is refused. Scope is re-evaluated before every network action, including after resume. |
 | **Pause / abort** | `pause` stops at the next safe boundary and keeps resumable state; `abort` is terminal. Both stop new tool calls immediately. |
@@ -37,14 +37,14 @@ hash chain, so a run can be inspected and replayed after the fact.
 ## 3. Prerequisites
 
 - An **isolated host/VM or container** with restricted egress (see `docs/deployment.md`).
-  MiniBug is a hardened agent runtime, not an OS sandbox.
+  AgentBug is a hardened agent runtime, not an OS sandbox.
 - A compiled binary (`cargo build --release`) or the desktop build (`start-desktop.bat`).
 - An OpenAI-compatible endpoint (API key read from the environment, never stored in
   the workspace).
 
 ## 4. Get a program URL
 
-The URL is the public program/brief page MiniBug reads to learn scope and ROE. Common sources:
+The URL is the public program/brief page AgentBug reads to learn scope and ROE. Common sources:
 
 - Public bug-bounty program pages (HackerOne, Bugcrowd, Intigriti, YesWeHack, etc.).
 - A customer-provided scope brief or `security.txt` (`https://example.com/.well-known/security.txt`).
@@ -52,13 +52,13 @@ The URL is the public program/brief page MiniBug reads to learn scope and ROE. C
 
 Use the canonical, public URL for the program. If the page requires a login, see
 [Limitations](#10-limitations). You can also pre-seed scope from a local brief with the
-existing `minibug scope-import --file brief.txt --program "Acme"` command before running
+existing `agentbug scope-import --file brief.txt --program "Acme"` command before running
 the engagement.
 
 ## 5. Configure the API key
 
-`config/minibug.example.toml` uses `env:VAR` indirection. Set the variable in the shell
-that launches MiniBug:
+`config/agentbug.example.toml` uses `env:VAR` indirection. Set the variable in the shell
+that launches AgentBug:
 
 ```sh
 # POSIX / macOS / Linux
@@ -67,7 +67,7 @@ export OPENAI_API_KEY="sk-..."
 $env:OPENAI_API_KEY = "sk-..."
 ```
 
-And in `minibug.toml`:
+And in `agentbug.toml`:
 
 ```toml
 [llm]
@@ -76,7 +76,7 @@ api_key = "env:OPENAI_API_KEY"
 default_model = ""                    # empty → auto-discover via GET /v1/models
 ```
 
-Verify with `minibug doctor` (checks config/env). Keep the key out of the engagement
+Verify with `agentbug doctor` (checks config/env). Keep the key out of the engagement
 workspace; it is redacted from reports, CLI output, events, and tool output.
 
 ## 6. Run an engagement
@@ -84,7 +84,7 @@ workspace; it is redacted from reports, CLI output, events, and tool output.
 ### CLI
 
 ```sh
-minibug engage --url https://hackerone.com/acme --cwd ./engagement
+agentbug engage --url https://hackerone.com/acme --cwd ./engagement
 ```
 
 A new engagement row is created in state `idle`, then transitions through `running`
@@ -117,14 +117,14 @@ The Engagement tab and the trace log show a stream of events. Typical kinds incl
 
 The authoritative source is the `trace_events` table (`kind`, `payload_json`,
 `created_at`, `run_id`) plus the tamper-evident session event hash chain. Verify chain
-integrity with `minibug verify-log --session <id>`.
+integrity with `agentbug verify-log --session <id>`.
 
 ## 8. Pause, resume, abort
 
 ```sh
-minibug engage pause  --engagement <id>
-minibug engage resume --engagement <id>
-minibug engage abort  --engagement <id>
+agentbug engage pause  --engagement <id>
+agentbug engage resume --engagement <id>
+agentbug engage abort  --engagement <id>
 ```
 
 - **Pause** stops new tool calls at the next safe boundary and persists all state.
@@ -139,11 +139,11 @@ minibug engage abort  --engagement <id>
 Inspect with the existing commands (`--session` is the underlying run session):
 
 ```sh
-minibug engagements
-minibug findings  --session <id>
-minibug artifacts --session <id>
-minibug assets    --session <id>
-minibug status    --session <id>       # state, budget, coverage, hypotheses
+agentbug engagements
+agentbug findings  --session <id>
+agentbug artifacts --session <id>
+agentbug assets    --session <id>
+agentbug status    --session <id>       # state, budget, coverage, hypotheses
 ```
 
 Findings carry severity, CVSS v3.1 vector, CWE, reproduction steps, PoC, impact,
@@ -152,7 +152,7 @@ remediation, and an evidence hash. See `docs/report-format.md` for the canonical
 Export the report locally:
 
 ```sh
-minibug report --session <id> --output report.md
+agentbug report --session <id> --output report.md
 ```
 
 Or use **Save report to file** in the desktop Engagement tab. The file is written under
@@ -161,7 +161,7 @@ or submitting it.**
 
 ## 10. Limitations
 
-- **Public pages, not login portals.** MiniBug reads unauthenticated public program
+- **Public pages, not login portals.** AgentBug reads unauthenticated public program
   pages. It cannot solve CAPTCHAs, log in, or read authenticated dashboards. If a
   program hides its scope behind a login, import a scope brief manually and verify
   authorization yourself.

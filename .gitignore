@@ -1,4 +1,4 @@
 /target
-/.minibug
-/minibug.toml
+/.agentbug
+/agentbug.toml
 **/*.rs.bk

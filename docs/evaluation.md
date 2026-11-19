@@ -1,4 +1,4 @@
-# MiniBug Internal Benchmark Plan
+# AgentBug Internal Benchmark Plan
 
 Status: internal plan. All benchmarks run against **local, licensed testbeds**. No live
 bug-bounty program is ever a benchmark target.
@@ -28,7 +28,7 @@ row in a DB, or a verifier script). Ground truth is never shown to the agent.
 1. Start the target testbed in the isolated network; confirm reachability.
 2. Create a task config in `eval/targets.example.yml` (URL, expected classes).
 3. Run the harness: `bash eval/run_benchmark.sh --execute` (dry-run is the default).
-4. Each run executes `minibug engage --url <url> --cwd <workdir>` and writes a report
+4. Each run executes `agentbug engage --url <url> --cwd <workdir>` and writes a report
    under `eval/results/<target>/report.md`.
 5. Score with `python3 eval/score.py --dir eval/results`.
 6. Verify each reported finding against the ground-truth oracle; record verdicts.
@@ -55,11 +55,11 @@ fail-closed events.
 
 Every evaluation must include a **plain-agent baseline** following the methodology of
 **arXiv:2607.13085**: the same LLM and the same task set, but a bare agent loop with
-no MiniBug scope engine, no planning/coverage ledger, no deterministic verifier, and
+no AgentBug scope engine, no planning/coverage ledger, no deterministic verifier, and
 no structured evidence pipeline.
 
-Report all metrics for both MiniBug and the baseline on identical tasks and budget.
-The purpose is to isolate the value added by MiniBug's guardrails (precision, FPR,
+Report all metrics for both AgentBug and the baseline on identical tasks and budget.
+The purpose is to isolate the value added by AgentBug's guardrails (precision, FPR,
 reproducibility) versus raw discovery ability (recall, time-to-first-finding).
 
 ## 6. Replay logs (required)
@@ -73,7 +73,7 @@ Every benchmark run must emit a deterministic **Cochise** replay log containing:
 - lifecycle events (pause/resume/abort) and the final report hash.
 
 Replay logs are used to (a) reproduce a finding, (b) audit why a false positive was
-produced, and (c) diff MiniBug against the baseline. A run without a replay log is not
+produced, and (c) diff AgentBug against the baseline. A run without a replay log is not
 a valid benchmark result.
 
 ## 7. Acceptance thresholds (proposed)

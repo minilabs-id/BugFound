@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Score MiniBug Markdown engagement reports. Standard library only.
+"""Score AgentBug Markdown engagement reports. Standard library only.
 
 Usage:
     python3 score.py report.md [report2.md ...]

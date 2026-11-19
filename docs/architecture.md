@@ -1,7 +1,7 @@
-# MiniBug Architecture (Phase 1: Universal Core)
+# AgentBug Architecture (Phase 1: Universal Core)
 
 ## Overview
-MiniBug is a Rust, LLM-agnostic universal agent core. The design borrows proven ideas from OpenCode while simplifying for performance and maintainability:
+AgentBug is a Rust, LLM-agnostic universal agent core. The design borrows proven ideas from OpenCode while simplifying for performance and maintainability:
 
 - **Session**: unit of work with persistent state (id, goal, state, model, history).
 - **Runner loop**: bounded step loop — load history → LLM chat (with tool schemas) → if tool calls: policy-evaluate & execute (or pause for approval/deny) → append results → continue; else finalize.

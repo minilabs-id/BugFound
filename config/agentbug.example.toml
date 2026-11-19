@@ -1,0 +1,55 @@
+# AgentBug example config (universal agent core MVP)
+# Copy to agentbug.toml and adjust.
+
+[llm]
+# OpenAI-compatible endpoint. base_url may include or omit /v1
+base_url = "https://api.openai.com"
+# api_key can be a literal or env:VAR_NAME
+api_key = "env:OPENAI_API_KEY"
+# Empty means runtime discovery via GET /v1/models (with first model as fallback)
+default_model = ""
+timeout_ms = 60000
+# Optional cost tracking (USD per 1K tokens)
+cost_per_1k_input = 0.0
+cost_per_1k_output = 0.0
+
+[agent]
+# "ask" = require approval for risky tools, "full_auto" = allow within policy
+mode = "ask"
+max_steps = 20
+# Optional system prompt injected at the start of every session
+system_prompt = "You are a careful bug bounty agent. Stay within engagement scope."
+# Optional guardrails. 0 = unlimited.
+max_tool_calls = 100
+max_network_calls = 50
+requests_per_minute = 60
+# Safe/read-only tools that may be auto-approved without a human prompt
+auto_approve_tools = ["echo"]
+# Hard cap on estimated tokens per session (0 = unlimited)
+max_estimated_tokens = 0
+
+[storage]
+path = ".agentbug/agentbug.db"
+
+# Bug bounty engagement scope (optional but recommended for network tools).
+# If in_scope is non-empty, network targets must match at least one entry.
+# out_of_scope always denies. Patterns: host, *.domain, URL, or CIDR-like prefix.
+[scope]
+engagement = ""
+in_scope = []
+out_of_scope = []
+notes = "Program rules / contacts"
+
+# Network egress. Proxy is OFF by default because it bypasses DNS pinning.
+# Enable only for an explicit trusted proxy (e.g. Burp) in a controlled setup.
+[network]
+allow_proxy = false
+# proxy_url = "http://127.0.0.1:8080"
+# Local lab/staging targets are blocked by default; opt in explicitly.
+trusted_local_targets = []
+
+# External recon adapters are disabled by default. Binaries must be installed.
+[external_tools]
+enabled = false
+auto_detect = true
+# commands = { nuclei = "/usr/local/bin/nuclei", nmap = "/usr/bin/nmap" }

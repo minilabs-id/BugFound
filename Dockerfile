@@ -17,7 +17,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN cargo build --release --locked -p minibug-cli
+RUN cargo build --release --locked -p agentbug-cli
 
 # ---------- runtime ----------
 FROM debian:bookworm-slim AS runtime
@@ -26,17 +26,17 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system minibug \
-    && useradd --system --gid minibug --home-dir /home/minibug --create-home minibug \
+    && groupadd --system agentbug \
+    && useradd --system --gid agentbug --home-dir /home/agentbug --create-home agentbug \
     && mkdir -p /work \
-    && chown minibug:minibug /work
+    && chown agentbug:agentbug /work
 
-COPY --from=builder /build/target/release/minibug-cli /usr/local/bin/minibug
+COPY --from=builder /build/target/release/agentbug /usr/local/bin/agentbug
 
 # No credentials are baked into the image: the API key is read from the
-# environment at runtime (llm.api_key = "env:OPENAI_API_KEY" in minibug.toml).
+# environment at runtime (llm.api_key = "env:OPENAI_API_KEY" in agentbug.toml).
 ENV RUST_LOG=info
 WORKDIR /work
-USER minibug
+USER agentbug
 
-ENTRYPOINT ["minibug"]
+ENTRYPOINT ["agentbug"]

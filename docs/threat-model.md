@@ -1,4 +1,4 @@
-# Threat Model MiniBug (baseline audit 2026-11-19)
+# Threat Model AgentBug (baseline audit 2026-11-19)
 
 Ruang lingkup: agent bug-bounty self-hosted, single-operator / small team,
 berjalan di container/VM dengan egress terbatas, memakai LLM OpenAI-compatible.
@@ -34,7 +34,7 @@ dari environment bukan dari image. Rincian ada di `deployment.md`.
 
 ## Ancaman baru: autonomous engagement flow
 
-Tambahan untuk alur `minibug engage --url <program-url>` dan tab Engagement desktop.
+Tambahan untuk alur `agentbug engage --url <program-url>` dan tab Engagement desktop.
 Semua ancaman di bawah dipetakan ke guardrail yang sama dengan tabel di atas, ditambah
 guardrail khusus engagement (ROE fail-closed, verifier deterministik, local-only).
 

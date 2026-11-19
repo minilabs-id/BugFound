@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/minibug-core",
-  "crates/minibug-llm",
-  "crates/minibug-tools",
-  "crates/minibug-policy",
-  "crates/minibug-store",
-  "crates/minibug-cli",
-  "crates/minibug-desktop",
-  "crates/minibug-engagement",
+  "crates/agentbug-core",
+  "crates/agentbug-llm",
+  "crates/agentbug-tools",
+  "crates/agentbug-policy",
+  "crates/agentbug-store",
+  "crates/agentbug-cli",
+  "crates/agentbug-desktop",
+  "crates/agentbug-engagement",
 ]
 
 [workspace.package]

@@ -1,7 +1,7 @@
-# MiniBug — Audit & Production Readiness Plan
+# AgentBug — Audit & Production Readiness Plan
 
 **Status:** final (audit ulang selesai, 2026-11-19).
-**Verdict audit:** MiniBug adalah **prototype yang ter-hardening dengan baik**, bukan agent bug-bounty siap produksi. Fitur inti berjalan dan tes hijau, tetapi ada tiga kelas blocker: (1) pinning SSRF kalah saat proxy aktif, (2) boundary shell/scope bisa dilewati dan salah dilabeli, (3) budget & approval tidak durable/concurrency-safe. Klaim "production-ready" saat ini terlalu optimistis.
+**Verdict audit:** AgentBug adalah **prototype yang ter-hardening dengan baik**, bukan agent bug-bounty siap produksi. Fitur inti berjalan dan tes hijau, tetapi ada tiga kelas blocker: (1) pinning SSRF kalah saat proxy aktif, (2) boundary shell/scope bisa dilewati dan salah dilabeli, (3) budget & approval tidak durable/concurrency-safe. Klaim "production-ready" saat ini terlalu optimistis.
 
 ---
 
@@ -82,7 +82,7 @@ Smoke test: HTTP program lokal → `engage` → 9/9 playbook → laporan `.md` d
 | `cargo fmt --all --check` | lolos |
 | `cargo test --workspace` | 31 tes lolos |
 | `cargo build --release --workspace` | lolos |
-| Config contoh | `config/minibug.example.toml` valid TOML |
+| Config contoh | `config/agentbug.example.toml` valid TOML |
 | Sudah benar-benar ada | approval/resume, lease & stale recovery, scope in/out, budget in-process, blokir IP private, guardrail shell substring, redaction parsial, report, persistensi finding/asset/artifact |
 | Tidak ada / belum benar | git repo, CI, lockfile di-commit, Dockerfile, redaction JSON/header, budget durable, atomic approval, guarded transition, compaction, adapter Phase 2 |
 
@@ -110,7 +110,7 @@ Smoke test: HTTP program lokal → `engage` → 9/9 playbook → laporan `.md` d
 
 **F-04 — Approval bisa dieksekusi dua kali; resolve & claim tidak atomik; policy tidak dievaluasi ulang** (High)
 - `store/lib.rs:507-514` (`UPDATE` tanpa predicate `status='pending'` / affected-row check), `:258-291` (`claim_session` SELECT lalu UPDATE); `core/lib.rs:475-535` (state check, baca approval, claim terpisah), `:578-612` (approve menjalankan args tanpa `policy.evaluate` ulang).
-- Dampak: dua proses `minibug approve` (desain memang lintas proses) bisa sama-sama mengklaim, resolve, dan menjalankan aksi destruktif. Perubahan scope/config antara park dan resume tidak terlihat.
+- Dampak: dua proses `agentbug approve` (desain memang lintas proses) bisa sama-sama mengklaim, resolve, dan menjalankan aksi destruktif. Perubahan scope/config antara park dan resume tidak terlihat.
 - Fix: `UPDATE approvals ... WHERE id=? AND status='pending'` + cek affected; claim dengan single conditional `UPDATE ... WHERE owner_id IS NULL OR lease_expires_at < now` + cek affected; bungkus dengan `BEGIN IMMEDIATE`; evaluasi ulang policy sebelum eksekusi.
 
 **F-05 — Redaction tidak lengkap, tidak konsisten, dan duplikatnya dead code** (High / data exposure)
@@ -162,10 +162,10 @@ Estimasi dalam hari kerja satu engineer. ID merujuk ke temuan di atas.
 ### Phase 0 — Release hygiene (2–3 hari)
 | ID | Task | Acceptance |
 | --- | --- | --- |
-| P0-1 | Init git repo minibug, commit baseline, tag `v0.1.0-mvp`, branch `dev` | `git status` bersih, tag ada |
+| P0-1 | Init git repo agentbug, commit baseline, tag `v0.1.0-mvp`, branch `dev` | `git status` bersih, tag ada |
 | P0-2 | Hapus `Cargo.lock` dari `.gitignore`, commit lockfile | `git ls-files Cargo.lock` tidak kosong |
 | P0-3 | CI: `fmt --check`, `clippy -D warnings`, `test`, `build --release` di Linux + Windows | Badge hijau dua job |
-| P0-4 | Dockerfile multi-stage, runtime non-root, image `<100MB` | `docker run --rm minibug --help` sukses |
+| P0-4 | Dockerfile multi-stage, runtime non-root, image `<100MB` | `docker run --rm agentbug --help` sukses |
 | P0-5 | Hapus `thiserror` unused, tambah `deny.toml` + `cargo deny check` | Clean |
 | P0-6 | Pin toolchain versi konkret (bukan `stable`) | `cargo --version` sesuai pin di CI |
 
@@ -226,7 +226,7 @@ Estimasi dalam hari kerja satu engineer. ID merujuk ke temuan di atas.
 
 ## 5. Exit criteria global
 
-MiniBug baru disebut "siap produksi" jika:
+AgentBug baru disebut "siap produksi" jika:
 
 - Phase 0–3 dan Phase 5 selesai. Phase 4 boleh sebagian dengan flag eksplisit, **kecuali P4-1 (compaction) wajib**.
 - `cargo deny check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`, `cargo build --release` hijau di CI Linux + Windows.

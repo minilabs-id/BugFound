@@ -1,0 +1,25 @@
+[package]
+name = "agentbug-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agentbug"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+toml.workspace = true
+agentbug-core = { path = "../agentbug-core" }
+agentbug-engagement = { path = "../agentbug-engagement" }
+agentbug-llm = { path = "../agentbug-llm" }
+agentbug-policy = { path = "../agentbug-policy" }
+agentbug-store = { path = "../agentbug-store" }
+agentbug-tools = { path = "../agentbug-tools" }

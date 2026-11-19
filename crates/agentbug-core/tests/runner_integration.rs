@@ -1,4 +1,8 @@
-use agentbug_core::{build_policy, build_policy_config, AgentConfig, Runner};
+use agentbug_core::inbox::{Delivery, Inbox, InboxKind};
+use agentbug_core::{
+    build_policy, build_policy_config, normalized_args_signature, record_provider_usage,
+    AgentConfig, Runner,
+};
 use agentbug_llm::{ChatMessage, ChatResponse, Llm, ToolCall, ToolSpec as LlmToolSpec};
 use agentbug_policy::Mode;
 use agentbug_store::Store;
@@ -358,7 +362,8 @@ async fn llm_error_fails_session_and_logs_event() {
     let session = store.list_sessions(10).unwrap().remove(0);
     assert_eq!(session.state, "failed");
     let events = store.list_events(&session.id, 50).unwrap();
-    assert!(events.iter().any(|e| e.kind == "llm.chat_failed"));
+    let chat_failed = events.iter().find(|e| e.kind == "llm.chat_failed").unwrap();
+    assert!(chat_failed.message.contains("category="));
     assert!(events.iter().any(|e| e.kind == "session.failed"));
 }
 
@@ -932,6 +937,8 @@ async fn autonomous_mode_allows_multi_target_batches() {
         AgentConfig {
             mode: Mode::FullAuto,
             max_steps: 5,
+            // These targets are explicitly pre-approved for this scenario.
+            auto_approve_all: true,
             ..Default::default()
         },
     );
@@ -1183,4 +1190,300 @@ async fn duplicate_tool_calls_are_skipped() {
     let session = store.list_sessions(10).unwrap().remove(0);
     let events = store.list_events(&session.id, 100).unwrap();
     assert!(events.iter().any(|e| e.kind == "tool.duplicate_skipped"));
+}
+
+#[tokio::test]
+async fn event_bus_receives_runner_events() {
+    let store = Store::open(":memory:").unwrap();
+    let llm = Arc::new(MockLlm::new(
+        "mock-model",
+        vec![ChatResponse {
+            content: Some("ok".into()),
+            tool_calls: vec![],
+            model: "mock-model".into(),
+        }],
+    ));
+    let runner = Runner::new(
+        store.clone(),
+        llm,
+        ToolRegistry::new(),
+        build_policy(Mode::Ask),
+        AgentConfig {
+            mode: Mode::Ask,
+            max_steps: 2,
+            ..Default::default()
+        },
+    );
+    assert_eq!(runner.run_goal("bus check").await.unwrap(), "ok");
+    let session = store.list_sessions(10).unwrap().remove(0);
+
+    let events = agentbug_core::event::EventBus::global().replay(&session.id);
+    assert!(events.iter().any(|e| e.kind == "session.created"));
+    assert!(events.iter().any(|e| e.kind == "session.completed"));
+    let created = events.iter().find(|e| e.kind == "session.created").unwrap();
+    let payload: Value = created.payload().unwrap();
+    assert_eq!(payload["level"], "info");
+    assert_eq!(payload["kind"], "session.created");
+}
+
+#[tokio::test]
+async fn inbox_control_cancel_interrupts_runner_at_step_boundary() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("inbox cancel").unwrap();
+    store.set_session_state(&session.id, "interrupted").unwrap();
+    store.set_session_model(&session.id, "mock-model").unwrap();
+    store.add_message(&session.id, "user", "continue").unwrap();
+    Inbox::global().enqueue(
+        &session.id,
+        InboxKind::Control,
+        json!({"op": "cancel"}),
+        Delivery::Queued,
+    );
+
+    // The model keeps asking for tools; the inbox cancel must still stop it.
+    let responses = (0..8)
+        .map(|i| ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: format!("c{i}"),
+                name: "echo".into(),
+                arguments: json!({"text": format!("work-{i}")}),
+            }],
+            model: "mock-model".into(),
+        })
+        .collect();
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(agentbug_tools::EchoTool));
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new("mock-model", responses)),
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            auto_approve_all: true,
+            max_steps: 8,
+            ..Default::default()
+        },
+    );
+
+    let err = runner
+        .resume_session(&session.id, "approve")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("interrupted"));
+    let state = store.get_session(&session.id).unwrap().unwrap();
+    assert_eq!(state.state, "interrupted");
+    assert!(!agentbug_core::execution::ExecutionCoordinator::global().is_cancelled(&session.id));
+}
+
+#[tokio::test]
+async fn full_auto_target_change_forces_approval() {
+    let store = Store::open(":memory:").unwrap();
+    let responses = vec![
+        ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "t1".into(),
+                name: "target_net".into(),
+                arguments: json!({"target": "first.example"}),
+            }],
+            model: "mock-model".into(),
+        },
+        ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "t2".into(),
+                name: "target_net".into(),
+                arguments: json!({"target": "second.example"}),
+            }],
+            model: "mock-model".into(),
+        },
+    ];
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(TargetNetTool));
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new("mock-model", responses)),
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            max_steps: 5,
+            ..Default::default()
+        },
+    );
+
+    runner.run_goal("target switch").await.unwrap();
+    let session = store.list_sessions(10).unwrap().remove(0);
+    assert_eq!(session.state, "waiting_approval");
+    assert!(store.get_pending_approval(&session.id).unwrap().is_some());
+    assert_eq!(store.coverage_count(&session.id).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn auto_approve_all_bypasses_target_change_guard() {
+    let store = Store::open(":memory:").unwrap();
+    let responses = vec![
+        ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "t1".into(),
+                name: "target_net".into(),
+                arguments: json!({"target": "first.example"}),
+            }],
+            model: "mock-model".into(),
+        },
+        ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "t2".into(),
+                name: "target_net".into(),
+                arguments: json!({"target": "second.example"}),
+            }],
+            model: "mock-model".into(),
+        },
+        ChatResponse {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            model: "mock-model".into(),
+        },
+    ];
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(TargetNetTool));
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new("mock-model", responses)),
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            auto_approve_all: true,
+            max_steps: 5,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(runner.run_goal("target switch").await.unwrap(), "done");
+    let session = store.list_sessions(10).unwrap().remove(0);
+    assert_eq!(session.state, "completed");
+    assert_eq!(store.coverage_count(&session.id).unwrap(), 2);
+}
+
+#[test]
+fn normalized_args_signature_sorts_object_keys_recursively() {
+    let a = json!({"b": 1, "a": {"z": 2, "y": [{"d": 4, "c": 3}]}});
+    let b = json!({"a": {"y": [{"c": 3, "d": 4}], "z": 2}, "b": 1});
+    assert_eq!(
+        normalized_args_signature("echo", &a),
+        normalized_args_signature("echo", &b)
+    );
+    assert_ne!(
+        normalized_args_signature("echo", &a),
+        normalized_args_signature("other", &a)
+    );
+}
+
+#[tokio::test]
+async fn duplicate_guard_uses_normalized_arguments() {
+    let make = |id: &str, first: bool| ToolCall {
+        id: id.into(),
+        name: "echo".into(),
+        arguments: if first {
+            json!({"text": "same", "extra": 1})
+        } else {
+            json!({"extra": 1, "text": "same"})
+        },
+    };
+    let responses = vec![
+        ChatResponse {
+            content: None,
+            tool_calls: vec![make("d1", true)],
+            model: "mock-model".into(),
+        },
+        ChatResponse {
+            content: None,
+            tool_calls: vec![make("d2", false)],
+            model: "mock-model".into(),
+        },
+        ChatResponse {
+            content: None,
+            tool_calls: vec![make("d3", true)],
+            model: "mock-model".into(),
+        },
+        ChatResponse {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            model: "mock-model".into(),
+        },
+    ];
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(agentbug_tools::EchoTool));
+    let store = Store::open(":memory:").unwrap();
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new("mock-model", responses)),
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            max_steps: 6,
+            ..Default::default()
+        },
+    );
+    assert_eq!(runner.run_goal("normalized dupes").await.unwrap(), "done");
+    let session = store.list_sessions(10).unwrap().remove(0);
+    let events = store.list_events(&session.id, 100).unwrap();
+    assert!(events.iter().any(|e| e.kind == "tool.duplicate_skipped"));
+}
+
+#[test]
+fn record_provider_usage_writes_durable_usage() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("usage").unwrap();
+    record_provider_usage(&store, &session.id, 100, 50, 0.25);
+    let usage = store.token_usage(&session.id).unwrap();
+    assert_eq!(usage.prompt_tokens, 100);
+    assert_eq!(usage.completion_tokens, 50);
+    assert!((usage.cost_usd - 0.25).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn stall_guard_ignores_coverage_only_progress() {
+    let store = Store::open(":memory:").unwrap();
+    let responses = (0..8)
+        .map(|i| ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: format!("s{i}"),
+                name: "target_net".into(),
+                arguments: json!({"target": format!("host-{i}.example")}),
+            }],
+            model: "mock-model".into(),
+        })
+        .collect();
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(TargetNetTool));
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new("mock-model", responses)),
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            auto_approve_all: true,
+            max_steps: 8,
+            stall_limit: 2,
+            ..Default::default()
+        },
+    );
+
+    let out = runner.run_goal("coverage only").await.unwrap();
+    assert!(out.contains("No new findings"));
+    let session = store.list_sessions(10).unwrap().remove(0);
+    assert_eq!(session.state, "completed");
+    // One step did record coverage, but coverage alone never resets the guard.
+    assert_eq!(store.coverage_count(&session.id).unwrap(), 1);
+    let events = store.list_events(&session.id, 100).unwrap();
+    assert!(events.iter().any(|e| e.kind == "runner.stall_stop"));
 }

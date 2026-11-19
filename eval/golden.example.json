@@ -1,0 +1,24 @@
+{
+  "project": "golden-example",
+  "description": "Small illustrative ground-truth dataset for a local testbed. This is an example input for eval/score.py, NOT a recorded benchmark result.",
+  "expected_vulns": [
+    {
+      "id": "sqli",
+      "cwe": "CWE-89",
+      "endpoint": "POST /login",
+      "aliases": ["sql-injection"]
+    },
+    {
+      "id": "xss",
+      "cwe": "CWE-79",
+      "endpoint": "GET /search?q=",
+      "aliases": ["reflected-xss"]
+    },
+    {
+      "id": "idor",
+      "cwe": "CWE-639",
+      "endpoint": "GET /api/users/{id}",
+      "aliases": ["broken-access-control"]
+    }
+  ]
+}

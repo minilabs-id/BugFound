@@ -1,47 +1,109 @@
-# AgentBug Architecture (Phase 1: Universal Core)
+# AgentBug Architecture
 
 ## Overview
-AgentBug is a Rust, LLM-agnostic universal agent core. The design borrows proven ideas from OpenCode while simplifying for performance and maintainability:
 
-- **Session**: unit of work with persistent state (id, goal, state, model, history).
-- **Runner loop**: bounded step loop — load history → LLM chat (with tool schemas) → if tool calls: policy-evaluate & execute (or pause for approval/deny) → append results → continue; else finalize.
-- **Tool runtime**: typed tools with schema, risk label, validated args, timeout/capture, truncated outputs.
-- **Policy/Permission**: `ask` vs `full_auto` modes, allow/ask/deny decisions, target allow/deny hooks, default-deny for destructive/intrusive actions.
-- **LLM layer**: OpenAI-compatible `/v1/chat/completions` + tool calling; `base_url` normalization; model auto-discovery via `GET /v1/models` with `default_model` fallback.
-- **Store**: SQLite (WAL) for sessions/messages/approvals (minimal in MVP).
+AgentBug is a Rust, LLM-agnostic agent core with a local bug-bounty engagement
+layer. The design borrows the durable-session idea from OpenCode but keeps the
+execution model deliberately simple: one bounded Runner step loop, typed tools,
+a typed policy, and SQLite as the single source of truth. Every feature advertised
+in `README.md` resolves to a call site in the evidence matrix at
+`docs/PRODUCTION_PLAN.md` §2; if it is not in that matrix, it is not a claim.
 
-## Execution & control (target model, inspired by OpenCode)
-- Cooperative `resume/wake/interrupt/await_idle` with wake coalescing and durable **run claim** for crash recovery.
-- Continuations and inbox (steer vs queued input) to avoid losing control/state.
-- Classified outcomes: `completed | interrupted | failed | waiting_approval | blocked`.
-- Strict error taxonomy (retryable vs blocked/declined/corrected vs fatal) and transactional state transitions.
+- **Session**: unit of work with persistent state (id, goal, state, model, history)
+  in `agentbug-store` (`create_session`, `claim_session`, `transition_state_owned`).
+- **Runner loop** (`agentbug-core::Runner::run_goal` / `run_loop`): load history →
+  LLM chat with tool schemas → policy-evaluate tool calls → execute or park for
+  approval → append results → continue; otherwise finalize. Each step is one LLM
+  call; there is no in-memory tool loop.
+- **Tool runtime** (`agentbug-tools`): typed tools with schema, risk label,
+  validated args, timeout/capture and truncated output; deterministic registry
+  via `try_default_registry_with_options`.
+- **Policy** (`agentbug-policy`): `ask` vs `full_auto`, allow/ask/deny decisions,
+  scope parsing from a program brief (`parse_scope_brief`), default-deny for
+  destructive/intrusive actions.
+- **LLM layer** (`agentbug-llm`): OpenAI-compatible `/v1/chat/completions` with
+  tool calling, `base_url` normalization, `GET /v1/models` discovery with
+  `default_model` fallback, retries with backoff.
+- **Store** (`agentbug-store`): SQLite (WAL) for sessions, messages, approvals,
+  events, budgets, findings, assets, artifacts, coverage, hypotheses, reports and
+  `trace_events`. Redaction (`redact`) is applied at report and CLI egress.
+
+## Execution & control
+
+- **Bounded steps, durable budgets.** `session_budgets` plus `ensure_budget` /
+  `budget_usage` persist steps, tool/network calls and the RPM window across
+  `resume` and restarts (`budget_survives_resume_with_a_new_runner`).
+- **Approval is a DB transaction.** Risky tool calls park the session in
+  `waiting_approval`; `resolve_approval` resolves once under a `status='pending'`
+  predicate, and `claim_session` / `transition_state_owned` guard ownership and
+  lease so two processes cannot both run an approved action.
+- **Engagement control is process-local and ID-based.** `agentbug-engagement`
+  owns a control center (`pause` / `resume` / `abort`) keyed by engagement id;
+  abort is terminal. Pause/resume/abort are surfaced by the CLI `engagement`
+  command and the desktop Engagement tab.
+- **Classified outcomes** are recorded in session/engagement state
+  (`completed | interrupted | failed | waiting_approval | blocked`, plus
+  `brief_only` for the read-only ingestion path).
+
+### Modules that are NOT production-wired
+
+`agentbug-core` retains `inbox`, `execution`, `event`, `step`, `compaction` and
+`error` modules (re-exported at the crate root). `subagent`, `skill` and `usage`
+were removed during hardening. The retained modules are unit-tested in isolation
+but have **no production call site from `agentbug-engagement`**. They are therefore
+not advertised as agent features: there is no steer queue, no wake coalescing, no
+skill loader and no subagent job execution in the shipping engagement flow. If a
+hardening item wires one of them, add a feature → call site → test row in
+`PRODUCTION_PLAN.md` §2 first.
 
 ## Policy modes
-- **ask**: auto-allow safe/read actions; require approval for exec/network/write/intrusive/unknown; deny out-of-scope/forbidden.
-- **full_auto**: autonomous **only within policy envelope** (scope/allowlist, rate/budget, non-destructive). Guardrails remain active even for broad/"no-scope" events unless explicitly configured.
+
+- **ask**: auto-allow safe/read actions; require approval for exec/network/write/
+  intrusive/unknown; deny out-of-scope or forbidden targets.
+- **full_auto**: autonomous **only within the policy envelope** (scope/allowlist,
+  rate/budget, non-destructive, tool risk labels). Guardrails remain active; the
+  engagement runner still refuses out-of-scope targets and destructive actions.
 
 ## Token & performance strategy
-- Keep prompts/history compact (compaction/summaries), store large tool outputs as artifacts and pass references/summaries to the LLM.
-- Bounded steps/tool-calls, timeouts, dedupe/cache of deterministic results, streaming/capture limits.
-- Async I/O, minimal dependencies, explicit state machine.
 
-## Phase 2 (Bug Bounty layer, on stable core)
-- Scope engine (in/out-of-scope parsing & enforcement), engagement profiles.
-- Tool adapters: httpx, subfinder, dnsx, katana, nuclei, ffuf, naabu/nmap (gated), Playwright, etc., with structured parsing and per-tool risk/rate profiles.
-- Asset graph/store, prioritized scheduler, hypothesis-driven playbooks.
-- Safe validation/PoC, evidence redaction, dedupe, and report drafting — always policy-gated.
+- Prompts/history are compacted in `Runner::build_llm_messages` once they grow
+  large (`compaction_summarizes_old_turns_and_keeps_recent_tail`); tool outputs are
+  truncated and large artifacts are stored, not replayed verbatim.
+- Bounded steps/tool-calls, timeouts, deterministic dedupe, and per-session
+  budgets keep cost predictable. Token/cost figures come from API usage in the
+  replay (`token_usage`, `agentbug tokens`), never from a `len/4` estimate.
+
+## Bug-bounty layer (on the core)
+
+- **Brief ingestion** (`fetch_brief` → `extract_profile_from_text` or LLM-assisted
+  extraction): scope and ROE are parsed from the **whole** brief; missing in-scope
+  targets or login/404 pages fail closed. `engage_brief_only` performs this path
+  without executing any tool.
+- **Planner** (`wstg_playbooks`, `prioritize_targets`): nine WSTG playbooks become
+  durable tasks and hypotheses; coverage is recorded per target (`record_coverage`).
+- **Verifier & report**: `validate_poc` is the deterministic acceptance gate;
+  findings carry request/response evidence and SHA-256 hashes; the canonical
+  Markdown renderer emits Executive Summary, Scope & ROE, Methodology, Findings,
+  Coverage, Timeline and Appendices. Reports are local only — there is no
+  submission path to any platform.
+- **Trace & eval**: `append_trace` writes `trace_events`; `eval/run_benchmark.ps1`
+  exports them to `replay.jsonl` and `eval/score.py` computes recall, precision,
+  FPR, reproducibility and tokens-per-finding. Evaluation is scaffolding; no
+  results are asserted.
 
 ## Implemented hardening
-- Interactive approval/resume flow with durable claims, lease renewal and stale-run recovery.
-- Tool-result interception persists findings/assets/artifacts; reports are redacted.
-- Rate/tool/network budgets are enforced in the runner and audited as events.
-- HTTP egress is DNS-pinned with private/reserved-range blocking and no redirects;
-  shell commands have a destructive-pattern guardrail and secret-scrubbed env.
-- Path confinement for filesystem tools, output truncation, fail-fast API keys,
-  deterministic tool registry, and mock-LLM integration tests for the runner loop.
 
-## Remaining gaps (deployment, not code)
-OS-level isolation (container/VM with restricted egress), context compaction for
-very long sessions, concurrency/clustering beyond process-local claims, and
-additional tool adapters (nuclei/ffuf/nmap/Playwright) with per-tool risk and
-rate profiles.
+Durable claims/leases and guarded transitions; atomic approval; persistent
+budgets; redaction at report, CLI and tool-output egress boundaries; deterministic
+PoC verifier;
+SHA-256 evidence; tamper-evident event chain (`verify-log`); shell allowlist with
+scrubbed env; HTTP DNS pinning with private-range blocking and no proxy; path
+confinement; deterministic tool registry; canonical report renderer. Exact call
+sites and tests are in `docs/PRODUCTION_PLAN.md` §2.
+
+## Remaining gaps
+
+OS-level isolation (container/VM with restricted egress), full concurrency and
+clustering beyond process-local claims, final closure of H-01…H-12 by their
+workstreams, and operator-recorded benchmark results. See `PRODUCTION_PLAN.md` §4
+for the verification gate and §5 for the readiness criteria.

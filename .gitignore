@@ -2,3 +2,9 @@
 /.agentbug
 /agentbug.toml
 **/*.rs.bk
+
+# Evaluation scratch space only. eval/results/ is intentionally tracked so an
+# operator can commit recorded benchmark artifacts.
+/eval/work/
+__pycache__/
+*.pyc

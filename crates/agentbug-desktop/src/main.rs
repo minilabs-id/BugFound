@@ -93,6 +93,8 @@ struct DesktopApp {
     tool_list: Vec<(String, String)>,
     engage_url: String,
     engage_cwd: String,
+    /// The exact database path this engagement was launched with (H-10).
+    engage_db: PathBuf,
     engagement_id: Option<String>,
     engage_events: Vec<EngagementEvent>,
     engage_status: Option<EngagementStatus>,
@@ -112,6 +114,7 @@ impl DesktopApp {
         let config = AppConfig::load(&config_path).unwrap_or_else(|_| AppConfig::default());
         let store =
             Store::open(&config.storage.path).unwrap_or_else(|_| Store::open(":memory:").unwrap());
+        let engage_db = PathBuf::from(&config.storage.path);
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
             config_path,
@@ -146,6 +149,7 @@ impl DesktopApp {
             tool_list: Vec::new(),
             engage_url: String::new(),
             engage_cwd: ".".into(),
+            engage_db,
             engagement_id: None,
             engage_events: Vec::new(),
             engage_status: None,
@@ -296,7 +300,21 @@ impl DesktopApp {
         let (tx, rx) = mpsc::channel();
         let url = self.engage_url.trim().to_string();
         let cwd = self.engage_cwd.trim().to_string();
-        let storage = self.config.storage.path.clone();
+        // H-01: carry the operator's mode, budgets and risk opt-ins into the
+        // engagement instead of using the permissive compatibility defaults.
+        let options = agentbug_engagement::EngagementOptions {
+            mode: self.run_mode_choice.into(),
+            max_steps: self.config.agent.max_steps,
+            max_tool_calls: self.config.agent.max_tool_calls,
+            max_network_calls: self.config.agent.max_network_calls,
+            requests_per_minute: self.config.agent.requests_per_minute,
+            max_estimated_tokens: self.config.agent.max_estimated_tokens,
+            allow_network_write: self.config.agent.allow_network_write,
+            allow_intrusive: self.config.agent.allow_intrusive,
+            auto_approve_all: self.config.agent.auto_approve_all,
+        };
+        let storage = PathBuf::from(&self.config.storage.path);
+        self.engage_db = storage.clone();
         self.engage_events.clear();
         self.engage_status = None;
         self.engagement_id = None;
@@ -304,8 +322,13 @@ impl DesktopApp {
         self.engage_msg.clear();
         self.engage_rx = Some(rx);
         self.engage_worker = Some(std::thread::spawn(move || {
-            let result =
-                agentbug_engagement::engage(&url, Path::new(&cwd), Path::new(&storage), tx.clone());
+            let result = agentbug_engagement::engage_with_options(
+                &url,
+                Path::new(&cwd),
+                &storage,
+                options,
+                tx.clone(),
+            );
             if let Err(e) = result {
                 let _ = tx.send(EngagementEvent::Error {
                     message: format!("{e:#}"),
@@ -345,10 +368,11 @@ impl DesktopApp {
             self.engage_msg = "no engagement id yet (start an engagement first)".into();
             return;
         };
+        let db = self.engage_db.clone();
         let result = match action {
-            EngageAction::Pause => agentbug_engagement::pause(&id),
-            EngageAction::Resume => agentbug_engagement::resume(&id),
-            EngageAction::Abort => agentbug_engagement::abort(&id),
+            EngageAction::Pause => agentbug_engagement::pause_at(&db, &id),
+            EngageAction::Resume => agentbug_engagement::resume_at(&db, &id),
+            EngageAction::Abort => agentbug_engagement::abort_at(&db, &id),
         };
         self.engage_msg = match result {
             Ok(()) => format!("{action:?} sent"),
@@ -361,7 +385,7 @@ impl DesktopApp {
             self.engage_msg = "no engagement id yet (start an engagement first)".into();
             return;
         };
-        match agentbug_engagement::status(&id) {
+        match agentbug_engagement::status_at(&self.engage_db, &id) {
             Ok(status) => {
                 self.engage_status = Some(status);
                 self.engage_msg.clear();

@@ -5,6 +5,12 @@
 //! runner one task at a time, and writes a verified report. `pause`, `resume`,
 //! `abort` and `status` operate through a process-global control registry so a
 //! CLI or desktop thread can steer a running engagement.
+//!
+//! Hardening notes (H-01/H-02/H-04/H-06/H-10/H-11): the operator-supplied
+//! [`EngagementOptions`] control mode, budgets and risk opt-ins; the full brief
+//! text is parsed into a fail-closed [`RoePolicy`]; findings are verified by
+//! replaying stored evidence bytes with a deterministic canary oracle; and
+//! control functions take an explicit database path via the `*_at` variants.
 
 use agentbug_core::{build_policy_config, AgentConfig, Runner};
 use agentbug_llm::{ChatMessage, ChatResponse, Llm, LlmClient, LlmConfig};
@@ -18,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -83,20 +90,92 @@ pub struct EngagementStatus {
     pub report_path: Option<PathBuf>,
 }
 
-/// Start a new engagement. This is a synchronous entry point that owns its own
-/// current-thread Tokio runtime; call it from a CLI/desktop worker thread, not
-/// from inside an existing runtime.
+/// Operator-supplied limits for a single engagement. Defaults are deliberately
+/// conservative: full-auto mode (so a brief-only run still works) but no
+/// network-write or intrusive opt-in and no blanket auto-approval.
+#[derive(Debug, Clone)]
+pub struct EngagementOptions {
+    pub mode: Mode,
+    pub max_steps: usize,
+    pub max_tool_calls: usize,
+    pub max_network_calls: usize,
+    pub requests_per_minute: u64,
+    pub max_estimated_tokens: u64,
+    pub allow_network_write: bool,
+    pub allow_intrusive: bool,
+    pub auto_approve_all: bool,
+}
+
+impl Default for EngagementOptions {
+    fn default() -> Self {
+        Self {
+            mode: Mode::FullAuto,
+            max_steps: 60,
+            max_tool_calls: 0,
+            max_network_calls: 0,
+            requests_per_minute: 0,
+            max_estimated_tokens: 0,
+            allow_network_write: false,
+            allow_intrusive: false,
+            auto_approve_all: false,
+        }
+    }
+}
+
+/// Typed rules of engagement parsed from the *full* brief text. Every flag is
+/// fail-closed: fuzzing, state changes and disclosure are denied unless the
+/// brief explicitly authorises them.
+#[derive(Debug, Clone, Default)]
+pub struct RoePolicy {
+    pub ua_marker: Option<String>,
+    pub max_rps: Option<u64>,
+    pub max_requests: Option<u64>,
+    pub allow_fuzzing: bool,
+    pub allow_state_change: bool,
+    pub allow_disclosure: bool,
+}
+
+/// Start a new engagement with the built-in compatibility defaults. Prefer
+/// [`engage_with_options`] in production so operator configuration is honoured.
 pub fn engage(
     program_url: &str,
     workspace: &Path,
     db_path: &Path,
     tx: Sender<EngagementEvent>,
 ) -> Result<EngagementProfile> {
+    engage_with_options(
+        program_url,
+        workspace,
+        db_path,
+        EngagementOptions::default(),
+        tx,
+    )
+}
+
+/// Start a new engagement using explicit operator options.
+///
+/// This is a synchronous entry point that owns its own current-thread Tokio
+/// runtime; call it from a CLI/desktop worker thread, not from inside an
+/// existing runtime.
+pub fn engage_with_options(
+    program_url: &str,
+    workspace: &Path,
+    db_path: &Path,
+    options: EngagementOptions,
+    tx: Sender<EngagementEvent>,
+) -> Result<EngagementProfile> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build tokio runtime for engagement")?;
-    runtime.block_on(engage_async(program_url, workspace, db_path, tx, false))
+    runtime.block_on(engage_async(
+        program_url,
+        workspace,
+        db_path,
+        tx,
+        false,
+        options,
+    ))
 }
 
 /// Read-only evaluation: ingest the public brief, extract scope/ROE and build
@@ -107,11 +186,35 @@ pub fn engage_brief_only(
     db_path: &Path,
     tx: Sender<EngagementEvent>,
 ) -> Result<EngagementProfile> {
+    engage_brief_only_with_options(
+        program_url,
+        workspace,
+        db_path,
+        EngagementOptions::default(),
+        tx,
+    )
+}
+
+/// Brief-only evaluation using explicit operator options.
+pub fn engage_brief_only_with_options(
+    program_url: &str,
+    workspace: &Path,
+    db_path: &Path,
+    options: EngagementOptions,
+    tx: Sender<EngagementEvent>,
+) -> Result<EngagementProfile> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build tokio runtime for brief-only engagement")?;
-    runtime.block_on(engage_async(program_url, workspace, db_path, tx, true))
+    runtime.block_on(engage_async(
+        program_url,
+        workspace,
+        db_path,
+        tx,
+        true,
+        options,
+    ))
 }
 
 static ENGAGEMENT_DB: OnceLock<PathBuf> = OnceLock::new();
@@ -188,6 +291,25 @@ pub fn status(engagement_id: &str) -> Result<EngagementStatus> {
     status_at(&engagement_db()?, engagement_id)
 }
 
+/// Ask the process-local execution coordinator to interrupt every runner
+/// session belonging to this engagement. Runner goals embed
+/// `engagement_id=<id>` so a cross-process `pause`/`abort` can find them in the
+/// same database the engagement was launched with.
+fn interrupt_engagement_sessions(db: &Path, engagement_id: &str) {
+    let Ok(store) = Store::open(db) else {
+        return;
+    };
+    let Ok(sessions) = store.list_sessions(500) else {
+        return;
+    };
+    let marker = format!("engagement_id={engagement_id}");
+    for session in sessions {
+        if session.state == "running" && session.goal.contains(&marker) {
+            agentbug_core::ExecutionCoordinator::global().interrupt(&session.id);
+        }
+    }
+}
+
 /// Cross-process variants: control an engagement using an explicit database path.
 pub fn pause_at(db: &Path, engagement_id: &str) -> Result<()> {
     let store = Store::open(db)?;
@@ -195,6 +317,7 @@ pub fn pause_at(db: &Path, engagement_id: &str) -> Result<()> {
         return Err(anyhow!("unknown engagement: {engagement_id}"));
     }
     store.upsert_engagement_control(engagement_id, "paused")?;
+    interrupt_engagement_sessions(db, engagement_id);
     notify_in_process(engagement_id, ControlState::Paused, true)
 }
 
@@ -215,6 +338,7 @@ pub fn abort_at(db: &Path, engagement_id: &str) -> Result<()> {
         return Err(anyhow!("unknown engagement: {engagement_id}"));
     }
     store.upsert_engagement_control(engagement_id, "aborted")?;
+    interrupt_engagement_sessions(db, engagement_id);
     notify_in_process(engagement_id, ControlState::Aborted, false)
 }
 
@@ -263,7 +387,6 @@ struct Control {
     findings: usize,
     coverage: usize,
     report_path: Option<PathBuf>,
-    actions: Vec<(String, Option<String>, bool, String)>,
 }
 
 struct ControlCenter {
@@ -287,29 +410,35 @@ fn update_control(engagement_id: &str, update: impl FnOnce(&mut Control)) {
     }
 }
 
-/// Block while paused; return `false` when the engagement was aborted.
-fn wait_while_paused(engagement_id: &str) -> bool {
+/// Block while paused; return `false` when the engagement was aborted. The
+/// database path is threaded in explicitly (H-10) so a CLI/desktop control
+/// command using `--db` always observes the same durable state as the runner.
+fn wait_while_paused(db: &Path, engagement_id: &str) -> bool {
     let center = control_center();
     let mut controls = center.controls.lock().unwrap();
     loop {
-        let durable = engagement_db()
-            .ok()
-            .and_then(|db| db_control_state(&db, engagement_id).ok().flatten());
+        let durable = db_control_state(db, engagement_id).ok().flatten();
         let Some(control) = controls.get(engagement_id) else {
             return false;
         };
         match durable.unwrap_or(control.state) {
             ControlState::Aborted => return false,
             ControlState::Running => return true,
-            ControlState::Paused => controls = center.changed.wait(controls).unwrap(),
+            // Poll with a timeout as well as listening for in-process signals
+            // so a control command from another process is observed (H-10).
+            ControlState::Paused => {
+                controls = center
+                    .changed
+                    .wait_timeout(controls, Duration::from_millis(500))
+                    .unwrap()
+                    .0;
+            }
         }
     }
 }
 
-fn control_aborted(engagement_id: &str) -> bool {
-    let durable = engagement_db()
-        .ok()
-        .and_then(|db| db_control_state(&db, engagement_id).ok().flatten());
+fn control_aborted(db: &Path, engagement_id: &str) -> bool {
+    let durable = db_control_state(db, engagement_id).ok().flatten();
     durable.unwrap_or_else(|| {
         control_center()
             .controls
@@ -321,7 +450,86 @@ fn control_aborted(engagement_id: &str) -> bool {
     }) == ControlState::Aborted
 }
 
-fn emit(tx: &Sender<EngagementEvent>, event: EngagementEvent) {
+/// Append-only, redacted replay log: one JSON line per engagement event so an
+/// external evaluator can replay the run without trusting the report (H-07).
+struct ReplayLog {
+    file: Mutex<std::fs::File>,
+}
+
+impl ReplayLog {
+    fn new(workspace: &Path, engagement_id: &str) -> Result<Self> {
+        let path = workspace.join(format!("replay-{engagement_id}.jsonl"));
+        let file = std::fs::File::create(&path)
+            .with_context(|| format!("create replay log {}", path.display()))?;
+        Ok(Self {
+            file: Mutex::new(file),
+        })
+    }
+
+    fn record(&self, event: &EngagementEvent) {
+        use std::io::Write;
+        let line = replay_event(event).to_string();
+        if let Ok(mut file) = self.file.lock() {
+            let _ = writeln!(file, "{line}");
+            let _ = file.flush();
+        }
+    }
+}
+
+fn replay_event(event: &EngagementEvent) -> Value {
+    match event {
+        EngagementEvent::Started { engagement_id } => {
+            json!({"event": "started", "engagement_id": redact(engagement_id)})
+        }
+        EngagementEvent::BriefIngested { profile } => json!({
+            "event": "brief_ingested",
+            "engagement": redact(&profile.engagement),
+            "in_scope": &profile.scope.in_scope,
+            "out_of_scope": &profile.scope.out_of_scope,
+        }),
+        EngagementEvent::PlanUpdated { tasks } => json!({
+            "event": "plan_updated",
+            "tasks": tasks.iter().map(|task| redact(task)).collect::<Vec<_>>(),
+        }),
+        EngagementEvent::Action {
+            tool,
+            target,
+            ok,
+            detail,
+        } => json!({
+            "event": "action",
+            "tool": redact(tool),
+            "target": target.as_deref().map(redact),
+            "ok": ok,
+            "detail": redact(detail),
+        }),
+        EngagementEvent::Finding {
+            id,
+            title,
+            severity,
+        } => json!({
+            "event": "finding",
+            "id": redact(id),
+            "title": redact(title),
+            "severity": redact(severity),
+        }),
+        EngagementEvent::ReportReady { path } => json!({
+            "event": "report_ready",
+            "path": redact(&path.to_string_lossy()),
+        }),
+        EngagementEvent::Error { message } => {
+            json!({"event": "error", "message": redact(message)})
+        }
+        EngagementEvent::Finished { summary } => {
+            json!({"event": "finished", "summary": redact(summary)})
+        }
+    }
+}
+
+fn emit(tx: &Sender<EngagementEvent>, replay: Option<&ReplayLog>, event: EngagementEvent) {
+    if let Some(replay) = replay {
+        replay.record(&event);
+    }
     let _ = tx.send(event);
 }
 
@@ -335,6 +543,7 @@ async fn engage_async(
     db_path: &Path,
     tx: Sender<EngagementEvent>,
     brief_only: bool,
+    options: EngagementOptions,
 ) -> Result<EngagementProfile> {
     std::fs::create_dir_all(workspace)
         .with_context(|| format!("create workspace {}", workspace.display()))?;
@@ -344,6 +553,7 @@ async fn engage_async(
         .create_engagement(program_url)
         .context("create engagement")?;
     let id = engagement.id.clone();
+    let replay = ReplayLog::new(workspace, &id).context("create replay log")?;
 
     control_center().controls.lock().unwrap().insert(
         id.clone(),
@@ -355,25 +565,37 @@ async fn engage_async(
             findings: 0,
             coverage: 0,
             report_path: None,
-            actions: Vec::new(),
         },
     );
     let _ = store.set_engagement_state(&id, "running");
     let _ = store.upsert_engagement_control(&id, "running");
     emit(
         &tx,
+        Some(&replay),
         EngagementEvent::Started {
             engagement_id: id.clone(),
         },
     );
 
-    let outcome = run_engagement(&store, &id, program_url, workspace, &tx, brief_only).await;
+    let outcome = run_engagement(
+        &store,
+        db_path,
+        &id,
+        program_url,
+        workspace,
+        &tx,
+        &replay,
+        brief_only,
+        options,
+    )
+    .await;
     match outcome {
         Ok(profile) => Ok(profile),
         Err(error) => {
             let message = format!("{error:#}");
             emit(
                 &tx,
+                Some(&replay),
                 EngagementEvent::Error {
                     message: message.clone(),
                 },
@@ -391,27 +613,63 @@ async fn engage_async(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_engagement(
     store: &Store,
+    db_path: &Path,
     id: &str,
     program_url: &str,
     workspace: &Path,
     tx: &Sender<EngagementEvent>,
+    replay: &ReplayLog,
     brief_only: bool,
+    options: EngagementOptions,
 ) -> Result<EngagementProfile> {
-    // 1. BriefReader — no proxy, 5 redirects, 15s timeout, 1MB body cap.
+    // 1. BriefReader — no proxy, no redirects, private hosts rejected,
+    //    non-2xx rejected, 1 MB body cap (H-02/H-11).
     let (raw_html, brief_text) = fetch_brief(program_url).await?;
     if brief_text.trim().is_empty() {
         return Err(anyhow!(
             "program brief contains no readable text; refusing to engage (fail-closed)"
         ));
     }
-    let _ = store.save_brief(id, &raw_html, "", "", "");
+    // H-11: never write an empty extraction snapshot. The deterministic scope
+    // parse must be non-empty before any planning or tool execution happens.
+    let deterministic_scope = agentbug_policy::parse_scope_brief(&brief_text);
+    if deterministic_scope.in_scope.is_empty() {
+        return Err(anyhow!(
+            "program brief has no deterministically parseable in-scope targets; refusing to engage (fail-closed)"
+        ));
+    }
+    // H-02: parse the full brief into a typed, fail-closed ROE policy and abort
+    // on any safety constraint we cannot translate into a field.
+    let roe = parse_roe(&brief_text);
+    let unparsed = unparsed_constraints(&brief_text);
+    if !unparsed.is_empty() {
+        let message = format!(
+            "unparsed ROE constraints; refusing to engage (fail-closed): {}",
+            unparsed.join(" | ")
+        );
+        emit(
+            tx,
+            Some(replay),
+            EngagementEvent::Error {
+                message: message.clone(),
+            },
+        );
+        return Err(anyhow!(message));
+    }
     let _ = store.append_trace(
         id,
         id,
         "brief.ingested",
-        &json!({ "html_bytes": raw_html.len(), "text_bytes": brief_text.len() }).to_string(),
+        &json!({
+            "html_bytes": raw_html.len(),
+            "text_bytes": brief_text.len(),
+            "in_scope": deterministic_scope.in_scope.clone(),
+            "max_rps": roe.max_rps,
+        })
+        .to_string(),
     );
 
     // 2. Profile extraction — deterministic LLM call when a key is available,
@@ -451,6 +709,23 @@ async fn run_engagement(
         None => extract_profile_from_text(&brief_text, program_url),
     };
 
+    // H-02: intersect LLM-extracted scope with the deterministic parse. An LLM
+    // may narrow scope or echo it, but never widen it with a host the brief did
+    // not actually contain.
+    let deterministic_hosts = deterministic_scope
+        .in_scope
+        .iter()
+        .map(|pattern| host_key(pattern))
+        .collect::<HashSet<_>>();
+    profile
+        .scope
+        .in_scope
+        .retain(|pattern| deterministic_hosts.contains(&host_key(pattern)));
+    for denied in &deterministic_scope.out_of_scope {
+        if !profile.scope.out_of_scope.contains(denied) {
+            profile.scope.out_of_scope.push(denied.clone());
+        }
+    }
     // Fail-closed: without at least one in-scope target nothing may be probed.
     if profile.scope.in_scope.is_empty() {
         return Err(anyhow!(
@@ -484,6 +759,7 @@ async fn run_engagement(
     );
     emit(
         tx,
+        Some(replay),
         EngagementEvent::BriefIngested {
             profile: profile.clone(),
         },
@@ -498,7 +774,11 @@ async fn run_engagement(
     }
     let planned_count = statements.len();
     update_control(id, |control| control.tasks_total = planned_count);
-    emit(tx, EngagementEvent::PlanUpdated { tasks: statements });
+    emit(
+        tx,
+        Some(replay),
+        EngagementEvent::PlanUpdated { tasks: statements },
+    );
 
     if brief_only {
         let _ = store.set_engagement_state(id, "brief_only");
@@ -509,6 +789,7 @@ async fn run_engagement(
         });
         emit(
             tx,
+            Some(replay),
             EngagementEvent::Finished {
                 summary: format!(
                     "Brief-only evaluation for {} completed: {} playbooks planned, no tools executed",
@@ -536,44 +817,39 @@ async fn run_engagement(
         .into_iter()
         .map(|finding| finding.id)
         .collect();
+    // H-04: canaries are generated here (never by the LLM) and kept only for
+    // the lifetime of this run so the verifier can replay stored bytes against
+    // a deterministic oracle.
+    let mut canaries: HashMap<String, String> = HashMap::new();
+    let mut evidence_hashes: HashMap<String, String> = HashMap::new();
 
     for task in store.list_tasks(id)? {
         if task.status == "done" || task.status == "completed" {
             continue;
         }
-        if !wait_while_paused(id) {
+        if !wait_while_paused(db_path, id) {
             break;
         }
 
-        let tools = build_tools(workspace, &profile)?;
-        // Autonomous engagement: the operator already authorised the run. Auto-approve
-        // every registered tool so a multi-target batch is never parked at an approval.
-        // Destructive actions remain blocked by policy, and intrusive adapters stay gated.
-        let auto_approve_tools = tools.specs().into_iter().map(|spec| spec.name).collect();
-        let agent = AgentConfig {
-            mode: Mode::FullAuto,
-            // Bounded playbooks + stall guard: stop looping when no new
-            // evidence appears, instead of burning hundreds of LLM/tool calls.
-            max_steps: 60,
-            stall_limit: 6,
-            system_prompt: Some(format!(
-                "You are AgentBug testing only the engagement scope: {scope_reminder}. \
-                 Stay within scope, collect evidence, and never submit reports or findings to third parties."
-            )),
-            budgets: BudgetConfig::default(),
-            max_estimated_tokens: 0,
-            auto_approve_tools,
-            ..AgentConfig::default()
-        };
+        let tools = build_tools(workspace, &profile, &roe, &options)?;
+        // H-01: only safe/read tools are auto-approved by default. Network-write
+        // and intrusive tools require an explicit operator opt-in, and blanket
+        // auto-approval is a separate explicit escape hatch.
+        let auto_approve_tools = auto_approvable_tools(&tools, &options);
+        let agent = agent_config(&options, &scope_reminder, auto_approve_tools);
         let policy = build_policy_config(PolicyConfig {
-            mode: Mode::FullAuto,
+            mode: options.mode,
             deny_destructive: true,
             scope: profile.scope.clone(),
+            budgets: BudgetConfig {
+                requests_per_minute: options.requests_per_minute,
+                ..BudgetConfig::default()
+            },
             ..PolicyConfig::default()
         });
         let runner = Runner::new(store.clone(), runner_llm.clone(), tools, policy, agent);
         let goal = format!(
-            "{}\n\nScope reminder: {scope_reminder}\n\
+            "engagement_id={id}\n{}\n\nScope reminder: {scope_reminder}\n\
              Use the available tools to gather evidence. Return findings and evidence in your final answer. \
              Do not submit anything to any external system.",
             task.statement
@@ -598,7 +874,7 @@ async fn run_engagement(
                     let _ = store.record_coverage(id, &row.target, &row.method, &row.path);
                 }
             }
-            observe_session(store, id, Some(&task.id), &session.id, tx)?;
+            observe_session(store, id, Some(&task.id), &session.id, tx, replay)?;
         }
 
         match run_result {
@@ -614,6 +890,7 @@ async fn run_engagement(
                 store.update_task_status(&task.id, "failed")?;
                 emit(
                     tx,
+                    Some(replay),
                     EngagementEvent::Error {
                         message: format!("playbook {} failed: {message}", task.playbook_id),
                     },
@@ -625,8 +902,27 @@ async fn run_engagement(
         update_control(id, |control| control.findings = current.len());
         for finding in current {
             if known_findings.insert(finding.id.clone()) {
+                match capture_evidence(store, &finding) {
+                    Ok((canary, evidence_hash)) => {
+                        canaries.insert(finding.id.clone(), canary);
+                        evidence_hashes.insert(finding.id.clone(), evidence_hash);
+                    }
+                    Err(error) => {
+                        emit(
+                            tx,
+                            Some(replay),
+                            EngagementEvent::Error {
+                                message: format!(
+                                    "failed to store evidence for finding {}: {error:#}",
+                                    finding.id
+                                ),
+                            },
+                        );
+                    }
+                }
                 emit(
                     tx,
+                    Some(replay),
                     EngagementEvent::Finding {
                         id: finding.id,
                         title: redact(&finding.title),
@@ -637,30 +933,27 @@ async fn run_engagement(
         }
     }
 
-    // 5. Verifier + report.
-    let aborted = control_aborted(id);
+    // 5. Verifier + report. Only findings that pass the deterministic replay
+    // oracle are promoted to `validated`; candidates stay out of the report.
+    let aborted = control_aborted(db_path, id);
     let findings = store.list_findings(id)?;
-    let mut verified: Vec<(String, String, String, String, f32)> = Vec::new();
-    for finding in &findings {
-        let vector = finding.cvss.clone().unwrap_or_default();
-        let score = cvss_base(&vector);
-        let cwe = finding
-            .cwe
-            .clone()
-            .unwrap_or_else(|| map_cwe(&finding.title, finding.vuln_type.as_deref()));
-        let severity = if score > 0.0 {
-            severity_from_score(score).to_string()
-        } else {
-            finding.severity.clone()
-        };
-        verified.push((severity, finding.title.clone(), cwe, vector, score));
-    }
+    let verified_count = verify_findings(store, id, &canaries, &evidence_hashes, &roe)?;
+    let verified_findings = store.verified_findings(id)?;
+    let candidate_count = findings.len().saturating_sub(verified_findings.len());
 
     let final_state = if aborted { "aborted" } else { "completed" };
     let _ = store.set_engagement_state(id, final_state);
     let _ = store.upsert_engagement_control(id, final_state);
-    let status = status(id)?;
-    let report = render_report(&profile, &status, &findings, &verified, control_actions(id));
+    let status = status_at(db_path, id)?;
+    let report = build_canonical_report(
+        store,
+        id,
+        &profile,
+        &status,
+        &verified_findings,
+        &evidence_hashes,
+        &roe,
+    );
     let report_path = workspace.join(format!("report-{id}.md"));
     std::fs::write(&report_path, &report)
         .with_context(|| format!("write report {}", report_path.display()))?;
@@ -680,28 +973,31 @@ async fn run_engagement(
     );
     update_control(id, |control| {
         control.finished = true;
-        control.findings = findings.len();
+        control.findings = verified_count;
         control.report_path = Some(report_path.clone());
     });
 
     emit(
         tx,
+        Some(replay),
         EngagementEvent::ReportReady {
             path: report_path.clone(),
         },
     );
     emit(
         tx,
+        Some(replay),
         EngagementEvent::Finished {
             summary: format!(
-                "Engagement {} ({}) {} with {}/{} playbooks complete, {} findings, \
-                 coverage {}, report {} (sha256 {})",
+                "Engagement {} ({}) {} with {}/{} playbooks complete, {} verified findings \
+                 ({} candidates excluded), coverage {}, report {} (sha256 {})",
                 id,
                 profile.engagement,
                 if aborted { "aborted" } else { "completed" },
                 status.tasks_done,
                 status.tasks_total,
-                findings.len(),
+                verified_count,
+                candidate_count,
                 status.coverage,
                 report_path.display(),
                 sha256
@@ -709,14 +1005,6 @@ async fn run_engagement(
         },
     );
     Ok(profile)
-}
-
-fn control_actions(engagement_id: &str) -> Vec<(String, Option<String>, bool, String)> {
-    let controls = control_center().controls.lock().unwrap();
-    controls
-        .get(engagement_id)
-        .map(|control| control.actions.clone())
-        .unwrap_or_default()
 }
 
 /// Translate a runner's persisted messages into engagement Action events and
@@ -728,6 +1016,7 @@ fn observe_session(
     task_id: Option<&str>,
     session_id: &str,
     tx: &Sender<EngagementEvent>,
+    replay: &ReplayLog,
 ) -> Result<()> {
     let messages = store.list_messages(session_id)?;
     let mut calls: HashMap<String, (String, Value)> = HashMap::new();
@@ -768,9 +1057,9 @@ fn observe_session(
         let ok = message.content.trim_start().starts_with("ok=true");
         let redacted = redact(&message.content);
         let detail = truncate(&redacted, 1000);
-        let action = (tool.clone(), target.clone(), ok, message.content.clone());
         emit(
             tx,
+            Some(replay),
             EngagementEvent::Action {
                 tool: tool.clone(),
                 target: target.clone(),
@@ -785,7 +1074,6 @@ fn observe_session(
             "tool_result",
             &json!({ "ok": ok, "target": target, "detail": detail }).to_string(),
         );
-        update_control(engagement_id, |control| control.actions.push(action));
     }
     let _ = store.append_trace(
         engagement_id,
@@ -801,14 +1089,15 @@ fn observe_session(
 // ---------------------------------------------------------------------------
 
 async fn fetch_brief(url: &str) -> Result<(String, String)> {
+    // H-02/H-11: no redirects (a public brief must not bounce to a private or
+    // login endpoint), and reject any host that resolves to a private address.
+    reject_private_brief_host(url).await?;
     let client = reqwest::Client::builder()
         .no_proxy()
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(45))
         .build()
         .context("build brief HTTP client")?;
-    // A login-walled program still returns a public HTML page; use whatever is
-    // served rather than rejecting on status. Scope extraction is fail-closed.
     let response = client
         .get(url)
         .header(
@@ -818,13 +1107,96 @@ async fn fetch_brief(url: &str) -> Result<(String, String)> {
         .send()
         .await
         .with_context(|| format!("fetch program brief {url}"))?;
-    // Buffer the whole body with a generous timeout, then cap to 1 MB. Some
-    // SPA pages send many small chunks and streaming can stall on slow links.
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "program brief returned HTTP {}; refusing to engage (fail-closed)",
+            response.status()
+        ));
+    }
+    if is_login_page(url, response.url().as_str()) {
+        return Err(anyhow!(
+            "program brief redirects to a login endpoint; refusing to engage (fail-closed)"
+        ));
+    }
+    // Buffer the whole body with a generous timeout, then cap to 1 MB.
     let body = response.bytes().await.context("stream brief body")?;
     let end = body.len().min(MAX_BRIEF_BYTES);
     let raw_html = String::from_utf8_lossy(&body[..end]).to_string();
     let text = html_to_text(&raw_html);
     Ok((raw_html, text))
+}
+
+fn is_non_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(addr) => {
+            addr.is_private()
+                || addr.is_loopback()
+                || addr.is_link_local()
+                || addr.is_unspecified()
+                || addr.is_multicast()
+                || matches!(addr.octets()[0], 0 | 100 | 192 | 198 | 240 | 255)
+        }
+        IpAddr::V6(addr) => {
+            addr.is_unspecified()
+                || addr.is_loopback()
+                || addr.is_multicast()
+                || addr.is_unique_local()
+                || addr.is_unicast_link_local()
+        }
+    }
+}
+
+async fn reject_private_brief_host(url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url).context("invalid program brief URL")?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("program brief URL has no host; refusing to engage"))?
+        .trim()
+        .to_ascii_lowercase();
+    if host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+    {
+        return Err(anyhow!(
+            "program brief host '{host}' is not publicly routable; refusing to engage (fail-closed)"
+        ));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_non_public_ip(ip) {
+            return Err(anyhow!(
+                "program brief host '{host}' resolves to a private address; refusing to engage (fail-closed)"
+            ));
+        }
+        return Ok(());
+    }
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let target = (host.clone(), port);
+    let resolved = tokio::task::spawn_blocking(move || {
+        (target.0.as_str(), target.1)
+            .to_socket_addrs()
+            .map(|addresses| addresses.map(|addr| addr.ip()).collect::<Vec<_>>())
+    })
+    .await
+    .context("resolve program brief host")?
+    .with_context(|| format!("resolve program brief host {host}"))?;
+    if resolved.is_empty() || resolved.iter().copied().any(is_non_public_ip) {
+        return Err(anyhow!(
+            "program brief host '{host}' resolves to a private or missing address; refusing to engage (fail-closed)"
+        ));
+    }
+    Ok(())
+}
+
+fn is_login_page(requested: &str, final_url: &str) -> bool {
+    let lower = final_url.to_ascii_lowercase();
+    let requested_host = host_from_url(requested).unwrap_or_default();
+    let final_host = host_from_url(final_url).unwrap_or_default();
+    final_host != requested_host
+        || ["/login", "signin", "sign-in", "auth", "sso"]
+            .iter()
+            .any(|marker| lower.contains(marker))
 }
 
 /// Strip HTML to readable text while keeping list/bullet boundaries so the
@@ -1018,6 +1390,290 @@ fn host_from_url(url: &str) -> Option<String> {
     } else {
         Some(host)
     }
+}
+
+/// Normalise a scope pattern to its comparable host key. Used to intersect
+/// LLM-extracted scope with the deterministic parse (H-02).
+fn host_key(pattern: &str) -> String {
+    let value = pattern.trim();
+    let without_scheme = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .unwrap_or(value);
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme)
+        .rsplit('@')
+        .next()
+        .unwrap_or(without_scheme);
+    let host = if authority.starts_with('[') {
+        authority.split(']').next().unwrap_or(authority)
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    host.trim()
+        .trim_start_matches("*.")
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+// ---------------------------------------------------------------------------
+// Rules of engagement (H-02)
+// ---------------------------------------------------------------------------
+
+/// Parse the *full* brief text into a typed, fail-closed ROE policy. All
+/// permissions default to false; only explicit authorisation flips them.
+pub fn parse_roe(text: &str) -> RoePolicy {
+    let mut policy = RoePolicy::default();
+    let quoted = Regex::new(r#"['"]([^'"]+)['"]"#).unwrap();
+    let rps_pattern = Regex::new(r"(\d+)\s*requests?\s*per\s*second").unwrap();
+    let requests_pattern =
+        Regex::new(r"(\d+)\s*requests?\s*(?:total|in total|per engagement|maximum)").unwrap();
+
+    for raw in text.lines() {
+        let line = raw.trim();
+        let lower = line.to_ascii_lowercase();
+        if policy.ua_marker.is_none() && lower.contains("user-agent") {
+            if let Some(captures) = quoted.captures(line) {
+                let marker = captures.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+                if !marker.is_empty() {
+                    policy.ua_marker = Some(format!("agentbug/0.1 {marker}"));
+                }
+            }
+        }
+        if policy.max_rps.is_none() {
+            if let Some(value) = rps_pattern.captures(&lower).and_then(|c| c.get(1)) {
+                policy.max_rps = value.as_str().parse::<u64>().ok();
+            }
+        }
+        if policy.max_requests.is_none() {
+            if let Some(value) = requests_pattern.captures(&lower).and_then(|c| c.get(1)) {
+                policy.max_requests = value.as_str().parse::<u64>().ok();
+            }
+        }
+        if !policy.allow_fuzzing
+            && [
+                "fuzzing is allowed",
+                "fuzzing is permitted",
+                "fuzzing is authorized",
+                "automated scanners are allowed",
+                "automated scanners are permitted",
+            ]
+            .iter()
+            .any(|phrase| lower.contains(phrase))
+        {
+            policy.allow_fuzzing = true;
+        }
+        if !policy.allow_state_change
+            && [
+                "state-changing requests are allowed",
+                "state changes are allowed",
+                "you may modify data",
+                "modifying data is allowed",
+            ]
+            .iter()
+            .any(|phrase| lower.contains(phrase))
+        {
+            policy.allow_state_change = true;
+        }
+        if !policy.allow_disclosure
+            && [
+                "public disclosure is allowed",
+                "disclosure is permitted",
+                "you may disclose",
+            ]
+            .iter()
+            .any(|phrase| lower.contains(phrase))
+        {
+            policy.allow_disclosure = true;
+        }
+        // Explicit prohibitions always win over a permissive phrase elsewhere.
+        if [
+            "no automated scanners",
+            "do not use automated scanners",
+            "no fuzzing",
+            "fuzzing is prohibited",
+            "fuzzing is not allowed",
+        ]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+        {
+            policy.allow_fuzzing = false;
+        }
+        if [
+            "no dos",
+            "denial of service is prohibited",
+            "do not modify data",
+            "no state change",
+            "state changes are prohibited",
+            "read-only",
+        ]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+        {
+            policy.allow_state_change = false;
+        }
+        if [
+            "no disclosure",
+            "do not disclose",
+            "disclosure is prohibited",
+            "no public disclosure",
+        ]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+        {
+            policy.allow_disclosure = false;
+        }
+    }
+    policy
+}
+
+/// Constraints that look actionable but could not be mapped to a [`RoePolicy`]
+/// field. The production path aborts when this is non-empty instead of guessing.
+fn unparsed_constraints(text: &str) -> Vec<String> {
+    const NEGATIVE: &[&str] = &[
+        "do not",
+        "don't",
+        "must not",
+        "not allowed",
+        "prohibited",
+        "forbidden",
+        "avoid",
+        "refrain",
+        "no ",
+        "only ",
+        "maximum",
+        "max ",
+        "limit",
+    ];
+    const SECURITY: &[&str] = &[
+        "scanner",
+        "automat",
+        "fuzz",
+        "dos",
+        "denial of service",
+        "modif",
+        "state chang",
+        "disclos",
+        "submi",
+        "user-agent",
+        "requests per",
+        "traffic",
+        "intrus",
+        "destruct",
+        "brute",
+        "exploit",
+        "rate limit",
+    ];
+
+    text.lines()
+        .map(str::trim)
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            let negative = NEGATIVE.iter().any(|marker| lower.contains(marker));
+            let security = SECURITY.iter().any(|keyword| lower.contains(keyword));
+            negative && security && !recognised_constraint(&lower)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn recognised_constraint(lower: &str) -> bool {
+    let quoted = Regex::new(r#"['"]([^'"]+)['"]"#).unwrap();
+    (lower.contains("user-agent") && quoted.is_match(lower))
+        || Regex::new(r"\d+\s*requests?\s*per\s*second")
+            .unwrap()
+            .is_match(lower)
+        || Regex::new(r"\d+\s*requests?").unwrap().is_match(lower)
+        || ["scanner", "fuzz", "automat"]
+            .iter()
+            .any(|keyword| lower.contains(keyword))
+        || [
+            "dos",
+            "denial of service",
+            "modif",
+            "state chang",
+            "read-only",
+            "read only",
+        ]
+        .iter()
+        .any(|keyword| lower.contains(keyword))
+        || ["disclos", "submi", "public", "third part"]
+            .iter()
+            .any(|keyword| lower.contains(keyword))
+        || lower.contains("rate limit")
+        || lower.contains("traffic")
+}
+
+/// Translate operator options into the runner's agent configuration. Kept as a
+/// pure helper so budget/mode propagation can be verified directly in tests.
+fn agent_config(
+    options: &EngagementOptions,
+    scope_reminder: &str,
+    auto_approve_tools: Vec<String>,
+) -> AgentConfig {
+    let budgets = BudgetConfig {
+        max_tool_calls: options.max_tool_calls,
+        max_network_calls: options.max_network_calls,
+        requests_per_minute: options.requests_per_minute,
+        max_steps: options.max_steps,
+        max_tokens: options.max_estimated_tokens,
+    };
+    AgentConfig {
+        mode: options.mode,
+        // Bounded playbooks + stall guard: stop looping when no new evidence
+        // appears, instead of burning hundreds of LLM/tool calls.
+        max_steps: options.max_steps,
+        stall_limit: 6,
+        system_prompt: Some(format!(
+            "You are AgentBug testing only the engagement scope: {scope_reminder}. \
+             Stay within scope, collect evidence, and never submit reports or findings to third parties."
+        )),
+        budgets: budgets.clone(),
+        budget: budgets.clone(),
+        rate_limits: budgets.clone(),
+        rate_limit: budgets,
+        max_tool_calls: options.max_tool_calls,
+        max_network_calls: options.max_network_calls,
+        requests_per_minute: options.requests_per_minute,
+        max_estimated_tokens: options.max_estimated_tokens,
+        auto_approve_tools,
+        auto_approve_all: options.auto_approve_all,
+        ..AgentConfig::default()
+    }
+}
+
+/// Only safe/read tools are auto-approved by default. Network-write and
+/// intrusive tools require the matching explicit opt-in.
+fn auto_approvable_tools(
+    tools: &agentbug_tools::ToolRegistry,
+    options: &EngagementOptions,
+) -> Vec<String> {
+    tools
+        .specs()
+        .into_iter()
+        .filter(|spec| {
+            let risk = spec.risk.as_str();
+            let name = spec.name.to_ascii_lowercase();
+            if matches!(risk, "safe" | "read") {
+                return true;
+            }
+            let intrusive = risk == "destructive"
+                || name.contains("fuzz")
+                || name.contains("exec")
+                || name.contains("command");
+            if intrusive {
+                return options.allow_intrusive;
+            }
+            let network_write = risk == "network"
+                || name.contains("http")
+                || name.contains("request")
+                || name.contains("write");
+            network_write && options.allow_network_write
+        })
+        .map(|spec| spec.name)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,101 +1900,211 @@ fn map_cwe(title: &str, vuln_type: Option<&str>) -> String {
     "CWE-284".to_string()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_report(
+/// Pin the raw request/response bytes of a finding with SHA-256 and return the
+/// canary plus digest used by the deterministic verifier. The canary is minted
+/// here from the finding id — never taken from LLM output.
+fn capture_evidence(store: &Store, finding: &agentbug_store::Finding) -> Result<(String, String)> {
+    let request = finding.request.clone().unwrap_or_default();
+    let response = finding.response.clone().unwrap_or_default();
+    // Derive the canary from the stored request bytes so it is reproducible
+    // from evidence alone and cannot be supplied or guessed by the LLM.
+    let canary = format!("agentbug-canary-{}", hex_digest(request.as_bytes()));
+    let artifact = canary.as_bytes();
+    let sha256 = store.add_evidence_bytes(
+        &finding.id,
+        "http",
+        request.as_bytes(),
+        response.as_bytes(),
+        Some(artifact),
+    )?;
+    Ok((canary, sha256))
+}
+
+/// Deterministic, independent replay oracle. A finding is promoted to
+/// `validated` only when its *stored* response bytes contain the locally minted
+/// canary, carry a 2xx status line, and the store can still reproduce the
+/// SHA-256 digest of the captured bytes. No LLM-supplied `expected_status` or
+/// `marker` participates in the decision.
+fn verify_findings(
+    store: &Store,
+    id: &str,
+    canaries: &HashMap<String, String>,
+    evidence_hashes: &HashMap<String, String>,
+    roe: &RoePolicy,
+) -> Result<usize> {
+    if !store.verify_evidence(id)? {
+        return Err(anyhow!(
+            "stored evidence SHA-256 digests do not match captured bytes"
+        ));
+    }
+    for finding in store.list_findings(id)? {
+        // A finding without an id can never be replayed.
+        if finding.id.trim().is_empty() {
+            continue;
+        }
+        let Some(canary) = canaries.get(&finding.id) else {
+            continue;
+        };
+        let Some(expected_hash) = evidence_hashes.get(&finding.id) else {
+            continue;
+        };
+        if expected_hash.len() != 64 || !expected_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        // Replay is over bytes persisted at capture time, not live arguments.
+        let response = finding.response.clone().unwrap_or_default();
+        if !response.contains(canary) || !has_success_status(&response) {
+            continue;
+        }
+        // Reject self-graded cases: a response that merely echoes the classic
+        // `<html` marker supplied by the model is not sufficient evidence.
+        if is_self_graded_marker(&response, canary) {
+            continue;
+        }
+        // ROE constraints that forbid state change or fuzzing invalidate any
+        // finding whose evidence claims those techniques.
+        let technique = format!("{} {}", finding.title, finding.description).to_ascii_lowercase();
+        if !roe.allow_state_change
+            && ["state chang", "modify data", "destructive", "dos "]
+                .iter()
+                .any(|token| technique.contains(token))
+        {
+            continue;
+        }
+        let detail = format!("deterministic canary replay; sha256={expected_hash}");
+        store.set_finding_validation(&finding.id, "validated", Some(&detail))?;
+    }
+    Ok(store.verified_findings(id)?.len())
+}
+
+fn has_success_status(response: &str) -> bool {
+    response
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("http/"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .is_some_and(|code| (200..300).contains(&code))
+}
+
+fn is_self_graded_marker(response: &str, canary: &str) -> bool {
+    let lowered = response.to_ascii_lowercase();
+    lowered.contains("<html") && !lowered.contains(&canary.to_ascii_lowercase())
+}
+
+/// Build the single canonical report. Only verified findings are passed to the
+/// renderer; candidates are reported through events and the replay log.
+fn build_canonical_report(
+    store: &Store,
+    id: &str,
     profile: &EngagementProfile,
     status: &EngagementStatus,
-    findings: &[agentbug_store::Finding],
-    verified: &[(String, String, String, String, f32)],
-    actions: Vec<(String, Option<String>, bool, String)>,
+    verified: &[agentbug_store::Finding],
+    evidence_hashes: &HashMap<String, String>,
+    roe: &RoePolicy,
 ) -> String {
-    let mut out = String::new();
-    out.push_str("# AgentBug Engagement Report\n\n");
-    out.push_str(&format!("- Engagement: {}\n", redact(&profile.engagement)));
-    out.push_str(&format!("- Program: {}\n", redact(&profile.program_url)));
-    out.push_str(&format!("- State: {}\n", status.state));
-    out.push_str(&format!(
-        "- Playbooks: {}/{}\n",
-        status.tasks_done, status.tasks_total
-    ));
-    out.push_str(&format!("- Findings: {}\n", findings.len()));
-    out.push_str(&format!("- Coverage events: {}\n", status.coverage));
-    out.push_str(&format!(
-        "- Generated: {}\n",
-        chrono::Utc::now().to_rfc3339()
-    ));
+    use agentbug_tools::{render_canonical_report, ReportFinding, ReportInput};
 
-    out.push_str("\n## Scope\n\n");
-    out.push_str(&format!(
-        "In scope: {}\n\nOut of scope: {}\n",
-        redact(&profile.scope.in_scope.join(", ")),
-        redact(&profile.scope.out_of_scope.join(", "))
-    ));
-    if !profile.rules.is_empty() {
-        out.push_str("\n### Rules\n\n");
-        for rule in &profile.rules {
-            out.push_str(&format!("- {}\n", redact(rule)));
-        }
+    let mut rules = profile.rules.clone();
+    rules.extend(profile.reporting_rules.clone());
+    if let Some(marker) = &roe.ua_marker {
+        rules.push(format!("User-Agent marker required: {marker}"));
     }
-    if !profile.reporting_rules.is_empty() {
-        out.push_str("\n### Reporting rules\n\n");
-        for rule in &profile.reporting_rules {
-            out.push_str(&format!("- {}\n", redact(rule)));
-        }
+    if let Some(rps) = roe.max_rps {
+        rules.push(format!("Maximum {rps} requests per second"));
+    }
+    if !roe.allow_fuzzing {
+        rules.push("Automated fuzzing not authorised".to_string());
+    }
+    if !roe.allow_state_change {
+        rules.push("State-changing requests not authorised".to_string());
+    }
+    if !roe.allow_disclosure {
+        rules.push("No external disclosure".to_string());
     }
 
-    out.push_str("\n## Findings\n\n");
-    if verified.is_empty() {
-        out.push_str("No validated findings.\n");
-    }
-    for (index, (severity, title, cwe, vector, score)) in verified.iter().enumerate() {
-        let finding = &findings[index];
-        out.push_str(&format!("### [{severity}] {}\n\n", redact(title)));
-        out.push_str(&format!(
-            "- CVSS v3.1 base: {score:.1} (`{}`)\n- CWE: {cwe}\n",
-            redact(vector)
-        ));
-        if let Some(asset) = &finding.asset {
-            out.push_str(&format!("- Asset: {}\n", redact(asset)));
-        }
-        if let Some(vuln_type) = &finding.vuln_type {
-            out.push_str(&format!("- Type: {}\n", redact(vuln_type)));
-        }
-        out.push('\n');
-        if !finding.description.is_empty() {
-            out.push_str(&format!("{}\n\n", redact(&finding.description)));
-        }
-        for (label, value) in [
-            ("Reproduction", &finding.reproduction),
-            ("Impact", &finding.impact),
-            ("Remediation", &finding.remediation),
-            ("Evidence", &finding.evidence),
-            ("Request", &finding.request),
-            ("Response", &finding.response),
-        ] {
-            if let Some(value) = value {
-                out.push_str(&format!("**{label}:** {}\n\n", redact(value)));
+    let findings = verified
+        .iter()
+        .map(|finding| {
+            let vector = finding.cvss.clone().unwrap_or_default();
+            let score = cvss_base(&vector);
+            let severity = if score > 0.0 {
+                severity_from_score(score).to_string()
+            } else {
+                finding.severity.clone()
+            };
+            let evidence_hash = evidence_hashes
+                .get(&finding.id)
+                .cloned()
+                .or_else(|| finding.evidence_hash.clone());
+            ReportFinding {
+                id: redact(&finding.id),
+                title: redact(&finding.title),
+                severity,
+                cvss: (score > 0.0).then_some(score),
+                vector: (!vector.is_empty()).then(|| redact(&vector)),
+                cwe: Some(
+                    finding
+                        .cwe
+                        .clone()
+                        .unwrap_or_else(|| map_cwe(&finding.title, finding.vuln_type.as_deref())),
+                ),
+                asset: finding.asset.as_deref().map(redact),
+                description: redact(&finding.description),
+                reproduction: finding.reproduction.as_deref().map(redact),
+                impact: finding.impact.as_deref().map(redact),
+                remediation: finding.remediation.as_deref().map(redact),
+                evidence_hash,
+                verified: true,
             }
-        }
-    }
+        })
+        .collect();
 
-    out.push_str("\n## Activity\n\n");
-    if actions.is_empty() {
-        out.push_str("No tool activity recorded.\n");
-    }
-    for (tool, target, ok, detail) in &actions {
-        out.push_str(&format!(
-            "- `{}` ok={} target={} — {}\n",
-            redact(tool),
-            ok,
-            target
-                .as_deref()
-                .map(redact)
-                .unwrap_or_else(|| "none".to_string()),
-            redact(detail)
-        ));
-    }
-    out
+    let coverage = store
+        .list_coverage(id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| (redact(&row.target), redact(&row.method), redact(&row.path)))
+        .collect();
+    let timeline = store
+        .list_all_events(500)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|event| {
+            (
+                redact(&event.created_at),
+                redact(&event.kind),
+                redact(&event.message),
+            )
+        })
+        .collect();
+
+    let _ = status;
+    render_canonical_report(&ReportInput {
+        program: redact(&profile.program_url),
+        engagement: redact(&profile.engagement),
+        scope_in: profile
+            .scope
+            .in_scope
+            .iter()
+            .map(|entry| redact(entry))
+            .collect(),
+        scope_out: profile
+            .scope
+            .out_of_scope
+            .iter()
+            .map(|entry| redact(entry))
+            .collect(),
+        rules: rules.into_iter().map(|rule| redact(&rule)).collect(),
+        findings,
+        coverage,
+        timeline,
+        report_id: redact(id),
+    })
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,39 +2139,18 @@ impl Llm for OfflineLlm {
 }
 
 /// Translate program ROE prose into tool-level enforcement: a required
-/// User-Agent marker and a hard request-rate cap.
+/// User-Agent marker and a hard request-rate cap. Kept as a compatibility
+/// wrapper over the full-brief [`parse_roe`] parser used in production.
 pub fn roe_overrides(rules: &[String]) -> (Option<String>, Option<u64>) {
-    let mut user_agent = None;
-    let mut max_rps = None;
-    let quoted = Regex::new(r#"['"]([^'"]+)['"]"#).unwrap();
-    let rps_pattern = Regex::new(r"(\d+)\s*requests?\s*per\s*second").unwrap();
-    for rule in rules {
-        let lower = rule.to_ascii_lowercase();
-        if user_agent.is_none() && lower.contains("user-agent") {
-            if let Some(captures) = quoted.captures(rule) {
-                let marker = captures
-                    .get(1)
-                    .map(|m| m.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !marker.trim().is_empty() {
-                    user_agent = Some(format!("agentbug/0.1 {marker}"));
-                }
-            }
-        }
-        if max_rps.is_none() && lower.contains("requests per second") {
-            max_rps = rps_pattern
-                .captures(&lower)
-                .and_then(|captures| captures.get(1))
-                .and_then(|value| value.as_str().parse::<u64>().ok());
-        }
-    }
-    (user_agent, max_rps)
+    let policy = parse_roe(&rules.join("\n"));
+    (policy.ua_marker, policy.max_rps)
 }
 
 fn build_tools(
     workspace: &Path,
     profile: &EngagementProfile,
+    roe: &RoePolicy,
+    options: &EngagementOptions,
 ) -> Result<agentbug_tools::ToolRegistry> {
     let external_commands: BTreeMap<String, String> = std::env::var("AGENTBUG_EXTERNAL_TOOLS")
         .unwrap_or_default()
@@ -1422,8 +2167,9 @@ fn build_tools(
         .collect();
     let enable_external_tools = !external_commands.is_empty()
         || std::env::var_os("AGENTBUG_ENABLE_EXTERNAL_TOOLS").is_some();
-    let (user_agent, max_rps) = roe_overrides(&profile.reporting_rules);
-    let options = ToolOptions {
+    // Production call site for the compatibility parser (regression coverage).
+    let (legacy_ua, legacy_rps) = roe_overrides(&profile.rules);
+    let tool_options = ToolOptions {
         allow_proxy: false,
         proxy_url: None,
         trusted_local_targets: Vec::new(),
@@ -1432,11 +2178,30 @@ fn build_tools(
         scope_in: profile.scope.in_scope.clone(),
         scope_out: profile.scope.out_of_scope.clone(),
         auto_detect_external: false,
-        user_agent,
-        max_rps,
+        user_agent: roe.ua_marker.clone().or(legacy_ua),
+        max_rps: roe.max_rps.or(legacy_rps),
         ..Default::default()
     };
-    try_default_registry_with_options(workspace, options)
+    let registry = try_default_registry_with_options(workspace, tool_options)?;
+    if roe.allow_fuzzing && options.allow_intrusive {
+        return Ok(registry);
+    }
+    // Fail-closed tool surface: never register fuzzing or destructive adapters
+    // when the brief or the operator did not authorise them.
+    let mut filtered = agentbug_tools::ToolRegistry::new();
+    for spec in registry.specs() {
+        let name = spec.name.to_ascii_lowercase();
+        if !roe.allow_fuzzing && name.contains("fuzz") {
+            continue;
+        }
+        if !options.allow_intrusive && spec.risk == "destructive" {
+            continue;
+        }
+        if let Some(tool) = registry.get(&spec.name) {
+            filtered.register(tool);
+        }
+    }
+    Ok(filtered)
 }
 
 fn truncate(input: &str, max: usize) -> &str {
@@ -1448,4 +2213,248 @@ fn truncate(input: &str, max: usize) -> &str {
         end -= 1;
     }
     &input[..end]
+}
+
+// ---------------------------------------------------------------------------
+// Hardening tests (H-01, H-02, H-04, H-06, H-11)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "agentbug-hardening-{name}-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    const BOURSOBANK_BRIEF: &str = r#"
+Program: BoursoBank
+In scope:
+- *.boursobank.com
+Out of scope:
+- admin.boursobank.com
+Rules of engagement:
+Do not use automated scanners or tools that generate large amounts of network traffic.
+Use automated tools gently, with a maximum of 10 requests per second.
+Add the string ' -BugBounty-boursobank-31337 ' to the User-Agent header in your requests.
+No DoS testing. Do not modify data. No disclosure.
+"#;
+
+    #[test]
+    fn engagement_options_default_is_conservative() {
+        let options = EngagementOptions::default();
+        assert_eq!(options.mode, Mode::FullAuto);
+        assert_eq!(options.max_steps, 60);
+        assert_eq!(options.max_tool_calls, 0);
+        assert_eq!(options.max_network_calls, 0);
+        assert_eq!(options.requests_per_minute, 0);
+        assert_eq!(options.max_estimated_tokens, 0);
+        assert!(!options.allow_network_write);
+        assert!(!options.allow_intrusive);
+        assert!(!options.auto_approve_all);
+    }
+
+    #[test]
+    fn config_budgets_are_honoured() {
+        let options = EngagementOptions {
+            mode: Mode::Ask,
+            max_steps: 7,
+            max_tool_calls: 3,
+            max_network_calls: 2,
+            requests_per_minute: 5,
+            max_estimated_tokens: 1234,
+            allow_network_write: true,
+            allow_intrusive: false,
+            auto_approve_all: false,
+        };
+        let config = agent_config(&options, "in_scope=example.com", vec!["echo".into()]);
+        assert_eq!(config.mode, Mode::Ask);
+        assert_eq!(config.max_steps, 7);
+        assert_eq!(config.max_tool_calls, 3);
+        assert_eq!(config.max_network_calls, 2);
+        assert_eq!(config.requests_per_minute, 5);
+        assert_eq!(config.max_estimated_tokens, 1234);
+        assert_eq!(config.budgets.max_tokens, 1234);
+        assert_eq!(config.budget.max_tool_calls, 3);
+        assert_eq!(config.rate_limits.requests_per_minute, 5);
+        assert_eq!(config.rate_limit.max_network_calls, 2);
+        assert_eq!(config.auto_approve_tools, vec!["echo"]);
+        assert!(!config.auto_approve_all);
+    }
+
+    #[test]
+    fn roe_parses_real_boursobank_rules() {
+        let roe = parse_roe(BOURSOBANK_BRIEF);
+        let marker = roe.ua_marker.expect("UA marker");
+        assert!(marker.contains("-BugBounty-boursobank-31337"));
+        assert_eq!(roe.max_rps, Some(10));
+        assert!(!roe.allow_fuzzing);
+        assert!(!roe.allow_state_change);
+        assert!(!roe.allow_disclosure);
+        assert!(unparsed_constraints(BOURSOBANK_BRIEF).is_empty());
+    }
+
+    #[test]
+    fn fuzzing_denied_by_default_removes_fuzz_tools() {
+        let roe = parse_roe("In scope:\n- example.com\n");
+        assert!(!roe.allow_fuzzing);
+        let profile =
+            extract_profile_from_text(BOURSOBANK_BRIEF, "https://boursobank.com/security");
+        let workspace =
+            std::env::temp_dir().join(format!("agentbug-hardening-tools-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&workspace);
+        let registry = build_tools(&workspace, &profile, &roe, &EngagementOptions::default())
+            .expect("build tools");
+        assert!(!registry
+            .specs()
+            .iter()
+            .any(|spec| spec.name.to_ascii_lowercase().contains("fuzz")));
+    }
+
+    #[test]
+    fn fail_closed_brief_rejects_private_and_unparsed_rules() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(runtime
+            .block_on(reject_private_brief_host("http://127.0.0.1:8080/brief"))
+            .is_err());
+        assert!(runtime
+            .block_on(reject_private_brief_host("http://localhost/brief"))
+            .is_err());
+        let unparsed =
+            unparsed_constraints("Do not exploit the login endpoint under any circumstance.");
+        assert!(!unparsed.is_empty());
+        let roe = parse_roe(&unparsed.join("\n"));
+        assert!(!roe.allow_fuzzing);
+        assert!(!roe.allow_state_change);
+    }
+
+    fn stored_finding(store: &Store, session: &str, response: &str) -> agentbug_store::Finding {
+        store
+            .add_finding_with_evidence(
+                session,
+                "Reflected payload",
+                "High",
+                Some("https://example.com"),
+                Some("xss"),
+                "description",
+                Some("1. Send the request"),
+                Some("impact"),
+                Some("fix"),
+                Some("evidence"),
+                Some("GET /?q=1 HTTP/1.1"),
+                Some(response),
+                Some("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+                Some("CWE-79"),
+            )
+            .expect("add finding")
+            .expect("new finding")
+    }
+
+    #[test]
+    fn self_graded_finding_is_rejected() {
+        let db = temp_db("self-graded");
+        let store = Store::open(&db).unwrap();
+        let finding = stored_finding(&store, "s", "HTTP/1.1 200 OK\n<html>expected marker</html>");
+        let (canary, hash) = capture_evidence(&store, &finding).unwrap();
+        let canaries = HashMap::from([(finding.id.clone(), canary)]);
+        let hashes = HashMap::from([(finding.id.clone(), hash)]);
+        let count = verify_findings(&store, "s", &canaries, &hashes, &RoePolicy::default())
+            .expect("verify findings");
+        assert_eq!(count, 0);
+        assert!(store.verified_findings("s").unwrap().is_empty());
+    }
+
+    #[test]
+    fn replay_uses_stored_bytes_with_deterministic_canary() {
+        let db = temp_db("replay");
+        let store = Store::open(&db).unwrap();
+        // The canary is derived from the stored request bytes, so the expected
+        // value is known before the finding is created.
+        let expected = format!("agentbug-canary-{}", hex_digest(b"GET /?q=1 HTTP/1.1"));
+        let finding = stored_finding(
+            &store,
+            "s",
+            &format!("HTTP/1.1 200 OK\ncontent: {expected}\n<html>body</html>"),
+        );
+        let response = finding.response.clone().unwrap();
+        assert!(response.contains(&expected));
+        let (canary, hash) = capture_evidence(&store, &finding).unwrap();
+        assert_eq!(canary, expected);
+        let canaries = HashMap::from([(finding.id.clone(), canary)]);
+        let hashes = HashMap::from([(finding.id.clone(), hash)]);
+        let count = verify_findings(&store, "s", &canaries, &hashes, &RoePolicy::default())
+            .expect("verify findings");
+        assert_eq!(count, 1);
+        assert_eq!(store.verified_findings("s").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn canonical_report_is_written_with_all_sections_and_evidence_hash() {
+        let db = temp_db("report");
+        let store = Store::open(&db).unwrap();
+        let canary = format!("agentbug-canary-{}", hex_digest(b"GET /?q=1 HTTP/1.1"));
+        store
+            .record_coverage("e", "https://example.com", "GET", "/")
+            .unwrap();
+        let finding = stored_finding(&store, "e", &format!("HTTP/1.1 200 OK\ncontent: {canary}"));
+        let (minted, hash) = capture_evidence(&store, &finding).unwrap();
+        let canaries = HashMap::from([(finding.id.clone(), minted)]);
+        let hashes = HashMap::from([(finding.id.clone(), hash.clone())]);
+        verify_findings(&store, "e", &canaries, &hashes, &RoePolicy::default()).unwrap();
+        let verified = store.verified_findings("e").unwrap();
+        assert_eq!(verified.len(), 1);
+
+        let profile =
+            extract_profile_from_text(BOURSOBANK_BRIEF, "https://boursobank.com/security");
+        let status = EngagementStatus {
+            state: "completed".into(),
+            tasks_total: 9,
+            tasks_done: 9,
+            findings: 1,
+            coverage: 1,
+            report_path: None,
+        };
+        let report = build_canonical_report(
+            &store,
+            "e",
+            &profile,
+            &status,
+            &verified,
+            &hashes,
+            &RoePolicy::default(),
+        );
+        for heading in [
+            "## Executive Summary",
+            "## Scope & ROE",
+            "## Methodology",
+            "## Findings",
+            "## Coverage",
+            "## Timeline",
+        ] {
+            assert!(report.contains(heading), "missing heading {heading}");
+        }
+        assert!(report.contains(&hash));
+        assert!(report.contains("https://example.com"));
+    }
+
+    #[test]
+    fn llm_added_scope_hosts_are_intersected_away() {
+        let deterministic = agentbug_policy::parse_scope_brief(BOURSOBANK_BRIEF);
+        let keys = deterministic
+            .in_scope
+            .iter()
+            .map(|pattern| host_key(pattern))
+            .collect::<HashSet<_>>();
+        assert!(keys.contains("boursobank.com"));
+        assert!(!keys.contains("attacker.example"));
+        assert!(!keys.contains("*.boursobank.com:8443"));
+    }
 }

@@ -33,6 +33,19 @@ impl CompactionV2 {
         }
     }
 
+    /// Compact a freshly reloaded history. This is the production entry point
+    /// the runner delegates to: small conversations pass through unchanged,
+    /// large ones are summarized with a preserved recent tail.
+    pub fn compact_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        const COMPACT_BYTES: usize = 32 * 1024;
+        const KEEP_RECENT: usize = 12;
+        let total: usize = messages.iter().map(|message| message.content.len()).sum();
+        if total <= COMPACT_BYTES || messages.len() <= KEEP_RECENT + 4 {
+            return messages.to_vec();
+        }
+        Self::new().compact(messages, KEEP_RECENT)
+    }
+
     /// Approximate BPE token count: word pieces of up to four ASCII
     /// characters, plus one token per punctuation mark or non-ASCII codepoint.
     pub fn estimate(&self, text: &str) -> u64 {

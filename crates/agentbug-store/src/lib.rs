@@ -3,8 +3,6 @@ use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -217,6 +215,20 @@ fn sha256_hex(input: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Canonical evidence digest: `Sha256(request || response || artifact)`.
+/// Raw bytes are concatenated without separators so the hash is reproducible
+/// from the exact bytes that were captured, independent of text encoding.
+fn sha256_evidence_bytes(request: &[u8], response: &[u8], artifact: Option<&[u8]>) -> String {
+    let mut input =
+        Vec::with_capacity(request.len() + response.len() + artifact.map_or(0, |a| a.len()));
+    input.extend_from_slice(request);
+    input.extend_from_slice(response);
+    if let Some(artifact) = artifact {
+        input.extend_from_slice(artifact);
+    }
+    format!("{:x}", Sha256::digest(input))
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -333,7 +345,9 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS evidence(
                id TEXT PRIMARY KEY, finding_id TEXT NOT NULL, kind TEXT NOT NULL, path TEXT,
-               sha256 TEXT NOT NULL, request TEXT, response TEXT, created_at TEXT NOT NULL
+               sha256 TEXT NOT NULL, request TEXT, response TEXT,
+                request_bytes BLOB, response_bytes BLOB, artifact_bytes BLOB,
+                created_at TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS reports(
                id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, format TEXT NOT NULL,
@@ -375,6 +389,9 @@ impl Store {
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_call_id TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_calls_json TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN name TEXT", []);
+        let _ = conn.execute("ALTER TABLE evidence ADD COLUMN request_bytes BLOB", []);
+        let _ = conn.execute("ALTER TABLE evidence ADD COLUMN response_bytes BLOB", []);
+        let _ = conn.execute("ALTER TABLE evidence ADD COLUMN artifact_bytes BLOB", []);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -1047,16 +1064,17 @@ impl Store {
         Ok(())
     }
 
-    fn evidence_hash(
+    /// SHA-256 over `request || response || evidence(artifact)`, rendered as 64-hex.
+    pub fn evidence_hash(
         evidence: Option<&str>,
         request: Option<&str>,
         response: Option<&str>,
     ) -> String {
-        let mut hasher = DefaultHasher::new();
-        evidence.hash(&mut hasher);
-        request.hash(&mut hasher);
-        response.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+        sha256_evidence_bytes(
+            request.unwrap_or("").as_bytes(),
+            response.unwrap_or("").as_bytes(),
+            evidence.map(str::as_bytes),
+        )
     }
 
     pub fn list_findings(&self, session_id: &str) -> Result<Vec<Finding>> {
@@ -1959,6 +1977,74 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Hash raw captured bytes with SHA-256 and persist the evidence row.
+    /// Returns the 64-hex digest so callers can stamp it onto findings/reports.
+    pub fn add_evidence_bytes(
+        &self,
+        finding_id: &str,
+        kind: &str,
+        request: &[u8],
+        response: &[u8],
+        artifact: Option<&[u8]>,
+    ) -> Result<String> {
+        let hash = sha256_evidence_bytes(request, response, artifact);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO evidence(id,finding_id,kind,path,sha256,request,response,request_bytes,response_bytes,artifact_bytes,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![
+                Uuid::new_v4().to_string(),
+                finding_id,
+                kind,
+                artifact.map(|a| String::from_utf8_lossy(a).into_owned()),
+                hash,
+                String::from_utf8_lossy(request).into_owned(),
+                String::from_utf8_lossy(response).into_owned(),
+                request,
+                response,
+                artifact,
+                now()
+            ],
+        )?;
+        Ok(hash)
+    }
+
+    /// Findings that passed verification. Only these may appear in reports.
+    pub fn verified_findings(&self, session_id: &str) -> Result<Vec<Finding>> {
+        let findings = self.list_findings(session_id)?;
+        Ok(findings
+            .into_iter()
+            .filter(|f| matches!(f.status.as_str(), "validated" | "confirmed"))
+            .collect())
+    }
+
+    /// Recompute every evidence digest for findings in a session and confirm
+    /// the stored SHA-256 values still match the captured bytes.
+    pub fn verify_evidence(&self, session_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT e.sha256, e.request_bytes, e.response_bytes, e.artifact_bytes
+             FROM evidence e JOIN findings f ON f.id = e.finding_id
+             WHERE f.session_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default(),
+                r.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default(),
+                r.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default(),
+            ))
+        })?;
+        for row in rows {
+            let (stored, request, response, artifact) = row?;
+            let artifact = (!artifact.is_empty()).then_some(artifact.as_slice());
+            if stored != sha256_evidence_bytes(&request, &response, artifact) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub fn save_report(
@@ -3213,5 +3299,175 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn evidence_bytes_hash_is_reproducible_sha256() {
+        let store = Store::open(":memory:").unwrap();
+        let session = store.create_session("g").unwrap();
+        let finding = store
+            .add_finding(
+                &session.id,
+                "Reflected XSS",
+                "high",
+                None,
+                None,
+                "desc",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let request = b"GET /search?q=FUZZ HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let response = b"HTTP/1.1 200 OK\r\n\r\n<html>canary</html>";
+        let artifact = b"canary-42";
+
+        let first = store
+            .add_evidence_bytes(&finding.id, "http", request, response, Some(artifact))
+            .unwrap();
+        let second = store
+            .add_evidence_bytes(&finding.id, "http", request, response, Some(artifact))
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        let mut input = Vec::new();
+        input.extend_from_slice(request);
+        input.extend_from_slice(response);
+        input.extend_from_slice(artifact);
+        assert_eq!(first, format!("{:x}", Sha256::digest(&input)));
+        assert_eq!(
+            first,
+            Store::evidence_hash(
+                Some(std::str::from_utf8(artifact).unwrap()),
+                Some(std::str::from_utf8(request).unwrap()),
+                Some(std::str::from_utf8(response).unwrap()),
+            )
+        );
+        assert!(store.verify_evidence(&session.id).unwrap());
+
+        // A different byte sequence must produce a different digest.
+        let other = store
+            .add_evidence_bytes(&finding.id, "http", request, response, Some(b"canary-43"))
+            .unwrap();
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn verify_evidence_detects_tampering() {
+        let store = Store::open(":memory:").unwrap();
+        let session = store.create_session("g").unwrap();
+        let finding = store
+            .add_finding(
+                &session.id,
+                "t",
+                "high",
+                None,
+                None,
+                "d",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .add_evidence_bytes(&finding.id, "http", b"GET /", b"HTTP/1.1 200", None)
+            .unwrap();
+        assert!(store.verify_evidence(&session.id).unwrap());
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE evidence SET sha256='tampered' WHERE finding_id=?1",
+                params![finding.id],
+            )
+            .unwrap();
+        }
+        assert!(!store.verify_evidence(&session.id).unwrap());
+    }
+
+    #[test]
+    fn verified_findings_filters_to_validated_and_confirmed() {
+        let store = Store::open(":memory:").unwrap();
+        let session = store.create_session("g").unwrap();
+        let open = store
+            .add_finding(
+                &session.id,
+                "open",
+                "low",
+                None,
+                None,
+                "d",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let validated = store
+            .add_finding(
+                &session.id,
+                "val",
+                "medium",
+                None,
+                None,
+                "d",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let confirmed = store
+            .add_finding(
+                &session.id,
+                "conf",
+                "high",
+                None,
+                None,
+                "d",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let rejected = store
+            .add_finding(
+                &session.id,
+                "rej",
+                "info",
+                None,
+                None,
+                "d",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .set_finding_validation(&validated.id, "validated", None)
+            .unwrap();
+        store
+            .set_finding_validation(&confirmed.id, "confirmed", None)
+            .unwrap();
+        store
+            .set_finding_validation(&rejected.id, "rejected", None)
+            .unwrap();
+
+        let verified: Vec<String> = store
+            .verified_findings(&session.id)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(verified.len(), 2);
+        assert!(verified.contains(&validated.id));
+        assert!(verified.contains(&confirmed.id));
+        assert!(!verified.contains(&open.id));
+        assert!(!verified.contains(&rejected.id));
     }
 }

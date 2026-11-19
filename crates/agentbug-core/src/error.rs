@@ -13,6 +13,11 @@ pub enum AgentError {
 }
 
 impl AgentError {
+    /// Classify a free-form error message into the most specific variant.
+    pub fn classify(message: &str) -> Self {
+        classify(message)
+    }
+
     pub fn message(&self) -> &str {
         match self {
             Self::Retryable(message)

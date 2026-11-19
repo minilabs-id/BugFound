@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InboxKind {
@@ -79,9 +79,16 @@ pub struct Inbox {
     inner: Arc<Mutex<Inner>>,
 }
 
+static GLOBAL: OnceLock<Inbox> = OnceLock::new();
+
 impl Inbox {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Process-wide inbox used by external producers and the `Runner`.
+    pub fn global() -> &'static Self {
+        GLOBAL.get_or_init(Self::new)
     }
 
     /// Admit a new item. The payload accepts a string, a `Value`, or anything

@@ -338,6 +338,9 @@ struct AgentFile {
     auto_approve_tools: Vec<String>,
     #[serde(default)]
     max_estimated_tokens: Option<u64>,
+    /// Explicit escape hatch: skip every approval prompt. Default off.
+    #[serde(default)]
+    auto_approve_all: bool,
 }
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 struct NetworkFile {
@@ -347,6 +350,12 @@ struct NetworkFile {
     proxy_url: Option<String>,
     #[serde(default)]
     trusted_local_targets: Vec<String>,
+    /// Opt in to network-write tools during an engagement. Default off.
+    #[serde(default)]
+    allow_network_write: bool,
+    /// Opt in to intrusive/fuzzing tools during an engagement. Default off.
+    #[serde(default)]
+    allow_intrusive: bool,
 }
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 struct ExternalFile {
@@ -502,6 +511,22 @@ fn print_approval_summary(store: &Store, session: &str) {
             }
         }
         Err(e) => eprintln!("warning: cannot list approvals: {e}"),
+    }
+}
+
+/// H-01: build engagement limits from the operator's config instead of using
+/// the permissive compatibility defaults.
+fn engagement_options(cfg: &FileConfig) -> agentbug_engagement::EngagementOptions {
+    agentbug_engagement::EngagementOptions {
+        mode: resolve_mode(None, cfg.agent.mode.as_deref()),
+        max_steps: cfg.agent.max_steps.unwrap_or(60),
+        max_tool_calls: cfg.agent.max_tool_calls.unwrap_or(0),
+        max_network_calls: cfg.agent.max_network_calls.unwrap_or(0),
+        requests_per_minute: cfg.agent.requests_per_minute.unwrap_or(0),
+        max_estimated_tokens: cfg.agent.max_estimated_tokens.unwrap_or(0),
+        allow_network_write: cfg.network.allow_network_write,
+        allow_intrusive: cfg.network.allow_intrusive,
+        auto_approve_all: cfg.agent.auto_approve_all,
     }
 }
 
@@ -886,12 +911,14 @@ path = ".agentbug/agentbug.db"
             brief_only,
         } => {
             let db_path = db.unwrap_or_else(|| cfg.storage.path.clone());
+            let options = engagement_options(&cfg);
             let (tx, rx) = std::sync::mpsc::channel::<agentbug_engagement::EngagementEvent>();
 
             // Keep the id emitted by the Started event so Ctrl+C can abort the
             // running engagement from an independent signal-watching thread.
             let engagement_id = Arc::new(std::sync::Mutex::new(None::<String>));
             let id_for_signal = Arc::clone(&engagement_id);
+            let signal_db = std::path::PathBuf::from(&db_path);
             std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -901,7 +928,7 @@ path = ".agentbug/agentbug.db"
                     if tokio::signal::ctrl_c().await.is_ok() {
                         let guard = id_for_signal.lock().unwrap();
                         if let Some(id) = guard.as_ref() {
-                            match agentbug_engagement::abort(id) {
+                            match agentbug_engagement::abort_at(&signal_db, id) {
                                 Ok(()) => {}
                                 Err(e) => eprintln!("warning: failed to abort engagement: {e}"),
                             }
@@ -915,17 +942,19 @@ path = ".agentbug/agentbug.db"
             let worker_db = db_path.clone();
             let worker = std::thread::spawn(move || {
                 if brief_only {
-                    agentbug_engagement::engage_brief_only(
+                    agentbug_engagement::engage_brief_only_with_options(
                         &worker_url,
                         Path::new(&worker_cwd),
                         Path::new(&worker_db),
+                        options,
                         tx,
                     )
                 } else {
-                    agentbug_engagement::engage(
+                    agentbug_engagement::engage_with_options(
                         &worker_url,
                         Path::new(&worker_cwd),
                         Path::new(&worker_db),
+                        options,
                         tx,
                     )
                 }

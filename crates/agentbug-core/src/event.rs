@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// A typed, session-scoped event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +46,8 @@ pub struct EventBus {
     inner: Arc<Mutex<Inner>>,
 }
 
+static GLOBAL: OnceLock<EventBus> = OnceLock::new();
+
 impl Default for EventBus {
     fn default() -> Self {
         Self::new()
@@ -58,6 +60,11 @@ impl EventBus {
             ids: Arc::new(AtomicU64::new(0)),
             inner: Arc::new(Mutex::new(Inner::default())),
         }
+    }
+
+    /// Process-wide bus shared by every `Runner` and its external observers.
+    pub fn global() -> &'static Self {
+        GLOBAL.get_or_init(Self::new)
     }
 
     /// Publish an event to a session. Live subscribers are notified with the

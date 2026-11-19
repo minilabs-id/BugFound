@@ -1,4 +1,8 @@
-use agentbug_engagement::{cvss_base, extract_profile_from_text, roe_overrides, wstg_playbooks};
+use agentbug_engagement::{
+    cvss_base, extract_profile_from_text, parse_roe, roe_overrides, wstg_playbooks,
+    EngagementOptions,
+};
+use agentbug_policy::Mode;
 
 #[test]
 fn heuristic_extracts_scope_from_local_html() {
@@ -55,6 +59,41 @@ fn cvss_matches_first_v31_reference_vectors() {
     assert!((cvss_base("CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N") - 1.8).abs() < 0.001);
     assert_eq!(cvss_base(""), 0.0);
     assert_eq!(cvss_base("CVSS:3.1/AV:N/AC:L"), 0.0);
+}
+
+#[test]
+fn full_brief_text_parses_into_fail_closed_roe() {
+    let brief = r#"
+Program: BoursoBank
+In scope:
+- *.boursobank.com
+Rules of engagement:
+Do not use automated scanners or tools that generate large amounts of network traffic.
+Use automated tools gently, with a maximum of 10 requests per second.
+Add the string ' -BugBounty-boursobank-31337 ' to the User-Agent header in your requests.
+No DoS testing. Do not modify data. No disclosure.
+"#;
+    let roe = parse_roe(brief);
+    assert!(roe
+        .ua_marker
+        .unwrap()
+        .contains("-BugBounty-boursobank-31337"));
+    assert_eq!(roe.max_rps, Some(10));
+    // Fuzzing and state-changing actions stay denied by default even when the
+    // brief mentions automated tools only to constrain them.
+    assert!(!roe.allow_fuzzing);
+    assert!(!roe.allow_state_change);
+    assert!(!roe.allow_disclosure);
+}
+
+#[test]
+fn engagement_options_default_denies_risk_and_has_no_auto_approval() {
+    let options = EngagementOptions::default();
+    assert_eq!(options.mode, Mode::FullAuto);
+    assert_eq!(options.max_steps, 60);
+    assert!(!options.allow_network_write);
+    assert!(!options.allow_intrusive);
+    assert!(!options.auto_approve_all);
 }
 
 #[test]

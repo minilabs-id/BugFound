@@ -17,6 +17,11 @@ use tokio::time::{sleep, timeout, Duration};
 const MAX_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024;
 const MAX_READ_BYTES: u64 = 512 * 1024;
+/// Hard ROE caps for `http_fuzz`: at most 200 wordlist items and 200 requests
+/// per call. Methods are restricted to non-destructive GET/HEAD/POST.
+const MAX_FUZZ_WORDLIST: usize = 200;
+const MAX_FUZZ_REQUESTS: usize = 200;
+const FUZZ_METHODS: &[&str] = &["GET", "HEAD", "POST"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -1370,6 +1375,8 @@ pub struct ExternalCommandTool {
     pub arg_template: Vec<String>,
     pub risk: String,
     cwd: PathBuf,
+    scope_in: Vec<String>,
+    scope_out: Vec<String>,
 }
 
 impl ExternalCommandTool {
@@ -1388,11 +1395,21 @@ impl ExternalCommandTool {
             arg_template,
             risk: risk.into(),
             cwd: cwd.as_ref().to_path_buf(),
+            scope_in: Vec::new(),
+            scope_out: Vec::new(),
         }
     }
 
     pub fn with_cwd(mut self, cwd: impl AsRef<Path>) -> Self {
         self.cwd = cwd.as_ref().to_path_buf();
+        self
+    }
+
+    /// Attach the engagement scope so the tool can fail closed on its own,
+    /// independently of the runner's approval gate.
+    pub fn with_scope(mut self, scope_in: Vec<String>, scope_out: Vec<String>) -> Self {
+        self.scope_in = scope_in;
+        self.scope_out = scope_out;
         self
     }
 }
@@ -1419,6 +1436,27 @@ impl Tool for ExternalCommandTool {
 
     async fn run(&self, input: Value) -> Result<ToolResult> {
         let args = build_external_args(&self.arg_template, &input);
+        // Scope is enforced here as well as by the runner: a prompt-injected
+        // or unapproved call must not spawn a process against an out-of-scope
+        // target even if it somehow bypasses the outer approval gate.
+        let target = self
+            .arg_template
+            .iter()
+            .position(|arg| arg.contains("{target}"))
+            .and_then(|index| args.get(index))
+            .cloned()
+            .or_else(|| {
+                input
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|target| !target.is_empty());
+        if let Some(target) = target {
+            if !scope_target_allowed(&target, &self.scope_in, &self.scope_out) {
+                anyhow::bail!("target '{target}' is not permitted by scope policy");
+            }
+        }
         let cwd = resolve_cwd(&self.cwd).unwrap_or_else(|_| self.cwd.clone());
         let mut cmd = std::process::Command::new(&self.command);
         cmd.args(&args)
@@ -1551,7 +1589,7 @@ pub fn try_default_registry_with_options(
     }));
     reg.register(Arc::new(ExternalBackedTool {
         name: "browser",
-        description: "Browser automation adapter via a configured playwright CLI (navigate/click/screenshot); gated when unavailable.",
+        description: "Gated CLI adapter that forwards browser actions to a configured Playwright CLI (navigate/click/screenshot); NOT full browser automation. Requires an explicit external_commands entry and is gated when unavailable.",
         risk: "network",
         required: &["url", "action"],
         commands: &["playwright"],
@@ -1667,14 +1705,10 @@ fn register_external_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &Tool
                 continue;
             }
         }
-        reg.register(Arc::new(ExternalCommandTool::new(
-            name,
-            description,
-            command,
-            arg_template,
-            risk,
-            cwd,
-        )));
+        reg.register(Arc::new(
+            ExternalCommandTool::new(name, description, command, arg_template, risk, cwd)
+                .with_scope(options.scope_in.clone(), options.scope_out.clone()),
+        ));
     }
 }
 
@@ -1689,14 +1723,17 @@ fn register_command_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &ToolO
         let Some((program, args)) = parts.split_first() else {
             continue;
         };
-        reg.register(Arc::new(ExternalCommandTool::new(
-            name,
-            format!("Gated external tool: {name}."),
-            program.clone(),
-            args.to_vec(),
-            "network",
-            cwd,
-        )));
+        reg.register(Arc::new(
+            ExternalCommandTool::new(
+                name,
+                format!("Gated external tool: {name}."),
+                program.clone(),
+                args.to_vec(),
+                "network",
+                cwd,
+            )
+            .with_scope(options.scope_in.clone(), options.scope_out.clone()),
+        ));
     }
 }
 
@@ -2436,98 +2473,332 @@ impl Tool for KnowledgeLookupTool {
     }
 }
 
-fn render_report(input: &Value) -> (String, Vec<String>) {
-    let program = str_field(input, &["program", "name", "title"], "Unnamed program");
-    let scope = match input.get("scope") {
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join(", "),
-        Some(Value::String(s)) => s.clone(),
-        _ => "(not specified)".to_string(),
-    };
-    let findings = input
-        .get("findings")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
+/// One verified finding as consumed by the canonical report renderer.
+#[derive(Debug, Clone)]
+pub struct ReportFinding {
+    pub id: String,
+    pub title: String,
+    pub severity: String,
+    pub cvss: Option<f32>,
+    pub vector: Option<String>,
+    pub cwe: Option<String>,
+    pub asset: Option<String>,
+    pub description: String,
+    pub reproduction: Option<String>,
+    pub impact: Option<String>,
+    pub remediation: Option<String>,
+    pub evidence_hash: Option<String>,
+    pub verified: bool,
+}
 
-    let mut markdown = String::new();
-    markdown.push_str(&format!("# Security Assessment Report — {program}\n\n"));
-    markdown.push_str("## Executive Summary\n\n");
-    markdown.push_str(&format!(
-        "This report documents {} validated finding(s) discovered during the engagement. Findings are prioritised by severity and include reproduction steps, proof of concept, impact, remediation and evidence integrity hashes.\n\n",
-        findings.len()
+/// Everything the canonical renderer needs. Coverage and timeline tuples are
+/// `(target, method, path)` and `(timestamp, kind, detail)` respectively.
+#[derive(Debug, Clone)]
+pub struct ReportInput {
+    pub program: String,
+    pub engagement: String,
+    pub scope_in: Vec<String>,
+    pub scope_out: Vec<String>,
+    pub rules: Vec<String>,
+    pub findings: Vec<ReportFinding>,
+    pub coverage: Vec<(String, String, String)>,
+    pub timeline: Vec<(String, String, String)>,
+    pub report_id: String,
+}
+
+/// The single canonical Markdown report renderer. Every report-producing path
+/// must delegate here so section names, ordering and evidence hashes agree.
+pub fn render_canonical_report(input: &ReportInput) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# {} — Security Assessment Report\n\n",
+        input.engagement
     ));
-    markdown.push_str("## Scope\n\n");
-    markdown.push_str(&format!("**Scope:** {scope}\n\n"));
-    markdown.push_str("## Methodology\n\n");
-    markdown.push_str(
-        "Testing combined passive reconnaissance, scoped HTTP probing, parameter fuzzing and manual validation. Each candidate issue was reproduced and assessed against OWASP WSTG and CWE guidance.\n\n",
-    );
-    markdown.push_str("## Findings\n\n");
-    if findings.is_empty() {
-        markdown.push_str("_No findings were recorded._\n\n");
+
+    let verified_count = input.findings.iter().filter(|f| f.verified).count();
+    out.push_str("## Executive Summary\n\n");
+    out.push_str(&format!(
+        "Program: {}\n\nThis report documents {} finding(s), {} verified, from engagement `{}` (report `{}`). Findings include reproduction steps, proof of concept, impact, remediation and SHA-256 evidence hashes.\n\n",
+        input.program,
+        input.findings.len(),
+        verified_count,
+        input.engagement,
+        input.report_id
+    ));
+
+    out.push_str("## Scope & ROE\n\n");
+    out.push_str("**In scope**\n\n");
+    for entry in &input.scope_in {
+        out.push_str(&format!("- `{entry}`\n"));
     }
+    if input.scope_in.is_empty() {
+        out.push_str("- (none)\n");
+    }
+    out.push_str("\n**Out of scope**\n\n");
+    for entry in &input.scope_out {
+        out.push_str(&format!("- `{entry}`\n"));
+    }
+    if input.scope_out.is_empty() {
+        out.push_str("- (none)\n");
+    }
+    out.push_str("\n**Rules of engagement**\n\n");
+    for rule in &input.rules {
+        out.push_str(&format!("- {rule}\n"));
+    }
+    if input.rules.is_empty() {
+        out.push_str("- (none)\n");
+    }
+    out.push('\n');
+
+    out.push_str("## Methodology\n\n");
+    out.push_str(
+        "Testing combined passive reconnaissance, scoped HTTP probing, bounded parameter fuzzing and manual validation against OWASP WSTG and CWE guidance. Raw request/response bytes are pinned with SHA-256 so evidence can be replayed and verified independently.\n\n",
+    );
+
+    out.push_str("## Findings\n\n");
+    if input.findings.is_empty() {
+        out.push_str("_No findings were recorded._\n\n");
+    }
+    for (index, finding) in input.findings.iter().enumerate() {
+        let hash = finding.evidence_hash.as_deref().unwrap_or("unavailable");
+        out.push_str(&format!("### F-{:03}: {}\n\n", index + 1, finding.title));
+        out.push_str(&format!("- **ID:** {}\n", finding.id));
+        out.push_str(&format!("- **Severity:** {}\n", finding.severity));
+        out.push_str(&format!(
+            "- **CVSS:** {}\n",
+            finding
+                .cvss
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "N/A".to_string())
+        ));
+        out.push_str(&format!(
+            "- **Vector:** {}\n",
+            finding.vector.as_deref().unwrap_or("N/A")
+        ));
+        out.push_str(&format!(
+            "- **CWE:** {}\n",
+            finding.cwe.as_deref().unwrap_or("N/A")
+        ));
+        out.push_str(&format!(
+            "- **Asset:** {}\n",
+            finding.asset.as_deref().unwrap_or("N/A")
+        ));
+        out.push_str(&format!("- **Verified:** {}\n", finding.verified));
+        out.push_str(&format!("- **Evidence SHA-256:** `{hash}`\n\n"));
+        out.push_str(&format!("{}\n\n", finding.description));
+        out.push_str("#### Steps to Reproduce\n\n");
+        out.push_str(&format!(
+            "{}\n\n",
+            finding.reproduction.as_deref().unwrap_or("Not provided")
+        ));
+        out.push_str("#### Proof of Concept\n\n");
+        out.push_str(&format!("Evidence bytes pinned by SHA-256 `{hash}`.\n\n"));
+        out.push_str("#### Impact\n\n");
+        out.push_str(&format!(
+            "{}\n\n",
+            finding.impact.as_deref().unwrap_or("Not provided")
+        ));
+        out.push_str("#### Remediation\n\n");
+        out.push_str(&format!(
+            "{}\n\n",
+            finding.remediation.as_deref().unwrap_or("Not provided")
+        ));
+    }
+
+    out.push_str("## Coverage\n\n");
+    if input.coverage.is_empty() {
+        out.push_str("- No coverage rows were supplied.\n");
+    } else {
+        for (target, method, path) in &input.coverage {
+            let method = if method.is_empty() { "ANY" } else { method };
+            out.push_str(&format!("- `{method} {target}{path}`\n"));
+        }
+    }
+    out.push('\n');
+
+    out.push_str("## Timeline\n\n");
+    if input.timeline.is_empty() {
+        out.push_str("- (none)\n");
+    } else {
+        for (timestamp, kind, detail) in &input.timeline {
+            out.push_str(&format!("- {timestamp} [{kind}] {detail}\n"));
+        }
+    }
+    out.push('\n');
+
+    out.push_str("## Appendices\n\n");
+    out.push_str("### A. Evidence Integrity\n\n");
+    for (index, finding) in input.findings.iter().enumerate() {
+        out.push_str(&format!(
+            "- F-{:03}: `{}`\n",
+            index + 1,
+            finding.evidence_hash.as_deref().unwrap_or("unavailable")
+        ));
+    }
+    out.push_str("\n### B. References\n\n");
+    out.push_str("- OWASP Web Security Testing Guide (WSTG)\n");
+    out.push_str("- MITRE CWE / Common Vulnerability Scoring System (CVSS)\n");
+    out
+}
+
+/// Adapt the legacy `report_writer` JSON input to [`render_canonical_report`].
+/// Returns the rendered Markdown plus the evidence hashes for tool callers.
+fn render_report(input: &Value) -> (String, Vec<String>) {
+    let program = str_field(input, &["program", "name", "title"], "Unnamed program").to_string();
+    let engagement = str_field(
+        input,
+        &["engagement", "program", "name", "title"],
+        "Unnamed engagement",
+    )
+    .to_string();
+    let report_id = str_field(input, &["report_id", "id"], "unspecified").to_string();
+
+    let as_strings = |key: &str| -> Vec<String> {
+        match input.get(key) {
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            Some(Value::String(s)) => vec![s.clone()],
+            _ => Vec::new(),
+        }
+    };
+    let scope_in = {
+        let mut values = as_strings("scope_in");
+        if values.is_empty() {
+            values = as_strings("scope");
+        }
+        values
+    };
+    let scope_out = as_strings("scope_out");
+    let rules = as_strings("rules");
+
+    let findings_value = input.get("findings").and_then(Value::as_array);
+    let mut findings: Vec<ReportFinding> = Vec::new();
     let mut evidence_hashes: Vec<String> = Vec::new();
-    let mut coverage: Vec<String> = Vec::new();
-    for (index, finding) in findings.iter().enumerate() {
-        let title = str_field(finding, &["title", "name"], "(untitled)");
-        let severity = str_field(finding, &["severity", "risk"], "info");
-        let cvss = str_field(finding, &["cvss", "cvss_score", "cvss_vector"], "N/A");
-        let cwe = str_field(finding, &["cwe"], "N/A");
+    let mut derived_coverage: Vec<String> = Vec::new();
+    for (index, finding) in findings_value.into_iter().flatten().enumerate() {
+        let raw_cvss = str_field(finding, &["cvss", "cvss_score"], "");
+        let vector = str_field(finding, &["vector", "cvss_vector", "cvss"], "");
         let steps = str_field(finding, &["steps", "reproduction", "repro"], "Not provided");
-        let poc = str_field(
-            finding,
-            &["poc", "proof_of_concept", "request"],
-            "Not provided",
-        );
-        let impact = str_field(finding, &["impact"], "Not provided");
-        let remediation = str_field(finding, &["remediation", "fix"], "Not provided");
+        let poc = str_field(finding, &["poc", "proof_of_concept", "request"], "");
+        let reproduction = if poc.is_empty() {
+            steps.to_string()
+        } else {
+            format!("{steps}\n\nPoC: {poc}")
+        };
         let evidence = str_field(finding, &["evidence", "response"], "");
-        let hash = sha256_hex(evidence.as_bytes());
+        let explicit_hash = str_field(finding, &["evidence_hash"], "");
+        let hash = if explicit_hash.is_empty() {
+            sha256_hex(evidence.as_bytes())
+        } else {
+            explicit_hash.to_string()
+        };
         evidence_hashes.push(hash.clone());
         let asset = str_field(finding, &["asset", "target", "url", "host"], "");
-        if !asset.is_empty() && !coverage.iter().any(|c| c == asset) {
-            coverage.push(asset.to_string());
+        if !asset.is_empty() && !derived_coverage.iter().any(|c| c == asset) {
+            derived_coverage.push(asset.to_string());
         }
-        markdown.push_str(&format!("### F-{:02}: {title}\n\n", index + 1));
-        markdown.push_str(&format!("- **Severity:** {severity}\n"));
-        markdown.push_str(&format!("- **CVSS:** {cvss}\n"));
-        markdown.push_str(&format!("- **CWE:** {cwe}\n"));
-        markdown.push_str(&format!("- **Evidence SHA-256:** `{hash}`\n\n"));
-        markdown.push_str(&format!("#### Steps to Reproduce\n\n{steps}\n\n"));
-        markdown.push_str("#### Proof of Concept\n\n");
-        markdown.push_str(&format!("```\n{poc}\n```\n\n"));
-        markdown.push_str(&format!("#### Impact\n\n{impact}\n\n"));
-        markdown.push_str(&format!("#### Remediation\n\n{remediation}\n\n"));
+        let verified = finding
+            .get("verified")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| {
+                matches!(
+                    str_field(finding, &["status"], ""),
+                    "validated" | "confirmed"
+                )
+            });
+        let id = str_field(finding, &["id"], "");
+        findings.push(ReportFinding {
+            id: if id.is_empty() {
+                format!("F-{:03}", index + 1)
+            } else {
+                id.to_string()
+            },
+            title: str_field(finding, &["title", "name"], "(untitled)").to_string(),
+            severity: str_field(finding, &["severity", "risk"], "info").to_string(),
+            cvss: raw_cvss.parse::<f32>().ok(),
+            vector: (!vector.is_empty()).then(|| vector.to_string()),
+            cwe: str_field(finding, &["cwe"], "").to_string().into(),
+            asset: (!asset.is_empty()).then(|| asset.to_string()),
+            description: str_field(finding, &["description", "desc"], "").to_string(),
+            reproduction: Some(reproduction),
+            impact: str_field(finding, &["impact"], "").to_string().into(),
+            remediation: str_field(finding, &["remediation", "fix"], "")
+                .to_string()
+                .into(),
+            evidence_hash: Some(hash),
+            verified,
+        });
     }
-    markdown.push_str("## Coverage\n\n");
-    if coverage.is_empty() {
-        markdown.push_str("- No specific assets were tagged in the supplied findings.\n\n");
-    } else {
-        for asset in &coverage {
-            markdown.push_str(&format!("- `{asset}`\n"));
-        }
-        markdown.push('\n');
-    }
-    markdown.push_str("## Timeline\n\n");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    markdown.push_str(&format!("- Report generated at Unix epoch {now}.\n"));
-    markdown.push_str("- Activity order: reconnaissance → discovery → validation → reporting.\n\n");
-    markdown.push_str("## Appendices\n\n");
-    markdown.push_str("### A. Evidence Integrity\n\n");
-    for (index, hash) in evidence_hashes.iter().enumerate() {
-        markdown.push_str(&format!("- Finding F-{:02}: `{hash}`\n", index + 1));
-    }
-    markdown.push_str("\n### B. References\n\n");
-    markdown.push_str("- OWASP Web Security Testing Guide (WSTG)\n");
-    markdown.push_str("- MITRE CWE / Common Vulnerability Scoring System (CVSS)\n");
-    (markdown, evidence_hashes)
+
+    let coverage: Vec<(String, String, String)> = input
+        .get("coverage")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    if let Some(single) = item.as_str() {
+                        return Some((single.to_string(), String::new(), String::new()));
+                    }
+                    let parts = item.as_array()?;
+                    Some((
+                        as_text(parts.first()),
+                        as_text(parts.get(1)),
+                        as_text(parts.get(2)),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            derived_coverage
+                .into_iter()
+                .map(|asset| (asset, String::new(), String::new()))
+                .collect()
+        });
+
+    let timeline: Vec<(String, String, String)> = input
+        .get("timeline")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let parts = item.as_array()?;
+                    Some((
+                        as_text(parts.first()),
+                        as_text(parts.get(1)),
+                        as_text(parts.get(2)),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            vec![(
+                format!("unix-{now}"),
+                "system".to_string(),
+                "Report generated".to_string(),
+            )]
+        });
+
+    let canonical = ReportInput {
+        program,
+        engagement,
+        scope_in,
+        scope_out,
+        rules,
+        findings,
+        coverage,
+        timeline,
+        report_id,
+    };
+    (render_canonical_report(&canonical), evidence_hashes)
 }
 
 /// Render a Markdown report from structured findings.
@@ -2701,12 +2972,12 @@ impl Tool for HttpFuzzTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "http_fuzz".into(),
-            description: "Fuzz a URL parameter or marker with a wordlist using the scoped HTTP client. Records status, response length and marker presence per payload.".into(),
+            description: "Fuzz a URL parameter or marker with a wordlist using the scoped HTTP client. Hard-capped at 200 wordlist items and 200 requests per call; only GET/HEAD/POST are allowed. Records status, response length and marker presence per payload and reports `capped` when input was truncated.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "url": {"type": "string"},
-                    "method": {"type": "string", "default": "GET"},
+                    "method": {"type": "string", "enum": FUZZ_METHODS, "default": "GET"},
                     "param": {"type": "string"},
                     "wordlist": {"type": "array", "items": {"type": "string"}},
                     "marker": {"type": "string", "default": "FUZZ"},
@@ -2728,15 +2999,34 @@ impl Tool for HttpFuzzTool {
             .get("wordlist")
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow!("wordlist required"))?;
-        let method = input.get("method").and_then(Value::as_str).unwrap_or("GET");
+        let method = input
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("GET")
+            .to_ascii_uppercase();
+        if !FUZZ_METHODS.contains(&method.as_str()) {
+            anyhow::bail!("method '{method}' is not allowed for http_fuzz (only GET/HEAD/POST)");
+        }
         let marker = input
             .get("marker")
             .and_then(Value::as_str)
             .unwrap_or("FUZZ");
         let param = input.get("param").and_then(Value::as_str);
         let explicit_match = input.get("match").and_then(Value::as_str);
+        let wordlist_total = wordlist.len();
+        let mut capped = wordlist_total > MAX_FUZZ_WORDLIST;
+        let mut requests = 0usize;
         let mut results: Vec<Value> = Vec::new();
-        for payload in wordlist.iter().filter_map(Value::as_str) {
+        for payload in wordlist
+            .iter()
+            .filter_map(Value::as_str)
+            .take(MAX_FUZZ_WORDLIST)
+        {
+            if requests >= MAX_FUZZ_REQUESTS {
+                capped = true;
+                break;
+            }
+            requests += 1;
             let mut entry = serde_json::Map::new();
             entry.insert("payload".into(), Value::String(payload.to_string()));
             let Some(candidate) = fuzz_candidate(&base, marker, param, payload) else {
@@ -2751,7 +3041,7 @@ impl Tool for HttpFuzzTool {
             entry.insert("url".into(), Value::String(candidate.to_string()));
             match self
                 .http
-                .run(json!({"url": candidate.as_str(), "method": method}))
+                .run(json!({"url": candidate.as_str(), "method": method.as_str()}))
                 .await
             {
                 Ok(response) => {
@@ -2781,17 +3071,20 @@ impl Tool for HttpFuzzTool {
             .any(|r| r.get("ok").and_then(Value::as_bool).unwrap_or(false));
         let structured = json!({
             "ok": any_ok,
+            "capped": capped,
             "url": raw_url,
             "param": param,
             "marker": marker,
+            "method": method,
+            "wordlist_total": wordlist_total,
+            "requests": requests,
             "results": results
         });
         Ok(ToolResult {
             ok: any_ok,
             output: truncate(&format!(
-                "fuzzed {} payload(s) against {}",
-                results.len(),
-                raw_url
+                "fuzzed {requests} payload(s) against {raw_url}{}",
+                if capped { " (capped)" } else { "" }
             )),
             structured: Some(structured),
         })
@@ -3668,6 +3961,129 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("external_commands"));
+    }
+
+    #[test]
+    fn canonical_report_contains_all_sections_and_f001() {
+        let input = ReportInput {
+            program: "Acme Bug Bounty".to_string(),
+            engagement: "Acme Spring 2026".to_string(),
+            scope_in: vec!["example.com".to_string()],
+            scope_out: vec!["admin.example.com".to_string()],
+            rules: vec!["Max 10 rps".to_string()],
+            findings: vec![ReportFinding {
+                id: "finding-1".to_string(),
+                title: "Reflected XSS".to_string(),
+                severity: "high".to_string(),
+                cvss: Some(7.4),
+                vector: Some("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N".to_string()),
+                cwe: Some("CWE-79".to_string()),
+                asset: Some("https://example.com/search".to_string()),
+                description: "Reflected input reaches the DOM.".to_string(),
+                reproduction: Some("1. Visit /search?q=<script>alert(1)</script>".to_string()),
+                impact: Some("Session theft".to_string()),
+                remediation: Some("Encode output".to_string()),
+                evidence_hash: Some("a".repeat(64)),
+                verified: true,
+            }],
+            coverage: vec![(
+                "https://example.com/search".to_string(),
+                "GET".to_string(),
+                String::new(),
+            )],
+            timeline: vec![(
+                "2026-11-19T00:00:00Z".to_string(),
+                "finding".to_string(),
+                "XSS confirmed".to_string(),
+            )],
+            report_id: "report-1".to_string(),
+        };
+        let markdown = render_canonical_report(&input);
+        for section in [
+            "# Acme Spring 2026 — Security Assessment Report",
+            "## Executive Summary",
+            "## Scope & ROE",
+            "## Methodology",
+            "## Findings",
+            "### F-001",
+            "CVSS",
+            "CWE-79",
+            "Steps to Reproduce",
+            "Proof of Concept",
+            "Impact",
+            "Remediation",
+            "Evidence SHA-256",
+            "## Coverage",
+            "## Timeline",
+            "## Appendices",
+        ] {
+            assert!(markdown.contains(section), "missing section: {section}");
+        }
+        assert!(markdown.contains(&"a".repeat(64)));
+        assert!(!markdown.contains("### F-1:"));
+    }
+
+    #[tokio::test]
+    async fn http_fuzz_caps_wordlist_requests_and_methods() {
+        let tool = HttpFuzzTool {
+            http: HttpRequestTool::new(),
+        };
+        let wordlist: Vec<String> = (0..1000).map(|i| format!("w{i}")).collect();
+        let result = tool
+            .run(json!({"url": "http://localhost/FUZZ", "wordlist": wordlist}))
+            .await
+            .unwrap();
+        let data = result.structured.unwrap();
+        assert_eq!(data["capped"], json!(true));
+        assert_eq!(data["wordlist_total"], json!(1000));
+        assert_eq!(data["requests"], json!(MAX_FUZZ_REQUESTS));
+        assert_eq!(data["results"].as_array().unwrap().len(), MAX_FUZZ_WORDLIST);
+
+        for method in ["PUT", "DELETE", "PATCH"] {
+            let err = tool
+                .run(json!({"url": "http://localhost/FUZZ", "wordlist": ["a"], "method": method}))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("not allowed"), "{err}");
+        }
+        for method in ["GET", "HEAD", "post"] {
+            assert!(
+                tool.run(
+                    json!({"url": "http://localhost/FUZZ", "wordlist": ["a"], "method": method})
+                )
+                .await
+                .is_ok(),
+                "{method} should be accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_command_tool_enforces_scope_before_spawn() {
+        let dir = std::env::temp_dir().join(format!("mbt-scope-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(windows)]
+        let (command, template) = (
+            "cmd",
+            vec!["/C".to_string(), "echo".to_string(), "{target}".to_string()],
+        );
+        #[cfg(not(windows))]
+        let (command, template) = ("echo", vec!["{target}".to_string()]);
+        let tool = ExternalCommandTool::new(
+            "scoped",
+            "scoped adapter",
+            command,
+            template,
+            "network",
+            &dir,
+        )
+        .with_scope(vec!["example.com".to_string()], Vec::new());
+
+        let denied = tool.run(json!({"target": "evil.org"})).await.unwrap_err();
+        assert!(denied.to_string().contains("scope policy"), "{denied}");
+        let allowed = tool.run(json!({"target": "example.com"})).await.unwrap();
+        assert!(allowed.ok);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn uuid_like() -> String {

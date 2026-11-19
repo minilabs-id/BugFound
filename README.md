@@ -41,7 +41,22 @@ execution, durable sessions, evidence capture, and redacted reports.
   event hash chain, PII redaction, and snapshot resume. External recon adapters
   are auto-detected, opt-in and gated; a pipeline tool chains their outputs.
 
-## CLI
+## Desktop (Windows)
+
+A native Windows desktop build is available. It uses the same core, store and
+tool runtime as the CLI; no browser or WebView2 is required.
+
+```bat
+start-desktop.bat
+```
+
+The window reads and writes `minibug.toml` in its working directory. Tabs:
+Sessions (messages/events/findings/assets/artifacts/coverage/report), New Run,
+Approvals (approve/deny with TTL shown), Config (all settings + scope), Tools
+(adapter availability) and Logs. Runs and approvals execute on a background
+worker thread, so the UI stays responsive.
+
+The CLI remains available for scripting and automation:
 
 ```sh
 minibug init --force                       # write minibug.toml

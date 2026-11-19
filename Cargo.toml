@@ -7,6 +7,7 @@ members = [
   "crates/minibug-policy",
   "crates/minibug-store",
   "crates/minibug-cli",
+  "crates/minibug-desktop",
 ]
 
 [workspace.package]
@@ -32,3 +33,5 @@ futures = "0.3"
 url = "2"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 sha2 = "0.10"
+eframe = "0.31"
+egui = "0.31"

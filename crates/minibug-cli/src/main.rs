@@ -2,10 +2,10 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use minibug_core::{AgentConfig, Runner};
 use minibug_llm::{Llm, LlmConfig};
-use minibug_policy::Mode;
+use minibug_policy::{parse_scope_brief, Mode};
 use minibug_store::{redact, Store};
-use minibug_tools::default_registry;
-use serde::Deserialize;
+use minibug_tools::{try_default_registry_with_options, ToolOptions};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -123,6 +123,34 @@ enum Commands {
         #[arg(long)]
         output: Option<String>,
     },
+    /// Show live session state, budgets, approvals and coverage
+    Status {
+        #[arg(long)]
+        session: String,
+    },
+    /// Validate configuration and local environment
+    Doctor,
+    /// List pending approvals with full details
+    Approvals {
+        #[arg(long)]
+        session: String,
+    },
+    /// Import an engagement brief into [scope]
+    ScopeImport {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        program: Option<String>,
+    },
+    /// Track testing hypotheses for a session
+    Hypothesis {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        add: Option<String>,
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -139,7 +167,7 @@ impl From<ModeArg> for Mode {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 struct FileConfig {
     #[serde(default)]
     llm: LlmFile,
@@ -149,6 +177,10 @@ struct FileConfig {
     storage: StorageFile,
     #[serde(default)]
     scope: minibug_policy::ScopeConfig,
+    #[serde(default)]
+    network: NetworkFile,
+    #[serde(default)]
+    external_tools: ExternalFile,
 }
 
 impl FileConfig {
@@ -209,7 +241,7 @@ impl FileConfig {
         Ok(())
     }
 }
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct LlmFile {
     #[serde(default = "d_base")]
     base_url: String,
@@ -236,7 +268,7 @@ fn d_base() -> String {
 fn d_timeout() -> u64 {
     60000
 }
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 struct AgentFile {
     #[serde(default)]
     mode: Option<String>,
@@ -252,8 +284,26 @@ struct AgentFile {
     max_network_calls: Option<usize>,
     #[serde(default)]
     requests_per_minute: Option<u64>,
+    #[serde(default)]
+    auto_approve_tools: Vec<String>,
 }
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+struct NetworkFile {
+    #[serde(default)]
+    allow_proxy: bool,
+    #[serde(default)]
+    proxy_url: Option<String>,
+    #[serde(default)]
+    trusted_local_targets: Vec<String>,
+}
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+struct ExternalFile {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    commands: std::collections::BTreeMap<String, String>,
+}
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct StorageFile {
     #[serde(default = "d_db")]
     path: String,
@@ -340,7 +390,14 @@ fn build_runner(cfg: &FileConfig, cwd: &str, mode: Mode, open_store: bool) -> Re
     // workspace up front so callers get a clean error instead of a panic.
     std::fs::canonicalize(cwd)
         .with_context(|| format!("invalid or inaccessible workspace cwd '{cwd}'"))?;
-    let tools = default_registry(cwd);
+    let options = ToolOptions {
+        allow_proxy: cfg.network.allow_proxy,
+        proxy_url: cfg.network.proxy_url.clone(),
+        trusted_local_targets: cfg.network.trusted_local_targets.clone(),
+        enable_external_tools: cfg.external_tools.enabled,
+        external_commands: cfg.external_tools.commands.clone(),
+    };
+    let tools = try_default_registry_with_options(cwd, options)?;
     let policy = minibug_core::build_policy_config(minibug_policy::PolicyConfig {
         mode,
         scope: cfg.scope.clone(),
@@ -358,6 +415,7 @@ fn build_runner(cfg: &FileConfig, cwd: &str, mode: Mode, open_store: bool) -> Re
         max_tool_calls: cfg.agent.max_tool_calls.unwrap_or(0),
         max_network_calls: cfg.agent.max_network_calls.unwrap_or(0),
         requests_per_minute: cfg.agent.requests_per_minute.unwrap_or(0),
+        auto_approve_tools: cfg.agent.auto_approve_tools.clone(),
         ..Default::default()
     };
     let store = if open_store {
@@ -368,6 +426,24 @@ fn build_runner(cfg: &FileConfig, cwd: &str, mode: Mode, open_store: bool) -> Re
     Ok((store, Arc::new(client), tools, policy, agent))
 }
 
+fn print_approval_summary(store: &Store, session: &str) {
+    match store.list_pending_approvals(session) {
+        Ok(approvals) => {
+            for approval in approvals {
+                println!(
+                    "pending approval: tool={} risk={} reason={} expires={} args={}",
+                    redact(&approval.tool_name),
+                    redact(&approval.risk),
+                    redact(approval.reason.as_deref().unwrap_or("-")),
+                    approval.expires_at.as_deref().unwrap_or("-"),
+                    redact(&approval.args_json)
+                );
+            }
+        }
+        Err(e) => eprintln!("warning: cannot list approvals: {e}"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -375,6 +451,7 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
     let cli = Cli::parse();
+    let config_path = cli.config.clone();
     let cfg = load_config(&cli.config)?;
     cfg.validate()?;
     match cli.command {
@@ -428,6 +505,7 @@ path = ".minibug/minibug.db"
             let mode = resolve_mode(mode, cfg.agent.mode.as_deref());
             let (store, client, tools, policy, agent) = build_runner(&cfg, &cwd, mode, true)?;
             let store = store.expect("store");
+            print_approval_summary(&store, &session);
             let runner = Runner::new(store, client, tools, policy, agent);
             let decision = if approve { "approve" } else { "deny" };
             match runner.resume_session(&session, decision).await {
@@ -441,7 +519,9 @@ path = ".minibug/minibug.db"
         Commands::Approve { session, cwd, mode } => {
             let mode = resolve_mode(mode, cfg.agent.mode.as_deref());
             let (store, client, tools, policy, agent) = build_runner(&cfg, &cwd, mode, true)?;
-            let runner = Runner::new(store.expect("store"), client, tools, policy, agent);
+            let store = store.expect("store");
+            print_approval_summary(&store, &session);
+            let runner = Runner::new(store, client, tools, policy, agent);
             match runner.resume_session(&session, "approve").await {
                 Ok(out) => println!("{}", out),
                 Err(e) => {
@@ -453,7 +533,9 @@ path = ".minibug/minibug.db"
         Commands::Deny { session, cwd, mode } => {
             let mode = resolve_mode(mode, cfg.agent.mode.as_deref());
             let (store, client, tools, policy, agent) = build_runner(&cfg, &cwd, mode, true)?;
-            let runner = Runner::new(store.expect("store"), client, tools, policy, agent);
+            let store = store.expect("store");
+            print_approval_summary(&store, &session);
+            let runner = Runner::new(store, client, tools, policy, agent);
             match runner.resume_session(&session, "deny").await {
                 Ok(out) => println!("{}", out),
                 Err(e) => {
@@ -564,6 +646,116 @@ path = ".minibug/minibug.db"
                 println!("report written");
             } else {
                 println!("{}", redact(&report));
+            }
+        }
+        Commands::Status { session } => {
+            let store = Store::open(&cfg.storage.path)?;
+            let session_row = store
+                .get_session(&session)?
+                .ok_or_else(|| anyhow!("session not found: {session}"))?;
+            let budget = store.budget_usage(&session)?;
+            let approvals = store.list_pending_approvals(&session)?;
+            let findings = store.list_findings(&session)?;
+            let coverage = store.coverage_count(&session)?;
+            let hypotheses = store.list_hypotheses(&session)?;
+            println!(
+                "session={} state={} model={}",
+                session_row.id,
+                session_row.state,
+                session_row.model.unwrap_or_else(|| "-".into())
+            );
+            println!(
+                "budget steps={}/{} tools={} network={} rpm_window={}",
+                budget.steps_used,
+                cfg.agent.max_steps.unwrap_or(20),
+                budget.tool_calls_used,
+                budget.network_calls_used,
+                budget.calls_in_window
+            );
+            println!(
+                "pending_approvals={} findings={} coverage={} hypotheses={}",
+                approvals.len(),
+                findings.len(),
+                coverage,
+                hypotheses.len()
+            );
+            for approval in approvals {
+                println!(
+                    "  pending: tool={} expires={}",
+                    redact(&approval.tool_name),
+                    approval.expires_at.as_deref().unwrap_or("-")
+                );
+            }
+            for hypothesis in hypotheses.iter().take(10) {
+                println!(
+                    "  hypothesis [{}] {}",
+                    redact(&hypothesis.status),
+                    redact(&hypothesis.statement)
+                );
+            }
+        }
+        Commands::Doctor => {
+            cfg.validate()?;
+            let store = Store::open(&cfg.storage.path)?;
+            println!("config: ok");
+            println!("database: ok ({})", cfg.storage.path);
+            match resolve_api_key(&cfg.llm.api_key) {
+                Ok(_) => println!("api_key: ok"),
+                Err(e) => println!("api_key: unavailable ({e})"),
+            }
+            println!(
+                "scope: in_scope={} out_of_scope={}",
+                cfg.scope.in_scope.len(),
+                cfg.scope.out_of_scope.len()
+            );
+            println!(
+                "proxy={} external_tools={}",
+                cfg.network.allow_proxy, cfg.external_tools.enabled
+            );
+            drop(store);
+        }
+        Commands::Approvals { session } => {
+            let store = Store::open(&cfg.storage.path)?;
+            let approvals = store.list_pending_approvals(&session)?;
+            if approvals.is_empty() {
+                println!("(no pending approvals)");
+            } else {
+                print_approval_summary(&store, &session);
+            }
+        }
+        Commands::ScopeImport { file, program } => {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("read scope brief {}", file.display()))?;
+            let mut scope = parse_scope_brief(&text);
+            if let Some(name) = program {
+                scope.engagement = Some(name);
+            }
+            let mut updated = cfg.clone();
+            updated.scope = scope;
+            let serialized = toml::to_string_pretty(&updated).context("serialize config")?;
+            std::fs::write(&config_path, serialized)
+                .with_context(|| format!("write config {}", config_path.display()))?;
+            println!(
+                "scope imported: in_scope={} out_of_scope={}",
+                updated.scope.in_scope.len(),
+                updated.scope.out_of_scope.len()
+            );
+        }
+        Commands::Hypothesis { session, add, list } => {
+            let store = Store::open(&cfg.storage.path)?;
+            if let Some(ref statement) = add {
+                let hypothesis = store.add_hypothesis(&session, statement)?;
+                println!("added hypothesis {}", hypothesis.id);
+            }
+            if list || add.is_none() {
+                for hypothesis in store.list_hypotheses(&session)? {
+                    println!(
+                        "[{}] {} {}",
+                        hypothesis.id,
+                        hypothesis.status,
+                        redact(&hypothesis.statement)
+                    );
+                }
             }
         }
     }

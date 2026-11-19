@@ -4,9 +4,10 @@ use minibug_policy::{ActionRequest, Decision, Mode, PolicyConfig, PolicyEngine};
 use minibug_store::{redact, Approval, Store};
 use minibug_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -47,6 +48,9 @@ pub struct AgentConfig {
     pub max_network_calls: usize,
     #[serde(default)]
     pub requests_per_minute: u64,
+    /// Safe/read-only tools that may be auto-approved without a human prompt.
+    #[serde(default)]
+    pub auto_approve_tools: Vec<String>,
 }
 fn default_max_steps() -> usize {
     20
@@ -65,6 +69,7 @@ impl Default for AgentConfig {
             max_tool_calls: 0,
             max_network_calls: 0,
             requests_per_minute: 0,
+            auto_approve_tools: Vec::new(),
         }
     }
 }
@@ -118,7 +123,11 @@ pub fn persist_bounty_tool_result(
         let impact = args.get("impact").and_then(|v| v.as_str());
         let remediation = args.get("remediation").and_then(|v| v.as_str());
         let evidence = args.get("evidence").and_then(|v| v.as_str());
-        if let Err(e) = store.add_finding(
+        let request = args.get("request").and_then(|v| v.as_str());
+        let response = args.get("response").and_then(|v| v.as_str());
+        let cvss = args.get("cvss").and_then(|v| v.as_str());
+        let cwe = args.get("cwe").and_then(|v| v.as_str());
+        match store.add_finding_with_evidence(
             session_id,
             title,
             severity,
@@ -129,8 +138,16 @@ pub fn persist_bounty_tool_result(
             impact,
             remediation,
             evidence,
+            request,
+            response,
+            cvss,
+            cwe,
         ) {
-            tracing::warn!(error=%e, session=%session_id, "failed to persist finding");
+            Ok(Some(_)) => tracing::info!(session=%session_id, title=%title, "finding persisted"),
+            Ok(None) => {
+                tracing::info!(session=%session_id, title=%title, "duplicate finding skipped")
+            }
+            Err(e) => tracing::warn!(error=%e, session=%session_id, "failed to persist finding"),
         }
     }
     if is_asset {
@@ -175,6 +192,8 @@ pub struct Runner {
     pub owner_id: String,
     /// Mirrors the durable per-session counter; the store remains the source of truth.
     pub tool_calls_used: std::sync::atomic::AtomicUsize,
+    /// Short-lived per-target cooldowns after 429/403 responses.
+    cooldowns: Mutex<HashMap<String, Instant>>,
 }
 
 impl Runner {
@@ -193,6 +212,7 @@ impl Runner {
             agent,
             owner_id: format!("runner-{}", Uuid::new_v4()),
             tool_calls_used: std::sync::atomic::AtomicUsize::new(0),
+            cooldowns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -344,10 +364,96 @@ impl Runner {
         }
     }
 
+    fn target_cooldown(&self, target: Option<&str>) -> Option<String> {
+        let target = target?;
+        let mut cooldowns = self.cooldowns.lock().unwrap();
+        cooldowns.retain(|_, at| at.elapsed() < Duration::from_secs(30));
+        if cooldowns.contains_key(target) {
+            Some(format!(
+                "RATE_LIMITED target={target} cooldown=30s (429/403)"
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn note_http_status(
+        &self,
+        session_id: &str,
+        target: Option<&str>,
+        result: &minibug_tools::ToolResult,
+    ) {
+        let Some(status) = result
+            .structured
+            .as_ref()
+            .and_then(|value| value.get("status"))
+            .and_then(|value| value.as_u64())
+        else {
+            return;
+        };
+        if status == 429 || status == 403 {
+            if let Some(target) = target {
+                self.cooldowns
+                    .lock()
+                    .unwrap()
+                    .insert(target.to_string(), Instant::now());
+                self.log_event(
+                    session_id,
+                    "warn",
+                    "target.cooldown",
+                    &format!("target={target} status={status} cooldown=30s"),
+                );
+            }
+        }
+    }
+
+    fn record_tool_coverage(
+        &self,
+        session_id: &str,
+        spec: &minibug_tools::ToolSpec,
+        args: &serde_json::Value,
+    ) {
+        if !Self::is_network_tool(spec) {
+            return;
+        }
+        let Some(target) = extract_policy_target(args) else {
+            return;
+        };
+        let method = args
+            .get("method")
+            .and_then(|value| value.as_str())
+            .unwrap_or("GET")
+            .to_string();
+        let path = args
+            .get("url")
+            .and_then(|value| value.as_str())
+            .and_then(|url| url::Url::parse(url).ok())
+            .map(|url| url.path().to_string())
+            .unwrap_or_default();
+        if let Err(e) = self
+            .store
+            .record_coverage(session_id, &target, &method, &path)
+        {
+            warn!(error=%e, session=%session_id, "failed to record coverage");
+        }
+    }
+
+    /// Once a target was explicitly trusted, switching to a new target needs
+    /// fresh approval even if the policy mode would otherwise allow it.
+    fn target_changed(&self, session_id: &str, target: Option<&str>) -> bool {
+        let Some(target) = target else {
+            return false;
+        };
+        match self.store.list_approved_targets(session_id) {
+            Ok(approved) => !approved.is_empty() && !approved.iter().any(|item| item == target),
+            Err(_) => false,
+        }
+    }
+
     /// Guarded state transition used by the recovery-aware runner.
     fn transition(&self, session_id: &str, state: &str, level: &str, kind: &str, message: &str) {
         let from: &[&str] = match state {
-            "running" => &["idle", "waiting_approval"],
+            "running" => &["idle", "waiting_approval", "interrupted"],
             "waiting_approval" => &["running"],
             _ => &["running", "waiting_approval"],
         };
@@ -372,10 +478,11 @@ impl Runner {
 
     /// Terminal state transition, guarded and followed by lease release.
     fn finish(&self, session_id: &str, state: &str, level: &str, kind: &str, message: &str) {
-        match self
-            .store
-            .transition_state(session_id, &["running", "waiting_approval"], state)
-        {
+        match self.store.transition_state(
+            session_id,
+            &["running", "waiting_approval", "interrupted"],
+            state,
+        ) {
             Ok(true) => self.release_claim(session_id),
             Ok(false) => warn!(session=%session_id, state=%state, "terminal transition refused"),
             Err(e) => warn!(error=%e, session=%session_id, "terminal transition failed"),
@@ -528,9 +635,13 @@ impl Runner {
                 ))
             }
             "interrupted" => {
-                return Err(anyhow!(
-                    "session {session_id} is interrupted (stale/crashed); it cannot be auto-resumed safely without an in-flight snapshot — start a new run"
-                ));
+                // Durable messages/events/model are the snapshot: resume the
+                // loop from the last persisted turn instead of discarding work.
+                if self.store.list_messages(session_id)?.is_empty() {
+                    return Err(anyhow!(
+                        "session {session_id} has no durable snapshot and cannot be resumed"
+                    ));
+                }
             }
             "blocked" => {
                 return Err(anyhow!(
@@ -544,10 +655,10 @@ impl Runner {
             }
         }
 
-        let approval = self
-            .store
-            .get_pending_approval(session_id)?
-            .ok_or_else(|| anyhow!("no pending approval for session {session_id}"))?;
+        let approval = self.store.get_pending_approval(session_id)?;
+        if session.state == "waiting_approval" && approval.is_none() {
+            return Err(anyhow!("no pending approval for session {session_id}"));
+        }
         let model = session
             .model
             .clone()
@@ -571,9 +682,21 @@ impl Runner {
             "resuming session",
         );
 
-        let outcome = self
-            .resume_after_approval(session_id, &model, &approval, decision)
-            .await;
+        let outcome = match approval {
+            Some(approval) => {
+                self.resume_after_approval(session_id, &model, &approval, decision)
+                    .await
+            }
+            None => {
+                self.log_event(
+                    session_id,
+                    "info",
+                    "session.resumed_snapshot",
+                    "resuming interrupted session from durable history",
+                );
+                self.run_loop(session_id, &model).await
+            }
+        };
 
         match outcome {
             Ok(out) => Ok(out),
@@ -830,6 +953,9 @@ impl Runner {
                 match tool.run(args.clone()).await {
                     Ok(result) => {
                         self.record_call(session_id, &spec);
+                        if let Some(target) = extract_policy_target(&args) {
+                            let _ = self.store.record_approved_target(session_id, &target);
+                        }
                         self.persist_bounty_tool_result(session_id, &spec.name, &args, &result);
                         self.store.add_message_full(
                             session_id,
@@ -996,11 +1122,39 @@ impl Runner {
                         continue;
                     };
                     let spec = tool.spec();
+                    let target = extract_policy_target(&tc.arguments);
                     let (decision, reason) = self.policy.evaluate(&ActionRequest {
                         tool: spec.name.clone(),
                         risk: spec.risk.clone(),
-                        target: extract_policy_target(&tc.arguments),
+                        target: target.clone(),
                     });
+                    let (decision, reason) = if decision == Decision::Allow
+                        && self.target_changed(session_id, target.as_deref())
+                    {
+                        (
+                            Decision::Ask,
+                            "target differs from previously approved targets".to_string(),
+                        )
+                    } else if decision == Decision::Ask
+                        && self
+                            .agent
+                            .auto_approve_tools
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case(&spec.name))
+                    {
+                        self.log_event(
+                            session_id,
+                            "info",
+                            "approval.auto",
+                            &format!(
+                                "tool={} risk={} rule=auto_approve_tools",
+                                spec.name, spec.risk
+                            ),
+                        );
+                        (Decision::Allow, "auto-approved safe tool".to_string())
+                    } else {
+                        (decision, reason)
+                    };
                     match decision {
                         Decision::Allow => {
                             self.log_event(
@@ -1009,6 +1163,23 @@ impl Runner {
                                 "tool.allowed",
                                 &format!("tool={} risk={} reason={}", spec.name, spec.risk, reason),
                             );
+                            if let Some(cooldown) = self.target_cooldown(target.as_deref()) {
+                                self.store.add_message_full(
+                                    session_id,
+                                    "tool",
+                                    &format!("ok=false error={cooldown}"),
+                                    Some(&tc.id),
+                                    None,
+                                    Some(&spec.name),
+                                )?;
+                                self.log_event(
+                                    session_id,
+                                    "warn",
+                                    "target.cooldown_hit",
+                                    &cooldown,
+                                );
+                                continue;
+                            }
                             if let Some(gate) = self.budget_gate(session_id, &spec) {
                                 self.store.add_message_full(
                                     session_id,
@@ -1025,6 +1196,12 @@ impl Runner {
                             match result {
                                 Ok(r) => {
                                     self.record_call(session_id, &spec);
+                                    self.record_tool_coverage(session_id, &spec, &tc.arguments);
+                                    self.note_http_status(session_id, target.as_deref(), &r);
+                                    if let Some(target) = target.as_deref() {
+                                        let _ =
+                                            self.store.record_approved_target(session_id, target);
+                                    }
                                     self.persist_bounty_tool_result(
                                         session_id,
                                         &spec.name,

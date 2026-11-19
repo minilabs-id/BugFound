@@ -162,6 +162,56 @@ impl ScopeConfig {
     }
 }
 
+/// Parse a human-authored program brief into a ScopeConfig.
+/// Section headings switch between in-scope and out-of-scope patterns;
+/// lines beginning with `-` or `*` are treated as patterns.
+pub fn parse_scope_brief(text: &str) -> ScopeConfig {
+    let mut scope = ScopeConfig::default();
+    let mut out_section = false;
+    let mut notes = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("out of scope") || lower.contains("out-of-scope") {
+            out_section = true;
+            continue;
+        }
+        if lower.contains("in scope") || lower.contains("in-scope") {
+            out_section = false;
+            continue;
+        }
+        if let Some(value) = line
+            .strip_prefix("Program:")
+            .or_else(|| line.strip_prefix("Engagement:"))
+        {
+            scope.engagement = Some(value.trim().to_string());
+            continue;
+        }
+        if let Some(pattern) = line
+            .strip_prefix('-')
+            .or_else(|| line.strip_prefix('*'))
+            .map(str::trim)
+        {
+            if !pattern.is_empty() {
+                if out_section {
+                    scope.out_of_scope.push(pattern.to_string());
+                } else {
+                    scope.in_scope.push(pattern.to_string());
+                }
+            }
+            continue;
+        }
+        notes.push(line.to_string());
+    }
+    if !notes.is_empty() {
+        scope.notes = Some(notes.join(" | "));
+    }
+    scope
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyConfig {
     #[serde(default)]
@@ -497,6 +547,16 @@ mod tests {
             target: Some("https://api.example.com/v1".into()),
         });
         assert_eq!(d, Decision::Allow);
+    }
+
+    #[test]
+    fn scope_brief_parser_handles_sections() {
+        let brief = "Program: Acme Corp\nIn scope:\n- *.acme.com\n- 10.0.0.0/8\nOut of scope:\n- admin.acme.com\nContact: security@acme.com";
+        let scope = parse_scope_brief(brief);
+        assert_eq!(scope.engagement.as_deref(), Some("Acme Corp"));
+        assert_eq!(scope.in_scope, vec!["*.acme.com", "10.0.0.0/8"]);
+        assert_eq!(scope.out_of_scope, vec!["admin.acme.com"]);
+        assert!(scope.notes.unwrap().contains("security@acme.com"));
     }
 
     #[test]

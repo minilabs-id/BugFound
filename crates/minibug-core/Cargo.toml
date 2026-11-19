@@ -12,6 +12,7 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 async-trait.workspace = true
+url.workspace = true
 minibug-llm = { path = "../minibug-llm" }
 minibug-tools = { path = "../minibug-tools" }
 minibug-policy = { path = "../minibug-policy" }

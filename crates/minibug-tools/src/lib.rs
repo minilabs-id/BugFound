@@ -33,6 +33,17 @@ pub struct ToolResult {
     pub structured: Option<Value>,
 }
 
+/// Operator-supplied policy for tool construction. Defaults keep the runner
+/// locked down (no proxy, no trusted local targets, no external tools).
+#[derive(Clone, Default)]
+pub struct ToolOptions {
+    pub allow_proxy: bool,
+    pub proxy_url: Option<String>,
+    pub trusted_local_targets: Vec<String>,
+    pub enable_external_tools: bool,
+    pub external_commands: BTreeMap<String, String>,
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
@@ -191,6 +202,94 @@ fn validate_host_string(host: &str) -> Result<()> {
     Ok(())
 }
 
+fn normalize_host(host: &str) -> String {
+    host.trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn ipv4_in_cidr(ip: Ipv4Addr, cidr: &str) -> bool {
+    let Some((base, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(base) = base.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u32>() else {
+        return false;
+    };
+    if prefix > 32 {
+        return false;
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    u32::from(ip) & mask == u32::from(base) & mask
+}
+
+/// A trusted entry is an exact host, a `*.suffix` wildcard, an IPv4 address,
+/// an IPv4 CIDR block, or a simple dotted IPv4 prefix (e.g. `192.168.1.`).
+fn trusted_entry_matches(entry: &str, host: &str) -> bool {
+    let trimmed = entry.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let entry = trimmed.trim_end_matches('.');
+    if let Some(suffix) = entry.strip_prefix("*.") {
+        return !suffix.is_empty() && host != suffix && host.ends_with(&format!(".{suffix}"));
+    }
+    if entry.contains('/') {
+        return host
+            .parse::<Ipv4Addr>()
+            .map(|ip| ipv4_in_cidr(ip, entry))
+            .unwrap_or(false);
+    }
+    if let Ok(entry_ip) = entry.parse::<Ipv4Addr>() {
+        return host
+            .parse::<Ipv4Addr>()
+            .map(|ip| ip == entry_ip)
+            .unwrap_or(false);
+    }
+    // A trailing dot is meaningful for a dotted IPv4 prefix, so inspect the
+    // untrimmed form here.
+    if trimmed.ends_with('.') && trimmed.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return host.starts_with(&trimmed);
+    }
+    entry == host
+}
+
+fn host_is_trusted(host: &str, trusted: &[String]) -> bool {
+    let host = normalize_host(host);
+    trusted
+        .iter()
+        .any(|entry| trusted_entry_matches(entry, &host))
+}
+
+/// Consult the explicit allowlist first; only then apply the default blocks.
+/// Local/metadata targets stay blocked unless an operator listed them.
+fn validate_host_with_options(host: &str, options: &ToolOptions) -> Result<()> {
+    if host_is_trusted(host, &options.trusted_local_targets) {
+        return Ok(());
+    }
+    validate_host_string(host)
+}
+
+/// Resolve a trusted host without the public-address restriction. Only used
+/// for hosts the operator explicitly marked as trusted local targets.
+async fn resolve_trusted_host(host: &str) -> Result<std::net::SocketAddr> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 0))
+        .await
+        .with_context(|| format!("resolve trusted host {host}"))?
+        .collect();
+    addrs
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("trusted host resolved to no addresses: {host}"))
+}
+
 /// Resolve every address before connecting and pin the request to a validated IP.
 /// This closes the DNS-rebinding/TOCTOU gap between validation and connection.
 async fn resolve_public_ip(host: &str) -> Result<std::net::SocketAddr> {
@@ -316,6 +415,30 @@ impl Tool for FsReadTool {
     }
 }
 
+/// Pass only what a child process needs to start; never inherit secrets such
+/// as DATABASE_URL or program API tokens.
+fn safe_process_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os()
+        .filter(|(k, _)| {
+            let key = k.to_string_lossy().to_ascii_uppercase();
+            [
+                "PATH",
+                "PATHEXT",
+                "SYSTEMROOT",
+                "COMSPEC",
+                "TEMP",
+                "TMP",
+                "HOME",
+                "USERPROFILE",
+                "LANG",
+                "LC_ALL",
+            ]
+            .iter()
+            .any(|allowed| *allowed == key)
+        })
+        .collect()
+}
+
 pub struct ShellExecTool {
     cwd: PathBuf,
 }
@@ -350,27 +473,7 @@ impl Tool for ShellExecTool {
         // permitted. Chaining/substitution is rejected so a prompt-injected
         // command cannot smuggle a second program past the allowlist.
         validate_shell_command(&cmd)?;
-        // Pass only what a shell/process needs to start; never inherit secrets
-        // such as DATABASE_URL or program API tokens.
-        let env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
-            .filter(|(k, _)| {
-                let key = k.to_string_lossy().to_ascii_uppercase();
-                [
-                    "PATH",
-                    "PATHEXT",
-                    "SYSTEMROOT",
-                    "COMSPEC",
-                    "TEMP",
-                    "TMP",
-                    "HOME",
-                    "USERPROFILE",
-                    "LANG",
-                    "LC_ALL",
-                ]
-                .iter()
-                .any(|allowed| *allowed == key)
-            })
-            .collect();
+        let env = safe_process_env();
         #[cfg(windows)]
         let mut c = {
             let mut c = Command::new("cmd");
@@ -408,26 +511,56 @@ impl Tool for ShellExecTool {
 
 pub struct HttpRequestTool {
     client: reqwest::Client,
+    options: ToolOptions,
 }
 impl Default for HttpRequestTool {
     fn default() -> Self {
         Self::new()
     }
 }
-impl HttpRequestTool {
-    pub fn new() -> Self {
-        let client = reqwest::Client::builder()
+
+/// Proxy is opt-in. Without a usable configured proxy we disable all proxies
+/// so a system proxy cannot resolve the hostname and bypass our DNS pin.
+fn apply_proxy(builder: reqwest::ClientBuilder, options: &ToolOptions) -> reqwest::ClientBuilder {
+    if options.allow_proxy {
+        if let Some(url) = options.proxy_url.as_deref() {
+            if let Ok(proxy) = reqwest::Proxy::all(url) {
+                return builder.proxy(proxy);
+            }
+        }
+    }
+    builder.no_proxy()
+}
+
+fn build_http_client(options: &ToolOptions) -> reqwest::Client {
+    let builder = apply_proxy(
+        reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             // Redirects are disabled: following one could land on an internal
             // address that passed validation only for the original target.
             .redirect(reqwest::redirect::Policy::none())
-            // A system proxy would resolve the hostname itself and bypass our
-            // validated DNS pin; egress must go directly to the pinned IP.
+            .user_agent("minibug/0.1"),
+        options,
+    );
+    builder.build().unwrap_or_else(|_| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .user_agent("minibug/0.1")
             .build()
-            .expect("http client");
-        Self { client }
+            .expect("http client")
+    })
+}
+
+impl HttpRequestTool {
+    pub fn new() -> Self {
+        Self::with_options(ToolOptions::default())
+    }
+
+    pub fn with_options(options: ToolOptions) -> Self {
+        let client = build_http_client(&options);
+        Self { client, options }
     }
 }
 #[async_trait]
@@ -463,23 +596,27 @@ impl Tool for HttpRequestTool {
         let host = parsed
             .host_str()
             .ok_or_else(|| anyhow!("url has no host"))?;
-        validate_host_string(host)?;
+        validate_host_with_options(host, &self.options)?;
         let pinned_ip = if host.parse::<IpAddr>().is_ok() {
             None
+        } else if host_is_trusted(host, &self.options.trusted_local_targets) {
+            Some(resolve_trusted_host(host).await?)
         } else {
             Some(resolve_public_ip(host).await?)
         };
         // Pin the connection to the IP we validated; the TLS SNI and Host header
         // still use the original hostname.
         let client = if let Some(ip) = pinned_ip {
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::none())
-                .no_proxy()
-                .user_agent("minibug/0.1")
-                .resolve(host, ip)
-                .build()
-                .context("build pinned http client")?
+            apply_proxy(
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .user_agent("minibug/0.1")
+                    .resolve(host, ip),
+                &self.options,
+            )
+            .build()
+            .context("build pinned http client")?
         } else {
             self.client.clone()
         };
@@ -698,7 +835,11 @@ impl Tool for SaveFindingTool {
                     "reproduction":{"type":"string"},
                     "impact":{"type":"string"},
                     "remediation":{"type":"string"},
-                    "evidence":{"type":"string"}
+                    "evidence":{"type":"string"},
+                    "request":{"type":"string"},
+                    "response":{"type":"string"},
+                    "cvss":{"type":"string"},
+                    "cwe":{"type":"string"}
                 },
                 "required":["title","severity","description"]
             }),
@@ -834,14 +975,154 @@ impl Tool for EchoTool {
     }
 }
 
+const MAX_EXTERNAL_LINES: usize = 200;
+
+/// Single-pass placeholder substitution. Values are never re-scanned, so an
+/// untrusted input cannot inject another placeholder through its value.
+fn substitute_placeholder(arg: &str, input: &Value) -> String {
+    let mut out = String::with_capacity(arg.len());
+    let mut rest = arg;
+    while let Some(pos) = rest.find('{') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        let Some(end) = after.find('}') else {
+            out.push('{');
+            rest = after;
+            continue;
+        };
+        let key = &after[..end];
+        if ["target", "host", "url", "word"].contains(&key) {
+            out.push_str(input.get(key).and_then(|v| v.as_str()).unwrap_or(""));
+            rest = &after[end + 1..];
+            continue;
+        }
+        out.push('{');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Build the exact argv for an external adapter from its template and input.
+/// Kept public so the substitution can be tested without spawning a process.
+pub fn build_external_args(template: &[String], input: &Value) -> Vec<String> {
+    template
+        .iter()
+        .map(|arg| substitute_placeholder(arg, input))
+        .collect()
+}
+
+/// A pre-approved external recon adapter. Arguments are passed as a discrete
+/// argv vector, never interpolated into a shell command string.
+pub struct ExternalCommandTool {
+    pub name: String,
+    pub description: String,
+    pub command: String,
+    pub arg_template: Vec<String>,
+    pub risk: String,
+    cwd: PathBuf,
+}
+
+impl ExternalCommandTool {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        command: impl Into<String>,
+        arg_template: Vec<String>,
+        risk: impl Into<String>,
+        cwd: impl AsRef<Path>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            command: command.into(),
+            arg_template,
+            risk: risk.into(),
+            cwd: cwd.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn with_cwd(mut self, cwd: impl AsRef<Path>) -> Self {
+        self.cwd = cwd.as_ref().to_path_buf();
+        self
+    }
+}
+
+#[async_trait]
+impl Tool for ExternalCommandTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "target":{"type":"string"},
+                    "host":{"type":"string"},
+                    "url":{"type":"string"},
+                    "word":{"type":"string"}
+                },
+                "required":[]
+            }),
+            risk: self.risk.clone(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let args = build_external_args(&self.arg_template, &input);
+        let cwd = resolve_cwd(&self.cwd).unwrap_or_else(|_| self.cwd.clone());
+        let mut cmd = std::process::Command::new(&self.command);
+        cmd.args(&args)
+            .current_dir(cwd)
+            .env_clear()
+            .envs(safe_process_env())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = tokio::task::spawn_blocking(move || cmd.output());
+        let out = timeout(Duration::from_secs(60), child)
+            .await
+            .context("external command timeout (60s)")?
+            .context("external command task failed")?
+            .context("spawn external command")?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<String> = stdout
+            .lines()
+            .take(MAX_EXTERNAL_LINES)
+            .map(truncate)
+            .collect();
+        let text = format!(
+            "exit={}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            out.status.code().unwrap_or(-1),
+            stdout,
+            stderr
+        );
+        Ok(ToolResult {
+            ok: out.status.success(),
+            output: truncate(&text),
+            structured: Some(json!({"lines": lines})),
+        })
+    }
+}
+
 /// Non-panicking registry constructor for untrusted CLI input.
 pub fn try_default_registry(cwd: impl AsRef<Path>) -> Result<ToolRegistry> {
+    try_default_registry_with_options(cwd, ToolOptions::default())
+}
+
+/// Registry constructor with explicit tool policy. External recon adapters are
+/// only present when `enable_external_tools` is set, and `dnsx` then belongs to
+/// the adapter rather than the built-in DNS alias.
+pub fn try_default_registry_with_options(
+    cwd: impl AsRef<Path>,
+    options: ToolOptions,
+) -> Result<ToolRegistry> {
     let cwd = cwd.as_ref();
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(FsReadTool::new(cwd)?));
     reg.register(Arc::new(FsWriteTool::new(cwd)?));
     reg.register(Arc::new(ShellExecTool::new(cwd)?));
-    reg.register(Arc::new(HttpRequestTool::new()));
+    reg.register(Arc::new(HttpRequestTool::with_options(options.clone())));
     reg.register(Arc::new(DnsLookupTool::new()));
     reg.register(Arc::new(SaveFindingTool));
     reg.register(Arc::new(RecordAssetTool));
@@ -858,14 +1139,94 @@ pub fn try_default_registry(cwd: impl AsRef<Path>) -> Result<ToolRegistry> {
     reg.register_alias("write", fs_write);
     reg.register_alias("dns", dns.clone());
     reg.register_alias("dns_lookup", dns.clone());
-    reg.register_alias("dns_resolve", dns.clone());
-    reg.register_alias("dnsx", dns);
+    reg.register_alias("dns_resolve", dns);
+    if options.enable_external_tools {
+        register_external_adapters(&mut reg, cwd, &options);
+    }
     Ok(reg)
+}
+
+fn register_external_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &ToolOptions) {
+    let adapters = [
+        (
+            "subfinder",
+            "Discover subdomains for a target with subfinder.",
+            "subfinder",
+            vec![
+                "-d".to_string(),
+                "{target}".to_string(),
+                "-silent".to_string(),
+            ],
+            "network",
+        ),
+        (
+            "dnsx",
+            "Resolve hosts with dnsx.",
+            "dnsx",
+            vec![
+                "-d".to_string(),
+                "{host}".to_string(),
+                "-silent".to_string(),
+            ],
+            "network",
+        ),
+        (
+            "katana",
+            "Crawl URLs with katana.",
+            "katana",
+            vec!["-u".to_string(), "{url}".to_string(), "-silent".to_string()],
+            "network",
+        ),
+        (
+            "ffuf",
+            "Fuzz URLs with ffuf.",
+            "ffuf",
+            vec![
+                "-u".to_string(),
+                "{url}".to_string(),
+                "-w".to_string(),
+                "{word}".to_string(),
+                "-silent".to_string(),
+            ],
+            "network",
+        ),
+    ];
+    for (name, description, command, arg_template, risk) in adapters {
+        reg.register(Arc::new(ExternalCommandTool::new(
+            name,
+            description,
+            command,
+            arg_template,
+            risk,
+            cwd,
+        )));
+    }
+    for name in ["nuclei", "nmap"] {
+        let Some(command) = options.external_commands.get(name) else {
+            continue;
+        };
+        let parts: Vec<String> = command.split_whitespace().map(String::from).collect();
+        let Some((program, args)) = parts.split_first() else {
+            continue;
+        };
+        reg.register(Arc::new(ExternalCommandTool::new(
+            name,
+            format!("Gated external tool: {name}."),
+            program.clone(),
+            args.to_vec(),
+            "network",
+            cwd,
+        )));
+    }
 }
 
 /// Compatibility wrapper. Prefer [`try_default_registry`] for user-supplied paths.
 pub fn default_registry(cwd: impl AsRef<Path>) -> ToolRegistry {
-    try_default_registry(cwd).expect("invalid workspace cwd")
+    default_registry_with_options(cwd, ToolOptions::default())
+}
+
+pub fn default_registry_with_options(cwd: impl AsRef<Path>, options: ToolOptions) -> ToolRegistry {
+    try_default_registry_with_options(cwd, options).expect("invalid workspace cwd")
 }
 
 #[cfg(test)]
@@ -1010,6 +1371,125 @@ mod tests {
         let registry = default_registry(&dir);
         assert!(registry.get("echo").is_some());
         assert!(try_default_registry("definitely/not/a/real/path").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proxy_options_do_not_panic() {
+        let options = ToolOptions {
+            allow_proxy: true,
+            proxy_url: Some("http://127.0.0.1:3128".to_string()),
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+        assert_eq!(tool.spec().name, "http_request");
+        // An invalid proxy must also fail closed instead of panicking.
+        let bad = ToolOptions {
+            proxy_url: Some("not a url".to_string()),
+            ..ToolOptions::default()
+        };
+        let _ = HttpRequestTool::with_options(bad);
+    }
+
+    #[test]
+    fn trusted_local_targets_are_explicit() {
+        // Default policy blocks loopback and metadata.
+        assert!(validate_host_string("127.0.0.1").is_err());
+        assert!(validate_host_string("169.254.169.254").is_err());
+        assert!(validate_host_string("localhost").is_err());
+        assert!(validate_host_string_with_default_options("localhost").is_err());
+
+        // Only an explicit entry lets a local host through.
+        let exact = vec!["127.0.0.1".to_string()];
+        assert!(host_is_trusted("127.0.0.1", &exact));
+        let options = ToolOptions {
+            trusted_local_targets: exact.clone(),
+            ..ToolOptions::default()
+        };
+        assert!(validate_host_with_options("127.0.0.1", &options).is_ok());
+        assert!(validate_host_with_options("10.0.0.5", &options).is_err());
+
+        let wildcard = vec!["*.lab.local".to_string()];
+        assert!(host_is_trusted("api.lab.local", &wildcard));
+        assert!(host_is_trusted("deep.api.lab.local", &wildcard));
+        assert!(!host_is_trusted("lab.local", &wildcard));
+        assert!(!host_is_trusted("api.example.com", &wildcard));
+
+        let cidr = vec!["10.0.0.0/8".to_string()];
+        assert!(host_is_trusted("10.1.2.3", &cidr));
+        assert!(host_is_trusted("10.0.0.1", &cidr));
+        assert!(!host_is_trusted("11.0.0.1", &cidr));
+
+        let prefix = vec!["192.168.1.".to_string()];
+        assert!(host_is_trusted("192.168.1.42", &prefix));
+        assert!(!host_is_trusted("192.168.2.42", &prefix));
+    }
+
+    fn validate_host_string_with_default_options(host: &str) -> Result<()> {
+        validate_host_with_options(host, &ToolOptions::default())
+    }
+
+    #[test]
+    fn build_external_args_substitutes_placeholders() {
+        let template: Vec<String> = [
+            "-d", "{target}", "--host", "{host}", "-u", "{url}", "-w", "{word}",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let input = json!({
+            "target": "example.com",
+            "host": "ns1.example.com",
+            "url": "https://example.com/a",
+            "word": "paths.txt"
+        });
+        assert_eq!(
+            build_external_args(&template, &input),
+            vec![
+                "-d",
+                "example.com",
+                "--host",
+                "ns1.example.com",
+                "-u",
+                "https://example.com/a",
+                "-w",
+                "paths.txt"
+            ]
+        );
+        // Missing values become empty strings and values are not re-scanned.
+        let missing = build_external_args(&["{target}".to_string()], &json!({}));
+        assert_eq!(missing, vec![""]);
+        let chained = build_external_args(
+            &["{target}".to_string()],
+            &json!({"target": "{host}", "host": "evil"}),
+        );
+        assert_eq!(chained, vec!["{host}"]);
+    }
+
+    #[test]
+    fn external_adapters_are_opt_in() {
+        let dir = std::env::temp_dir().join(format!("mbt-ext-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = try_default_registry(&dir).unwrap();
+        assert!(plain.get("dns").is_some());
+        assert!(plain.get("dns_resolve").is_some());
+        assert!(plain.get("dnsx").is_none());
+        assert!(plain.get("subfinder").is_none());
+
+        let mut options = ToolOptions {
+            enable_external_tools: true,
+            ..ToolOptions::default()
+        };
+        options
+            .external_commands
+            .insert("nuclei".into(), "nuclei -u {url}".into());
+        let reg = try_default_registry_with_options(&dir, options).unwrap();
+        for name in ["subfinder", "dnsx", "katana", "ffuf", "nuclei"] {
+            assert!(reg.get(name).is_some(), "missing {name}");
+        }
+        assert!(reg.get("nmap").is_none());
+        let dnsx = reg.get("dnsx").unwrap().spec();
+        assert_eq!(dnsx.name, "dnsx");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

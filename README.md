@@ -30,9 +30,14 @@ execution, durable sessions, evidence capture, and redacted reports.
 - **Reporting**: `store.export_report()` produces a Markdown report with
   findings, assets, artifacts and a timeline; JSON/header/bearer secrets are
   redacted at every report and CLI output boundary.
-- **Concurrency safety**: approvals resolve once (`status='pending'` guard),
-  session claims use atomic conditional updates, and runner transitions are
-  guarded by owner/lease.
+- **Concurrency safety**: approvals resolve once (`status='pending'` guard) and
+  expire after 15 minutes, session claims use atomic conditional updates, and
+  runner transitions are guarded by owner/lease.
+- **Operator workflow**: proxy mode (opt-in, for Burp/ZAP), lab mode for trusted
+  local targets, auto-approve rules for safe tools, per-target cooldown after
+  429/403, coverage ledger + hypothesis tracking, deduped findings with
+  request/response evidence, CVSS/CWE fields, and snapshot resume for
+  interrupted sessions. External recon adapters are opt-in and gated.
 
 ## CLI
 
@@ -46,6 +51,11 @@ minibug assets --session <id>
 minibug artifacts --session <id>
 minibug report --session <id> --output report.md
 minibug logs --session <id>
+minibug status --session <id>          # state, budget, coverage, hypotheses
+minibug approvals --session <id>       # pending approvals + expiry
+minibug doctor                         # validate config/env
+minibug scope-import --file brief.txt --program "Acme"
+minibug hypothesis --session <id> --add "IDOR on /api/users"
 ```
 
 Configuration example: `config/minibug.example.toml`. Set `scope.in_scope` for

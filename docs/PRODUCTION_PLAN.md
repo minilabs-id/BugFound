@@ -30,6 +30,17 @@ Phase 0–2 dan sebagian Phase 3 sudah dieksekusi. Ringkasan perubahan:
 | F-17 tool output framing | done | `<untrusted_tool_output>` + redaction |
 | F-18 tests | partial | tes baru untuk mayoritas finding; soak/E2E belum |
 | P4-1 context compaction | done | `build_llm_messages` ringkas history >32KB, jaga tool_call/tool result tetap valid; 2 tes unit |
+| Kritik #1 shell terlalu sempit | done | External recon adapters opt-in (`subfinder/dnsx/katana/ffuf`, gated `nuclei/nmap`) via `ToolOptions` |
+| Kritik #2 proxy diblokir | done | `ToolOptions.allow_proxy/proxy_url` + `HttpRequestTool::with_options`; default tetap no-proxy |
+| Kritik #3 lab mode | done | `trusted_local_targets` (host/wildcard/CIDR) di tools |
+| Kritik #4 scope brief | done | `parse_scope_brief` + CLI `scope-import` |
+| Kritik #5 coverage/hypothesis | done | tabel `coverage`, `hypotheses`; CLI `status`, `hypothesis` |
+| Kritik #6 finding evidence | done | `add_finding_with_evidence`, dedupe, request/response/CVSS/CWE, hash |
+| Kritik #7 approval UX | done | TTL 15m, `approvals`, auto-approve tools, ringkasan di resume |
+| Kritik #8 backoff | done | cooldown 30s setelah 429/403 per target |
+| Kritik #9 target change | done | `approved_targets` + paksa approval saat target berubah |
+| Kritik #10 observability | done | `status`, `doctor`, `approvals` |
+| Kritik #11 crash resume | done | resume dari durable snapshot; tes `stale_running_session_is_recovered...` |
 | P0 release hygiene | done* | Git repo di branch `dev`, commit `ae9049c`, tag `v0.1.0-mvp`, `Cargo.lock` di-commit, CI+Dockerfile+deny.toml+runbook; `cargo deny check` dijalankan di CI (binary tidak terpasang lokal) |
 
 Verifikasi terakhir: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,

@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -44,6 +46,8 @@ pub struct Approval {
     pub created_at: String,
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +76,37 @@ pub struct Finding {
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub request: Option<String>,
+    #[serde(default)]
+    pub response: Option<String>,
+    #[serde(default)]
+    pub cvss: Option<String>,
+    #[serde(default)]
+    pub cwe: Option<String>,
+    #[serde(default)]
+    pub dedupe_key: Option<String>,
+    #[serde(default)]
+    pub evidence_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Coverage {
+    pub id: String,
+    pub session_id: String,
+    pub target: String,
+    pub method: String,
+    pub path: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Hypothesis {
+    pub id: String,
+    pub session_id: String,
+    pub statement: String,
+    pub status: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,7 +183,7 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS approvals(
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL, reason TEXT,
-               tool_name TEXT, args_json TEXT, risk TEXT, created_at TEXT, tool_call_id TEXT
+               tool_name TEXT, args_json TEXT, risk TEXT, created_at TEXT, tool_call_id TEXT, expires_at TEXT
              );
              CREATE TABLE IF NOT EXISTS events(
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, level TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL
@@ -156,7 +191,8 @@ impl Store {
              CREATE TABLE IF NOT EXISTS findings(
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, title TEXT NOT NULL, severity TEXT NOT NULL,
                asset TEXT, vuln_type TEXT, description TEXT NOT NULL, reproduction TEXT, impact TEXT,
-               remediation TEXT, evidence TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+               remediation TEXT, evidence TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+               request TEXT, response TEXT, cvss TEXT, cwe TEXT, dedupe_key TEXT, evidence_hash TEXT
              );
              CREATE TABLE IF NOT EXISTS assets(
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL,
@@ -166,6 +202,18 @@ impl Store {
              CREATE TABLE IF NOT EXISTS artifacts(
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, path TEXT, content TEXT,
                metadata_json TEXT, created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS coverage(
+               id TEXT PRIMARY KEY, session_id TEXT NOT NULL, target TEXT NOT NULL, method TEXT NOT NULL DEFAULT '',
+               path TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, UNIQUE(session_id,target,method,path)
+             );
+             CREATE TABLE IF NOT EXISTS hypotheses(
+               id TEXT PRIMARY KEY, session_id TEXT NOT NULL, statement TEXT NOT NULL,
+               status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS approved_targets(
+               session_id TEXT NOT NULL, target TEXT NOT NULL, created_at TEXT NOT NULL,
+               PRIMARY KEY(session_id,target)
              );
              CREATE TABLE IF NOT EXISTS schema_version(
                version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
@@ -188,6 +236,9 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_findings_session ON findings(session_id);
              CREATE INDEX IF NOT EXISTS idx_assets_session ON assets(session_id);
              CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id);
+             CREATE INDEX IF NOT EXISTS idx_coverage_session ON coverage(session_id);
+             CREATE INDEX IF NOT EXISTS idx_hypotheses_session ON hypotheses(session_id);
+             CREATE INDEX IF NOT EXISTS idx_approved_targets_session ON approved_targets(session_id);
              CREATE INDEX IF NOT EXISTS idx_pending_calls_approval ON pending_tool_calls(approval_id);
              INSERT OR IGNORE INTO schema_version(version, applied_at)
                VALUES(1, strftime('%Y-%m-%dT%H:%M:%SZ','now'));",
@@ -201,6 +252,13 @@ impl Store {
         let _ = conn.execute("ALTER TABLE approvals ADD COLUMN risk TEXT", []);
         let _ = conn.execute("ALTER TABLE approvals ADD COLUMN created_at TEXT", []);
         let _ = conn.execute("ALTER TABLE approvals ADD COLUMN tool_call_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE approvals ADD COLUMN expires_at TEXT", []);
+        let _ = conn.execute("ALTER TABLE findings ADD COLUMN request TEXT", []);
+        let _ = conn.execute("ALTER TABLE findings ADD COLUMN response TEXT", []);
+        let _ = conn.execute("ALTER TABLE findings ADD COLUMN cvss TEXT", []);
+        let _ = conn.execute("ALTER TABLE findings ADD COLUMN cwe TEXT", []);
+        let _ = conn.execute("ALTER TABLE findings ADD COLUMN dedupe_key TEXT", []);
+        let _ = conn.execute("ALTER TABLE findings ADD COLUMN evidence_hash TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_call_id TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_calls_json TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN name TEXT", []);
@@ -486,6 +544,30 @@ impl Store {
         reason: &str,
         tool_call_id: Option<&str>,
     ) -> Result<Approval> {
+        self.create_approval_with_ttl(
+            session_id,
+            tool_name,
+            args_json,
+            risk,
+            reason,
+            tool_call_id,
+            900,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // stable public persistence API with TTL
+    pub fn create_approval_with_ttl(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        args_json: &str,
+        risk: &str,
+        reason: &str,
+        tool_call_id: Option<&str>,
+        ttl_secs: i64,
+    ) -> Result<Approval> {
+        let created_at = now();
+        let expires_at = (Utc::now() + Duration::seconds(ttl_secs)).to_rfc3339();
         let a = Approval {
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
@@ -494,13 +576,14 @@ impl Store {
             risk: risk.to_string(),
             status: "pending".to_string(),
             reason: Some(reason.to_string()),
-            created_at: now(),
+            created_at,
             tool_call_id: tool_call_id.map(|s| s.to_string()),
+            expires_at: Some(expires_at),
         };
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO approvals(id,session_id,action,status,reason,tool_name,args_json,risk,created_at,tool_call_id)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            "INSERT INTO approvals(id,session_id,action,status,reason,tool_name,args_json,risk,created_at,tool_call_id,expires_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 a.id,
                 a.session_id,
@@ -512,6 +595,7 @@ impl Store {
                 a.risk,
                 a.created_at,
                 a.tool_call_id,
+                a.expires_at,
             ],
         )?;
         Ok(a)
@@ -520,11 +604,13 @@ impl Store {
     pub fn get_pending_approval(&self, session_id: &str) -> Result<Option<Approval>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,session_id,COALESCE(tool_name,action),COALESCE(args_json,'{}'),COALESCE(risk,''),status,reason,COALESCE(created_at,''),tool_call_id
-             FROM approvals WHERE session_id=?1 AND status='pending' ORDER BY rowid DESC LIMIT 1",
+            "SELECT id,session_id,COALESCE(tool_name,action),COALESCE(args_json,'{}'),COALESCE(risk,''),status,reason,COALESCE(created_at,''),tool_call_id,expires_at
+             FROM approvals WHERE session_id=?1 AND status='pending'
+             AND (expires_at IS NULL OR expires_at > ?2)
+             ORDER BY rowid DESC LIMIT 1",
         )?;
         let row = stmt
-            .query_row(params![session_id], |r| {
+            .query_row(params![session_id, now()], |r| {
                 Ok(Approval {
                     id: r.get(0)?,
                     session_id: r.get(1)?,
@@ -535,10 +621,52 @@ impl Store {
                     reason: r.get(6)?,
                     created_at: r.get(7)?,
                     tool_call_id: r.get(8)?,
+                    expires_at: r.get(9)?,
                 })
             })
             .optional()?;
         Ok(row)
+    }
+
+    pub fn list_pending_approvals(&self, session_id: &str) -> Result<Vec<Approval>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,session_id,COALESCE(tool_name,action),COALESCE(args_json,'{}'),COALESCE(risk,''),status,reason,COALESCE(created_at,''),tool_call_id,expires_at
+             FROM approvals WHERE session_id=?1 AND status='pending'
+             AND (expires_at IS NULL OR expires_at > ?2)
+             ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id, now()], |r| {
+            Ok(Approval {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                tool_name: r.get(2)?,
+                args_json: r.get(3)?,
+                risk: r.get(4)?,
+                status: r.get(5)?,
+                reason: r.get(6)?,
+                created_at: r.get(7)?,
+                tool_call_id: r.get(8)?,
+                expires_at: r.get(9)?,
+            })
+        })?;
+        let mut out = vec![];
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Mark pending approvals whose TTL has elapsed as expired.
+    /// Returns the number of rows transitioned.
+    pub fn expire_stale_approvals(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute(
+            "UPDATE approvals SET status='expired'
+             WHERE status='pending' AND expires_at IS NOT NULL AND expires_at <= ?1",
+            params![now()],
+        )?;
+        Ok(affected)
     }
 
     /// Resolve an approval only if it is still pending. Two concurrent
@@ -650,23 +778,110 @@ impl Store {
             status: "open".to_string(),
             created_at: ts.clone(),
             updated_at: ts,
+            request: None,
+            response: None,
+            cvss: None,
+            cwe: None,
+            dedupe_key: None,
+            evidence_hash: None,
         };
         let conn = self.conn.lock().unwrap();
+        Self::insert_finding(&conn, &f)?;
+        Ok(f)
+    }
+
+    #[allow(clippy::too_many_arguments)] // evidence-rich persistence API
+    pub fn add_finding_with_evidence(
+        &self,
+        session_id: &str,
+        title: &str,
+        severity: &str,
+        asset: Option<&str>,
+        vuln_type: Option<&str>,
+        description: &str,
+        reproduction: Option<&str>,
+        impact: Option<&str>,
+        remediation: Option<&str>,
+        evidence: Option<&str>,
+        request: Option<&str>,
+        response: Option<&str>,
+        cvss: Option<&str>,
+        cwe: Option<&str>,
+    ) -> Result<Option<Finding>> {
+        let dedupe_key = format!(
+            "{}|{}|{}",
+            title,
+            asset.unwrap_or_default(),
+            vuln_type.unwrap_or_default()
+        )
+        .to_lowercase();
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM findings WHERE session_id=?1 AND dedupe_key=?2 LIMIT 1",
+                params![session_id, dedupe_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if existing.is_some() {
+            return Ok(None);
+        }
+        let ts = now();
+        let f = Finding {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            title: title.to_string(),
+            severity: severity.to_string(),
+            asset: asset.map(|s| s.to_string()),
+            vuln_type: vuln_type.map(|s| s.to_string()),
+            description: description.to_string(),
+            reproduction: reproduction.map(|s| s.to_string()),
+            impact: impact.map(|s| s.to_string()),
+            remediation: remediation.map(|s| s.to_string()),
+            evidence: evidence.map(|s| s.to_string()),
+            status: "open".to_string(),
+            created_at: ts.clone(),
+            updated_at: ts,
+            request: request.map(|s| s.to_string()),
+            response: response.map(|s| s.to_string()),
+            cvss: cvss.map(|s| s.to_string()),
+            cwe: cwe.map(|s| s.to_string()),
+            dedupe_key: Some(dedupe_key),
+            evidence_hash: Some(Self::evidence_hash(evidence, request, response)),
+        };
+        Self::insert_finding(&conn, &f)?;
+        Ok(Some(f))
+    }
+
+    fn insert_finding(conn: &Connection, f: &Finding) -> Result<()> {
         conn.execute(
-            "INSERT INTO findings(id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            "INSERT INTO findings(id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 f.id, f.session_id, f.title, f.severity, f.asset, f.vuln_type, f.description,
-                f.reproduction, f.impact, f.remediation, f.evidence, f.status, f.created_at, f.updated_at
+                f.reproduction, f.impact, f.remediation, f.evidence, f.status, f.created_at, f.updated_at,
+                f.request, f.response, f.cvss, f.cwe, f.dedupe_key, f.evidence_hash
             ],
         )?;
-        Ok(f)
+        Ok(())
+    }
+
+    fn evidence_hash(
+        evidence: Option<&str>,
+        request: Option<&str>,
+        response: Option<&str>,
+    ) -> String {
+        let mut hasher = DefaultHasher::new();
+        evidence.hash(&mut hasher);
+        request.hash(&mut hasher);
+        response.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
     }
 
     pub fn list_findings(&self, session_id: &str) -> Result<Vec<Finding>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at
+            "SELECT id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash
              FROM findings WHERE session_id=?1 ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
@@ -685,6 +900,12 @@ impl Store {
                 status: r.get(11)?,
                 created_at: r.get(12)?,
                 updated_at: r.get(13)?,
+                request: r.get(14)?,
+                response: r.get(15)?,
+                cvss: r.get(16)?,
+                cwe: r.get(17)?,
+                dedupe_key: r.get(18)?,
+                evidence_hash: r.get(19)?,
             })
         })?;
         let mut out = vec![];
@@ -813,6 +1034,8 @@ impl Store {
         let findings = self.list_findings(session_id)?;
         let assets = self.list_assets(session_id)?;
         let artifacts = self.list_artifacts(session_id)?;
+        let coverage = self.list_coverage(session_id)?;
+        let hypotheses = self.list_hypotheses(session_id)?;
         let events = self.list_events(session_id, 1000)?;
         let mut out = String::new();
         out.push_str("# MiniBug Report\n\n");
@@ -844,6 +1067,18 @@ impl Store {
             if let Some(e) = &f.evidence {
                 out.push_str(&format!("  Evidence: {}\n", redact(e)));
             }
+            if let Some(rq) = &f.request {
+                out.push_str(&format!("  Request: {}\n", redact(rq)));
+            }
+            if let Some(rs) = &f.response {
+                out.push_str(&format!("  Response: {}\n", redact(rs)));
+            }
+            if let Some(c) = &f.cvss {
+                out.push_str(&format!("  CVSS: {}\n", redact(c)));
+            }
+            if let Some(c) = &f.cwe {
+                out.push_str(&format!("  CWE: {}\n", redact(c)));
+            }
         }
         out.push_str("\n## Assets\n");
         if assets.is_empty() {
@@ -868,6 +1103,29 @@ impl Store {
             if let Some(m) = &a.metadata_json {
                 out.push_str(&format!("  metadata: {}\n", redact(m)));
             }
+        }
+        out.push_str("\n## Coverage\n");
+        if coverage.is_empty() {
+            out.push_str("(none)\n");
+        }
+        for c in coverage {
+            out.push_str(&format!(
+                "- {} {} {}\n",
+                redact(&c.method),
+                redact(&c.target),
+                redact(&c.path)
+            ));
+        }
+        out.push_str("\n## Hypotheses\n");
+        if hypotheses.is_empty() {
+            out.push_str("(none)\n");
+        }
+        for h in hypotheses {
+            out.push_str(&format!(
+                "- [{}] {}\n",
+                redact(&h.status),
+                redact(&h.statement)
+            ));
         }
         out.push_str("\n## Timeline\n");
         for e in events {
@@ -1047,6 +1305,128 @@ impl Store {
                 Err(e)
             }
         }
+    }
+
+    pub fn record_coverage(
+        &self,
+        session_id: &str,
+        target: &str,
+        method: &str,
+        path: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO coverage(id,session_id,target,method,path,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                Uuid::new_v4().to_string(),
+                session_id,
+                target,
+                method,
+                path,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn coverage_count(&self, session_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coverage WHERE session_id=?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    pub fn list_coverage(&self, session_id: &str) -> Result<Vec<Coverage>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,session_id,target,method,path,created_at FROM coverage WHERE session_id=?1 ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            Ok(Coverage {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                target: r.get(2)?,
+                method: r.get(3)?,
+                path: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?;
+        let mut out = vec![];
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn add_hypothesis(&self, session_id: &str, statement: &str) -> Result<Hypothesis> {
+        let h = Hypothesis {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            statement: statement.to_string(),
+            status: "open".to_string(),
+            created_at: now(),
+        };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO hypotheses(id,session_id,statement,status,created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![h.id, h.session_id, h.statement, h.status, h.created_at],
+        )?;
+        Ok(h)
+    }
+
+    pub fn list_hypotheses(&self, session_id: &str) -> Result<Vec<Hypothesis>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,session_id,statement,status,created_at FROM hypotheses WHERE session_id=?1 ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            Ok(Hypothesis {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                statement: r.get(2)?,
+                status: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        })?;
+        let mut out = vec![];
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn set_hypothesis_status(&self, id: &str, status: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE hypotheses SET status=?2 WHERE id=?1",
+            params![id, status],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_approved_target(&self, session_id: &str, target: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO approved_targets(session_id,target,created_at) VALUES(?1,?2,?3)",
+            params![session_id, target, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_approved_targets(&self, session_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT target FROM approved_targets WHERE session_id=?1 ORDER BY target")?;
+        let rows = stmt.query_map(params![session_id], |r| r.get::<_, String>(0))?;
+        let mut out = vec![];
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 }
 
@@ -1458,5 +1838,197 @@ mod tests {
         assert!(!store
             .transition_state_owned(&s.id, "owner-a", &["idle"], "completed")
             .unwrap());
+    }
+
+    #[test]
+    fn finding_dedupe_by_key() {
+        let store = Store::open(":memory:").unwrap();
+        let s = store.create_session("g").unwrap();
+        let first = store
+            .add_finding_with_evidence(
+                &s.id,
+                "SQL Injection",
+                "high",
+                Some("https://example.com/login"),
+                Some("sqli"),
+                "desc",
+                Some("repro"),
+                Some("impact"),
+                Some("fix"),
+                Some("evidence text"),
+                Some("POST /login"),
+                Some("HTTP/1.1 200"),
+                Some("CVSS:3.1/AV:N/AC:L"),
+                Some("CWE-89"),
+            )
+            .unwrap()
+            .expect("first insert should succeed");
+        assert_eq!(
+            first.dedupe_key.as_deref(),
+            Some("sql injection|https://example.com/login|sqli")
+        );
+        assert!(first.evidence_hash.is_some());
+
+        // Same key, different casing -> deduped, no insert.
+        let dup = store
+            .add_finding_with_evidence(
+                &s.id,
+                "sql injection",
+                "high",
+                Some("https://example.com/login"),
+                Some("SQLI"),
+                "other desc",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(dup.is_none());
+        assert_eq!(store.list_findings(&s.id).unwrap().len(), 1);
+
+        // Different key -> inserted.
+        let second = store
+            .add_finding_with_evidence(
+                &s.id, "XSS", "medium", None, None, "desc", None, None, None, None, None, None,
+                None, None,
+            )
+            .unwrap();
+        assert!(second.is_some());
+        let loaded = store.list_findings(&s.id).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].request.as_deref(), Some("POST /login"));
+        assert_eq!(loaded[0].cwe.as_deref(), Some("CWE-89"));
+        assert_eq!(loaded[0].cvss.as_deref(), Some("CVSS:3.1/AV:N/AC:L"));
+    }
+
+    #[test]
+    fn approval_ttl_filtering() {
+        let store = Store::open(":memory:").unwrap();
+        let s = store.create_session("g").unwrap();
+
+        let valid = store
+            .create_approval(&s.id, "shell", "{}", "exec", "reason", None)
+            .unwrap();
+        assert!(valid.expires_at.is_some());
+
+        let expired = store
+            .create_approval_with_ttl(&s.id, "shell", "{}", "exec", "reason", None, -60)
+            .unwrap();
+        assert!(expired.expires_at.is_some());
+
+        let pending = store.get_pending_approval(&s.id).unwrap().unwrap();
+        assert_eq!(pending.id, valid.id);
+        assert_eq!(pending.expires_at, valid.expires_at);
+        let listed = store.list_pending_approvals(&s.id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, valid.id);
+
+        let n = store.expire_stale_approvals().unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            store.get_pending_approval(&s.id).unwrap().unwrap().id,
+            valid.id
+        );
+        assert_eq!(store.list_pending_approvals(&s.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn coverage_and_hypothesis_crud() {
+        let store = Store::open(":memory:").unwrap();
+        let s = store.create_session("g").unwrap();
+
+        store
+            .record_coverage(&s.id, "https://example.com", "GET", "/")
+            .unwrap();
+        store
+            .record_coverage(&s.id, "https://example.com", "GET", "/")
+            .unwrap();
+        store
+            .record_coverage(&s.id, "https://example.com", "POST", "/login")
+            .unwrap();
+        assert_eq!(store.coverage_count(&s.id).unwrap(), 2);
+        let coverage = store.list_coverage(&s.id).unwrap();
+        assert_eq!(coverage.len(), 2);
+        assert!(coverage.iter().all(|c| c.session_id == s.id));
+        assert!(coverage
+            .iter()
+            .any(|c| c.method == "POST" && c.path == "/login"));
+
+        let h = store
+            .add_hypothesis(&s.id, "Login may be vulnerable to SQLi")
+            .unwrap();
+        assert_eq!(h.status, "open");
+        let h2 = store
+            .add_hypothesis(&s.id, "Endpoint may leak tokens")
+            .unwrap();
+        let hypotheses = store.list_hypotheses(&s.id).unwrap();
+        assert_eq!(hypotheses.len(), 2);
+
+        store.set_hypothesis_status(&h.id, "confirmed").unwrap();
+        let hypotheses = store.list_hypotheses(&s.id).unwrap();
+        assert_eq!(
+            hypotheses.iter().find(|x| x.id == h.id).unwrap().status,
+            "confirmed"
+        );
+        assert_eq!(
+            hypotheses.iter().find(|x| x.id == h2.id).unwrap().status,
+            "open"
+        );
+
+        store
+            .record_approved_target(&s.id, "https://example.com")
+            .unwrap();
+        store
+            .record_approved_target(&s.id, "https://example.com")
+            .unwrap();
+        assert_eq!(
+            store.list_approved_targets(&s.id).unwrap(),
+            vec!["https://example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn report_includes_evidence_coverage_and_hypotheses() {
+        let store = Store::open(":memory:").unwrap();
+        let s = store.create_session("g").unwrap();
+        store
+            .add_finding_with_evidence(
+                &s.id,
+                "Leak",
+                "high",
+                None,
+                None,
+                "desc",
+                None,
+                None,
+                None,
+                Some("api_key=supersecret"),
+                Some("GET /admin HTTP/1.1 Authorization: Bearer abc123"),
+                Some("HTTP/1.1 200 OK"),
+                Some("7.5"),
+                Some("CWE-200"),
+            )
+            .unwrap();
+        store
+            .record_coverage(&s.id, "https://example.com", "GET", "/admin")
+            .unwrap();
+        store
+            .add_hypothesis(&s.id, "Admin panel is public")
+            .unwrap();
+
+        let report = store.export_report(&s.id).unwrap();
+        assert!(report.contains("## Coverage"));
+        assert!(report.contains("## Hypotheses"));
+        assert!(report.contains("Request:"));
+        assert!(report.contains("Response:"));
+        assert!(report.contains("CVSS:"));
+        assert!(report.contains("CWE:"));
+        assert!(!report.contains("supersecret"));
+        assert!(!report.contains("abc123"));
     }
 }

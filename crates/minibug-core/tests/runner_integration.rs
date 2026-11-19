@@ -238,13 +238,23 @@ async fn ask_mode_deny_continues_without_executing() {
 }
 
 #[tokio::test]
-async fn stale_running_session_is_marked_interrupted() {
+async fn stale_running_session_is_recovered_and_resumed_from_snapshot() {
     let store = Store::open(":memory:").unwrap();
     let session = store.create_session("interrupted goal").unwrap();
     store.set_session_state(&session.id, "running").unwrap();
     store.set_session_model(&session.id, "mock-model").unwrap();
+    store
+        .add_message(&session.id, "user", "continue the work")
+        .unwrap();
 
-    let llm = Arc::new(MockLlm::new("mock-model", vec![]));
+    let llm = Arc::new(MockLlm::new(
+        "mock-model",
+        vec![ChatResponse {
+            content: Some("recovered and finished".into()),
+            tool_calls: vec![],
+            model: "mock-model".into(),
+        }],
+    ));
     let runner = Runner::new(
         store.clone(),
         llm,
@@ -257,18 +267,38 @@ async fn stale_running_session_is_marked_interrupted() {
         },
     );
 
-    let err = runner
-        .resume_session(&session.id, "approve")
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("interrupted"));
+    assert_eq!(
+        runner.resume_session(&session.id, "approve").await.unwrap(),
+        "recovered and finished"
+    );
     let s = store.get_session(&session.id).unwrap().unwrap();
-    assert_eq!(s.state, "interrupted");
-    // no active owner/lease after recovery
+    assert_eq!(s.state, "completed");
     assert!(s.owner_id.is_none());
     assert!(s.lease_expires_at.is_none());
     let events = store.list_events(&session.id, 50).unwrap();
     assert!(events.iter().any(|e| e.kind == "session.recovered_stale"));
+    assert!(events.iter().any(|e| e.kind == "session.resumed_snapshot"));
+}
+
+#[tokio::test]
+async fn interrupted_without_snapshot_is_rejected() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("no snapshot").unwrap();
+    store.set_session_state(&session.id, "running").unwrap();
+    store.set_session_model(&session.id, "mock-model").unwrap();
+
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new("mock-model", vec![])),
+        ToolRegistry::new(),
+        build_policy(Mode::Ask),
+        AgentConfig::default(),
+    );
+    let err = runner
+        .resume_session(&session.id, "approve")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no durable snapshot"));
 }
 
 #[tokio::test]
@@ -786,4 +816,190 @@ async fn policy_deny_after_parking_blocks_approved_execution() {
     let msgs = store.list_messages(&session.id).unwrap();
     assert!(msgs.iter().any(|m| m.content.contains("policy changed")));
     assert!(!msgs.iter().any(|m| m.content.contains("ran:echo hi")));
+}
+
+struct TargetNetTool;
+
+#[async_trait]
+impl Tool for TargetNetTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "target_net".into(),
+            description: "mock network tool".into(),
+            input_schema: json!({"type":"object"}),
+            risk: "network".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let target = input
+            .get("target")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        Ok(ToolResult {
+            ok: true,
+            output: format!("probed:{target}"),
+            structured: Some(json!({"status": 200})),
+        })
+    }
+}
+
+#[tokio::test]
+async fn configured_auto_approve_tool_runs_without_parking() {
+    let store = Store::open(":memory:").unwrap();
+    let llm = Arc::new(MockLlm::new(
+        "mock-model",
+        vec![
+            ChatResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "mock_exec".into(),
+                    arguments: json!({"cmd":"echo hi"}),
+                }],
+                model: "mock-model".into(),
+            },
+            ChatResponse {
+                content: Some("auto finished".into()),
+                tool_calls: vec![],
+                model: "mock-model".into(),
+            },
+        ],
+    ));
+    let runner = Runner::new(
+        store.clone(),
+        llm,
+        base_tools_with_mock_exec(),
+        build_policy(Mode::Ask),
+        AgentConfig {
+            mode: Mode::Ask,
+            max_steps: 5,
+            auto_approve_tools: vec!["mock_exec".into()],
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        runner.run_goal("auto approve").await.unwrap(),
+        "auto finished"
+    );
+    let session = store.list_sessions(10).unwrap().remove(0);
+    assert_eq!(session.state, "completed");
+    let msgs = store.list_messages(&session.id).unwrap();
+    assert!(msgs.iter().any(|m| m.content.contains("ran:echo hi")));
+    let events = store.list_events(&session.id, 100).unwrap();
+    assert!(events.iter().any(|e| e.kind == "approval.auto"));
+}
+
+#[tokio::test]
+async fn switching_target_after_approval_requires_new_approval() {
+    let store = Store::open(":memory:").unwrap();
+    let llm = Arc::new(MockLlm::new(
+        "mock-model",
+        vec![
+            ChatResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "target_net".into(),
+                    arguments: json!({"target":"example.com"}),
+                }],
+                model: "mock-model".into(),
+            },
+            ChatResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c2".into(),
+                    name: "target_net".into(),
+                    arguments: json!({"target":"other.com"}),
+                }],
+                model: "mock-model".into(),
+            },
+            ChatResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                model: "mock-model".into(),
+            },
+        ],
+    ));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(TargetNetTool));
+    let runner = Runner::new(
+        store.clone(),
+        llm,
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            max_steps: 5,
+            ..Default::default()
+        },
+    );
+    let out = runner.run_goal("two targets").await.unwrap();
+    assert!(out.contains("waiting approval"));
+    let session = store.list_sessions(10).unwrap().remove(0);
+    assert_eq!(session.state, "waiting_approval");
+    let approval = store.get_pending_approval(&session.id).unwrap().unwrap();
+    assert!(approval
+        .reason
+        .unwrap_or_default()
+        .contains("differs from previously approved"));
+    assert_eq!(store.coverage_count(&session.id).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn finding_evidence_is_persisted_and_deduplicated() {
+    let store = Store::open(":memory:").unwrap();
+    let finding = |id: &str, evidence: &str| ToolCall {
+        id: id.into(),
+        name: "save_finding".into(),
+        arguments: json!({
+            "title":"SQLi in login",
+            "severity":"high",
+            "asset":"https://example.com/login",
+            "vuln_type":"sqli",
+            "description":"union based",
+            "evidence": evidence,
+            "request":"GET /login HTTP/1.1",
+            "response":"HTTP/1.1 200 OK",
+            "cvss":"9.8",
+            "cwe":"CWE-89"
+        }),
+    };
+    let llm = Arc::new(MockLlm::new(
+        "mock-model",
+        vec![
+            ChatResponse {
+                content: None,
+                tool_calls: vec![finding("f1", "first"), finding("f2", "second")],
+                model: "mock-model".into(),
+            },
+            ChatResponse {
+                content: Some("report".into()),
+                tool_calls: vec![],
+                model: "mock-model".into(),
+            },
+        ],
+    ));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(minibug_tools::SaveFindingTool));
+    let runner = Runner::new(
+        store.clone(),
+        llm,
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            max_steps: 5,
+            ..Default::default()
+        },
+    );
+    assert_eq!(runner.run_goal("dedupe").await.unwrap(), "report");
+    let session = store.list_sessions(10).unwrap().remove(0);
+    let findings = store.list_findings(&session.id).unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].request.as_deref(), Some("GET /login HTTP/1.1"));
+    assert_eq!(findings[0].response.as_deref(), Some("HTTP/1.1 200 OK"));
+    assert_eq!(findings[0].cvss.as_deref(), Some("9.8"));
+    assert_eq!(findings[0].cwe.as_deref(), Some("CWE-89"));
+    let report = store.export_report(&session.id).unwrap();
+    assert!(report.contains("CWE-89"));
 }

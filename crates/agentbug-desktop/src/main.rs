@@ -309,8 +309,8 @@ impl DesktopApp {
             max_network_calls: self.config.agent.max_network_calls,
             requests_per_minute: self.config.agent.requests_per_minute,
             max_estimated_tokens: self.config.agent.max_estimated_tokens,
-            allow_network_write: self.config.agent.allow_network_write,
-            allow_intrusive: self.config.agent.allow_intrusive,
+            allow_network_write: self.config.network.allow_network_write,
+            allow_intrusive: self.config.network.allow_intrusive,
             auto_approve_all: self.config.agent.auto_approve_all,
         };
         let storage = PathBuf::from(&self.config.storage.path);
@@ -736,6 +736,10 @@ impl DesktopApp {
             "auto approve: {}",
             self.config.agent.auto_approve_tools.join(", ")
         ));
+        ui.checkbox(
+            &mut self.config.agent.auto_approve_all,
+            "auto approve all (skip every approval prompt)",
+        );
         ui.separator();
         ui.label("Scope (one pattern per line)");
         ui.horizontal(|ui| {
@@ -764,6 +768,14 @@ impl DesktopApp {
             "trusted local: {}",
             self.config.network.trusted_local_targets.join(", ")
         ));
+        ui.checkbox(
+            &mut self.config.network.allow_network_write,
+            "allow network-write tools during engagements",
+        );
+        ui.checkbox(
+            &mut self.config.network.allow_intrusive,
+            "allow intrusive/fuzzing tools during engagements",
+        );
         ui.checkbox(
             &mut self.config.external_tools.enabled,
             "enable external adapters",

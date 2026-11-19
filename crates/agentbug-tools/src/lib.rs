@@ -16,6 +16,9 @@ use tokio::time::{sleep, timeout, Duration};
 
 const MAX_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024;
+/// One extra chunk of headroom prevents a single borderline chunk from being
+/// discarded just because it crosses the cap; we still stop immediately after.
+const MAX_HTTP_BODY_SLACK: usize = 8 * 1024;
 const MAX_READ_BYTES: u64 = 512 * 1024;
 /// Hard ROE caps for `http_fuzz`: at most 200 wordlist items and 200 requests
 /// per call. Methods are restricted to non-destructive GET/HEAD/POST.
@@ -124,11 +127,11 @@ fn truncate(s: &str) -> String {
     format!("{}\n...[truncated]", &s[..end])
 }
 
-/// Only a small set of local, non-network commands may be spawned by the agent.
-/// Network-capable recon must go through `http_request`/`dns_lookup`, which
-/// enforce scope and egress rules.
+/// Only the two harmless local commands may be spawned by the agent. Anything
+/// that can read files, spawn tools or reach the network must go through the
+/// scoped `http_request`/`dns_lookup` tool instead, where policy is enforced.
 fn validate_shell_command(cmd: &str) -> Result<()> {
-    const ALLOWED: &[&str] = &["echo", "git", "cargo", "ls", "dir", "cat", "pwd", "whoami"];
+    const ALLOWED: &[&str] = &["echo", "whoami"];
     let first = cmd.split_whitespace().next().unwrap_or("");
     let exe = Path::new(first)
         .file_name()
@@ -138,15 +141,35 @@ fn validate_shell_command(cmd: &str) -> Result<()> {
     if !ALLOWED.contains(&exe.as_str()) {
         anyhow::bail!("command '{exe}' is not in the shell allowlist");
     }
-    for ch in ['|', ';', '&', '`', '>', '<', '\n', '\r'] {
+    // Chaining, redirection and expansion characters must never survive into
+    // the shell string: a prompt-injected command could otherwise smuggle a
+    // second program past the allowlist or read files outside the workspace.
+    for ch in [
+        '|', ';', '&', '`', '>', '<', '\n', '\r', '!', '=', '/', '\\', ':', '$', '{', '}', '(',
+        ')', '[', ']',
+    ] {
         if cmd.contains(ch) {
             anyhow::bail!("shell metacharacter '{ch}' is not allowed");
         }
     }
-    if cmd.contains("$(") {
-        anyhow::bail!("command substitution is not allowed");
+    for seq in ["..", "$("] {
+        if cmd.contains(seq) {
+            anyhow::bail!("shell sequence '{seq}' is not allowed");
+        }
+    }
+    for token in cmd.split_whitespace() {
+        if token.contains('=') || token.contains('!') || looks_like_path(token) {
+            anyhow::bail!("argument '{token}' is not allowed");
+        }
     }
     Ok(())
+}
+
+/// A token that refers to a filesystem path (absolute, relative, home-relative
+/// or a bare dot entry). Rejecting these keeps `shell_exec` from being used as
+/// a file reader even before other structural checks apply.
+fn looks_like_path(token: &str) -> bool {
+    token.contains(['/', '\\', ':', '~']) || token.starts_with('.')
 }
 
 /// Deny private, loopback, link-local, metadata, CGNAT and other reserved ranges.
@@ -515,8 +538,6 @@ fn safe_process_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
                 "COMSPEC",
                 "TEMP",
                 "TMP",
-                "HOME",
-                "USERPROFILE",
                 "LANG",
                 "LC_ALL",
             ]
@@ -541,7 +562,7 @@ impl Tool for ShellExecTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "shell_exec".into(),
-            description: "Execute a shell command in the workspace cwd (30s timeout, 8KB output cap). Intended for safe local recon/build/test commands as allowed by policy.".into(),
+            description: "Execute an allowlisted trivial shell command (echo/whoami) in the workspace cwd (30s timeout, 8KB output cap). Not a general shell.".into(),
             input_schema: json!({"type":"object","properties":{"cmd":{"type":"string","description":"Shell command to run in workspace cwd"}},"required":["cmd"]}),
             risk: "exec".into(),
         }
@@ -639,6 +660,31 @@ fn build_http_client(options: &ToolOptions) -> reqwest::Client {
             .build()
             .expect("http client")
     })
+}
+
+/// Consume a response body one chunk at a time, accumulating at most the cap
+/// (plus a small slack for the chunk that crosses it). This avoids buffering an
+/// unbounded response in memory the way `resp.bytes()` would. Returns the bytes
+/// collected so far and whether the body was truncated at the cap.
+async fn read_body_capped(
+    resp: &mut reqwest::Response,
+    read_timeout: Duration,
+) -> Result<(Vec<u8>, bool)> {
+    let cap = MAX_HTTP_BODY_BYTES + MAX_HTTP_BODY_SLACK;
+    let mut body = Vec::with_capacity(MAX_HTTP_BODY_BYTES);
+    while let Some(chunk) = timeout(read_timeout, resp.chunk())
+        .await
+        .context("read body timeout")??
+    {
+        if body.len() + chunk.len() > cap {
+            return Ok((body, true));
+        }
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_HTTP_BODY_BYTES {
+            return Ok((body, true));
+        }
+    }
+    Ok((body, false))
 }
 
 /// Wait until an outgoing request fits inside the configured ROE rate limit.
@@ -801,7 +847,7 @@ impl Tool for HttpRequestTool {
             req = req.body(body.to_string());
         }
         obey_rate_limit(&self.options).await;
-        let resp = timeout(Duration::from_millis(timeout_ms), req.send())
+        let mut resp = timeout(Duration::from_millis(timeout_ms), req.send())
             .await
             .context("http timeout")??;
         let status = resp.status().as_u16();
@@ -815,10 +861,8 @@ impl Tool for HttpRequestTool {
                 .collect::<String>();
             headers.insert(k.to_string(), Value::String(redact(&value)));
         }
-        let bytes = timeout(Duration::from_millis(timeout_ms), resp.bytes())
-            .await
-            .context("read body timeout")??;
-        let truncated = bytes.len() > MAX_HTTP_BODY_BYTES;
+        let (bytes, truncated) =
+            read_body_capped(&mut resp, Duration::from_millis(timeout_ms)).await?;
         let slice = &bytes[..bytes.len().min(MAX_HTTP_BODY_BYTES)];
         let body_text = redact(&String::from_utf8_lossy(slice));
         let out = json!({
@@ -877,18 +921,32 @@ impl Tool for ValidatePoCTool {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "finding_id": {"type": "string", "description": "Id of the finding this advisory result belongs to"},
                     "url": {"type": "string", "description": "Absolute http/https URL to validate"},
                     "method": {"type": "string", "enum": ["GET","HEAD","POST","PUT","DELETE","OPTIONS"], "default": "GET"},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "body": {"type": "string"},
                     "expected_status": {"type": "number", "default": 200},
                     "marker": {"type": "string", "description": "Substring that must appear in the response body"}
                 },
-                "required": ["url"]
+                "required": ["finding_id", "url"]
             }),
             risk: "network".into(),
         }
     }
 
     async fn run(&self, input: Value) -> Result<ToolResult> {
+        let Some(finding_id) = input
+            .get("finding_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return Ok(ToolResult {
+                ok: false,
+                output: "finding_id required".into(),
+                structured: Some(json!({"valid": false, "error": "finding_id required"})),
+            });
+        };
         let url = input
             .get("url")
             .and_then(|v| v.as_str())
@@ -905,7 +963,16 @@ impl Tool for ValidatePoCTool {
             u16::try_from(expected_status).context("expected_status out of range")?;
         let marker = input.get("marker").and_then(|v| v.as_str());
 
-        let response = self.http.run(json!({"url": url, "method": method})).await?;
+        // Replay exactly what was supplied: headers and body are part of the
+        // proof-of-concept and must reach the request, not just the URL/method.
+        let mut replay = json!({"url": url, "method": method});
+        if let Some(headers) = input.get("headers") {
+            replay["headers"] = headers.clone();
+        }
+        if let Some(body) = input.get("body") {
+            replay["body"] = body.clone();
+        }
+        let response = self.http.run(replay).await?;
         let status = response
             .structured
             .as_ref()
@@ -923,17 +990,25 @@ impl Tool for ValidatePoCTool {
         let valid =
             response.ok && poc_verdict(status, expected_status, marker_found, marker.is_some());
 
+        // Advisory only: a caller-supplied expected_status/marker is not an
+        // authoritative oracle. Core runs an independent canary verifier and
+        // is solely responsible for promoting a finding; this verdict never
+        // changes finding state.
         let structured = json!({
+            "advisory": true,
+            "finding_id": finding_id,
             "valid": valid,
             "status": status,
             "marker_found": marker_found,
             "url": url,
         });
         let output = if valid {
-            format!("PoC validated for {url}: status {status}, marker found: {marker_found}")
+            format!(
+                "Advisory PoC result for finding {finding_id} ({url}): status {status}, marker found: {marker_found}. Independent verification required."
+            )
         } else {
             format!(
-                "PoC not validated for {url}: status {status} (expected {expected_status}), ok={}, marker found: {marker_found}",
+                "Advisory PoC result for finding {finding_id} ({url}): status {status} (expected {expected_status}), ok={}, marker found: {marker_found}. Independent verification required.",
                 response.ok
             )
         };
@@ -1366,6 +1441,44 @@ pub fn build_external_args(template: &[String], input: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Every placeholder key that can carry a target. Each value substituted into
+/// one of these must be checked against the engagement scope before spawn.
+const SCOPE_PLACEHOLDER_KEYS: &[&str] = &[
+    "target", "host", "url", "word", "domain", "ports", "param", "marker", "action", "selector",
+    "script", "match",
+];
+
+/// Collect all non-empty values that would be substituted into scope-bearing
+/// placeholders by `build_external_args`, so each is scope-checked. A bare
+/// `target` in the input is also returned when no template placeholder exists,
+/// preserving the check for templates that receive a target out of band.
+pub fn external_scope_values(template: &[String], input: &Value) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut has_target_placeholder = false;
+    for key in SCOPE_PLACEHOLDER_KEYS {
+        let placeholder = format!("{{{key}}}");
+        if !template.iter().any(|arg| arg.contains(&placeholder)) {
+            continue;
+        }
+        if *key == "target" {
+            has_target_placeholder = true;
+        }
+        if let Some(value) = input.get(*key).and_then(Value::as_str) {
+            if !value.is_empty() {
+                values.push(value.to_string());
+            }
+        }
+    }
+    if !has_target_placeholder {
+        if let Some(target) = input.get("target").and_then(Value::as_str) {
+            if !target.is_empty() {
+                values.push(target.to_string());
+            }
+        }
+    }
+    values
+}
+
 /// A pre-approved external recon adapter. Arguments are passed as a discrete
 /// argv vector, never interpolated into a shell command string.
 pub struct ExternalCommandTool {
@@ -1377,6 +1490,7 @@ pub struct ExternalCommandTool {
     cwd: PathBuf,
     scope_in: Vec<String>,
     scope_out: Vec<String>,
+    timeout: Duration,
 }
 
 impl ExternalCommandTool {
@@ -1397,11 +1511,19 @@ impl ExternalCommandTool {
             cwd: cwd.as_ref().to_path_buf(),
             scope_in: Vec::new(),
             scope_out: Vec::new(),
+            timeout: Duration::from_secs(60),
         }
     }
 
     pub fn with_cwd(mut self, cwd: impl AsRef<Path>) -> Self {
         self.cwd = cwd.as_ref().to_path_buf();
+        self
+    }
+
+    /// Override the spawn timeout. Primarily useful for tests that exercise
+    /// the kill-on-timeout path without waiting the full production minute.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -1438,41 +1560,40 @@ impl Tool for ExternalCommandTool {
         let args = build_external_args(&self.arg_template, &input);
         // Scope is enforced here as well as by the runner: a prompt-injected
         // or unapproved call must not spawn a process against an out-of-scope
-        // target even if it somehow bypasses the outer approval gate.
-        let target = self
-            .arg_template
-            .iter()
-            .position(|arg| arg.contains("{target}"))
-            .and_then(|index| args.get(index))
-            .cloned()
-            .or_else(|| {
-                input
-                    .get("target")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .filter(|target| !target.is_empty());
-        if let Some(target) = target {
-            if !scope_target_allowed(&target, &self.scope_in, &self.scope_out) {
-                anyhow::bail!("target '{target}' is not permitted by scope policy");
+        // target even if it somehow bypasses the outer approval gate. Every
+        // substituted value is checked, not just `{target}`.
+        for value in external_scope_values(&self.arg_template, &input) {
+            if !scope_target_allowed(&value, &self.scope_in, &self.scope_out) {
+                anyhow::bail!("target '{value}' is not permitted by scope policy");
             }
         }
         let cwd = resolve_cwd(&self.cwd).unwrap_or_else(|_| self.cwd.clone());
-        let mut cmd = std::process::Command::new(&self.command);
-        cmd.args(&args)
+        let mut child = Command::new(&self.command)
+            .args(&args)
             .current_dir(cwd)
             .env_clear()
             .envs(safe_process_env())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = tokio::task::spawn_blocking(move || cmd.output());
-        let out = timeout(Duration::from_secs(60), child)
-            .await
-            .context("external command timeout (60s)")?
-            .context("external command task failed")?
+            .stderr(Stdio::piped())
+            .spawn()
             .context("spawn external command")?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Poll for completion instead of spawn_blocking(output()): on timeout
+        // we can now kill and reap the child rather than leaving it running.
+        let deadline = Instant::now() + self.timeout;
+        let out = loop {
+            match child.try_wait().context("poll external command")? {
+                Some(_) => break child.wait_with_output().await.context("collect output")?,
+                None => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill().await;
+                        anyhow::bail!("external command timeout");
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+        let stdout = redact(&String::from_utf8_lossy(&out.stdout));
+        let stderr = redact(&String::from_utf8_lossy(&out.stderr));
         let lines: Vec<String> = stdout
             .lines()
             .take(MAX_EXTERNAL_LINES)
@@ -3413,14 +3534,21 @@ mod tests {
     async fn shell_exec_scrubs_secret_environment() {
         let key = "AGENTBUG_TEST_SECRET_TOKEN";
         std::env::set_var(key, "hunter2");
+        // Shell expansion of $VAR/%VAR% is now rejected by the allowlist, so
+        // verify the invariant directly: a secret env var is not part of the
+        // sanitised environment handed to any child process.
+        let env = safe_process_env();
+        assert!(
+            env.iter().all(|(k, v)| {
+                let k = k.to_string_lossy().to_ascii_uppercase();
+                k != key && v.to_string_lossy() != "hunter2"
+            }),
+            "secret leaked into child environment"
+        );
         let dir = std::env::temp_dir().join(format!("mbt-env-{}", uuid_like()));
         std::fs::create_dir_all(&dir).unwrap();
         let tool = ShellExecTool::new(&dir).unwrap();
-        #[cfg(windows)]
-        let cmd = format!("echo %{key}%");
-        #[cfg(not(windows))]
-        let cmd = format!("echo ${key}");
-        let result = tool.run(json!({"cmd": cmd})).await.unwrap();
+        let result = tool.run(json!({"cmd": "echo hi"})).await.unwrap();
         assert!(result.ok);
         assert!(!result.output.contains("hunter2"));
         std::env::remove_var(key);
@@ -3678,7 +3806,10 @@ mod tests {
         let spec = ValidatePoCTool::new().spec();
         assert_eq!(spec.name, "validate_poc");
         assert_eq!(spec.risk, "network");
-        assert_eq!(spec.input_schema["required"], json!(["url"]));
+        assert_eq!(spec.input_schema["required"], json!(["finding_id", "url"]));
+        assert!(spec.input_schema["properties"]["finding_id"].is_object());
+        assert!(spec.input_schema["properties"]["headers"].is_object());
+        assert!(spec.input_schema["properties"]["body"].is_object());
         assert_eq!(
             spec.input_schema["properties"]["method"]["default"],
             json!("GET")
@@ -4086,6 +4217,276 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---- TC-1: shell allowlist / process environment -----------------------
+
+    #[test]
+    fn shell_allowlist_is_only_echo_and_whoami() {
+        for cmd in [
+            "git -c alias.x=!calc x",
+            "cargo build",
+            "cat C:\\Windows\\win.ini",
+            "ls -la",
+            "dir",
+            "pwd",
+            "echo hi > file",
+            "echo a=b",
+            "echo ..",
+        ] {
+            assert!(
+                validate_shell_command(cmd).is_err(),
+                "expected {cmd} to be rejected"
+            );
+        }
+        assert!(validate_shell_command("echo hi").is_ok());
+        assert!(validate_shell_command("whoami").is_ok());
+    }
+
+    #[tokio::test]
+    async fn shell_exec_allows_echo_and_whoami() {
+        let dir = std::env::temp_dir().join(format!("mbt-ok-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = ShellExecTool::new(&dir).unwrap();
+        let echo = tool.run(json!({"cmd": "echo hi"})).await.unwrap();
+        assert!(echo.ok);
+        assert!(echo.output.contains("hi"));
+        let who = tool.run(json!({"cmd": "whoami"})).await.unwrap();
+        assert!(who.ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn safe_process_env_excludes_home_and_userprofile() {
+        for (key, _) in safe_process_env() {
+            let key = key.to_string_lossy().to_ascii_uppercase();
+            assert!(
+                !matches!(key.as_str(), "HOME" | "USERPROFILE"),
+                "leaked {key} into child environment"
+            );
+        }
+    }
+
+    // ---- TC-5: capped streaming HTTP body ----------------------------------
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    async fn serve_once(body: String) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            let header_end = loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break raw.len();
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if let Some(pos) = find_subslice(&raw, b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&raw[..header_end]);
+            let content_length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            while raw.len() < header_end + content_length {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&raw).into_owned()
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    fn local_tool_options() -> ToolOptions {
+        ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            ..ToolOptions::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn http_body_is_capped_when_streamed() {
+        let (url, server) = serve_once("x".repeat(64 * 1024)).await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool.run(json!({"url": url})).await.unwrap();
+        let data = result.structured.unwrap();
+        assert_eq!(data["body_truncated"], json!(true));
+        let body_bytes = data["body_bytes"].as_u64().unwrap() as usize;
+        assert!(body_bytes <= MAX_HTTP_BODY_BYTES + MAX_HTTP_BODY_SLACK);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_small_body_is_not_truncated() {
+        let (url, server) = serve_once("hello".to_string()).await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool.run(json!({"url": url})).await.unwrap();
+        let data = result.structured.unwrap();
+        assert_eq!(data["body_truncated"], json!(false));
+        assert_eq!(data["body"], json!("hello"));
+        server.await.unwrap();
+    }
+
+    // ---- TC-6: redaction ----------------------------------------------------
+
+    #[test]
+    fn redact_covers_all_bearers_and_json_secrets() {
+        let out = redact("Authorization: Bearer first and Bearer second");
+        assert!(!out.contains("first"), "{out}");
+        assert!(!out.contains("second"), "{out}");
+        assert_eq!(out.matches("[REDACTED]").count(), 2);
+
+        let input = r#"{"api_key":"plaintext","nested":{"token":"abc123"},"note":"Bearer leakme"}"#;
+        let out = redact(input);
+        assert!(!out.contains("plaintext"), "{out}");
+        assert!(!out.contains("abc123"), "{out}");
+        assert!(!out.contains("leakme"), "{out}");
+    }
+
+    // ---- TC-7: external command scope / timeout / redaction -----------------
+
+    #[test]
+    fn external_scope_values_covers_all_placeholders() {
+        let template: Vec<String> = [
+            "-d", "{target}", "--host", "{host}", "-u", "{url}", "-w", "{word}",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let input = json!({
+            "target": "example.com",
+            "host": "ns.example.com",
+            "url": "https://example.com/a",
+            "word": "wordlist.txt"
+        });
+        assert_eq!(
+            external_scope_values(&template, &input),
+            vec![
+                "example.com",
+                "ns.example.com",
+                "https://example.com/a",
+                "wordlist.txt"
+            ]
+        );
+        // Empty values are skipped and a bare target is the fallback.
+        assert!(external_scope_values(&["{host}".to_string()], &json!({"host": ""})).is_empty());
+        assert_eq!(
+            external_scope_values(&["plain".to_string()], &json!({"target": "t.example.com"})),
+            vec!["t.example.com"]
+        );
+    }
+
+    #[tokio::test]
+    async fn external_command_checks_non_target_placeholders_against_scope() {
+        let dir = std::env::temp_dir().join(format!("mbt-url-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // "echo" never runs: the out-of-scope {url} value is rejected first.
+        let tool = ExternalCommandTool::new(
+            "scoped",
+            "scoped",
+            "echo",
+            vec!["{url}".to_string()],
+            "network",
+            &dir,
+        )
+        .with_scope(vec!["example.com".to_string()], Vec::new());
+        let err = tool
+            .run(json!({"url": "https://evil.org/"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("scope policy"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn external_command_kills_child_on_timeout() {
+        let dir = std::env::temp_dir().join(format!("mbt-kill-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(windows)]
+        let (program, args) = (
+            "ping",
+            vec!["-n".to_string(), "30".to_string(), "127.0.0.1".to_string()],
+        );
+        #[cfg(not(windows))]
+        let (program, args) = ("sleep", vec!["30".to_string()]);
+        let tool = ExternalCommandTool::new("slow", "slow", program, args, "safe", &dir)
+            .with_timeout(Duration::from_millis(200));
+        let start = Instant::now();
+        let err = tool.run(json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "kill-on-timeout took too long: {:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- TC-8: advisory PoC validation -------------------------------------
+
+    #[tokio::test]
+    async fn validate_poc_requires_finding_id() {
+        let tool = ValidatePoCTool::new();
+        let result = tool
+            .run(json!({"url": "http://example.com/"}))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["valid"], json!(false));
+        assert_eq!(data["error"], json!("finding_id required"));
+    }
+
+    #[tokio::test]
+    async fn validate_poc_replay_is_advisory_and_includes_headers_body() {
+        let (url, server) = serve_once("marker-here".to_string()).await;
+        let tool = ValidatePoCTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "finding_id": "f-1",
+                "url": url,
+                "method": "POST",
+                "headers": {"X-Test": "abc123"},
+                "body": "hello=world",
+                "expected_status": 200,
+                "marker": "marker-here"
+            }))
+            .await
+            .unwrap();
+        let data = result.structured.unwrap();
+        assert_eq!(data["advisory"], json!(true));
+        assert_eq!(data["finding_id"], json!("f-1"));
+        assert_eq!(data["valid"], json!(true));
+        let raw = server.await.unwrap().to_ascii_lowercase();
+        assert!(
+            raw.contains("x-test: abc123") || raw.contains("x-test:abc123"),
+            "{raw}"
+        );
+        assert!(raw.contains("hello=world"), "{raw}");
+    }
+
     fn uuid_like() -> String {
         format!(
             "{}",
@@ -4270,29 +4671,77 @@ fn redact_pii(out: &mut String) {
     apply_ranges(out, numeric);
 }
 
+/// Keys whose values are credentials and must never appear in tool output.
+const SENSITIVE_KEYS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "api-key",
+    "token",
+    "secret",
+    "client_secret",
+    "password",
+    "passwd",
+    "pwd",
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+];
+
+fn is_sensitive_key(key: &str) -> bool {
+    let k = key.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+    SENSITIVE_KEYS
+        .iter()
+        .any(|sensitive| k == *sensitive || k.contains(sensitive))
+}
+
+/// Redact credential values in structured JSON, including nested objects and
+/// arrays, so an LLM-supplied `api_key`/`token`/`secret` cannot leak verbatim.
+fn redact_json_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if is_sensitive_key(key) {
+                    *child = Value::String("[REDACTED]".into());
+                } else {
+                    redact_json_value(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Redact likely secrets from free text.
 pub fn redact(input: &str) -> String {
-    let mut out = input.to_string();
-    // Bearer tokens
-    if let Some(idx) = out.to_ascii_lowercase().find("bearer ") {
-        // redact rest of token-like chunk
-        let start = idx + "bearer ".len();
-        let end = out[start..]
-            .find(|c: char| c.is_whitespace())
-            .map(|n| start + n)
+    let mut out = if let Ok(mut value) = serde_json::from_str::<Value>(input) {
+        if value.is_object() || value.is_array() {
+            redact_json_value(&mut value);
+            value.to_string()
+        } else {
+            input.to_string()
+        }
+    } else {
+        input.to_string()
+    };
+    // Bearer tokens: replace every occurrence, not just the first one.
+    loop {
+        let Some(idx) = out.to_ascii_lowercase().find("bearer ") else {
+            break;
+        };
+        let end = out[idx + "bearer ".len()..]
+            .find(char::is_whitespace)
+            .map(|n| idx + "bearer ".len() + n)
             .unwrap_or(out.len());
-        out.replace_range(start..end, "[REDACTED]");
+        out.replace_range(idx..end, "[REDACTED]");
     }
     // key=value style secrets
-    for key in [
-        "api_key",
-        "apikey",
-        "token",
-        "secret",
-        "password",
-        "passwd",
-        "authorization",
-    ] {
+    for key in SENSITIVE_KEYS {
         let lower = out.to_ascii_lowercase();
         let mut search_from = 0;
         while let Some(pos) = lower[search_from..].find(key) {

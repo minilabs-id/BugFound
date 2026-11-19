@@ -97,6 +97,7 @@ fn build_runner(config: &AppConfig, cwd: &str, mode: Mode) -> Result<Runner> {
         max_network_calls: config.agent.max_network_calls,
         requests_per_minute: config.agent.requests_per_minute,
         auto_approve_tools: config.agent.auto_approve_tools.clone(),
+        auto_approve_all: config.agent.auto_approve_all,
         max_estimated_tokens: config.agent.max_estimated_tokens,
         cost_per_1k_input: config.llm.cost_per_1k_input,
         cost_per_1k_output: config.llm.cost_per_1k_output,

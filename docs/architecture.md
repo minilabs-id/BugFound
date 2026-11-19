@@ -93,7 +93,7 @@ hardening item wires one of them, add a feature → call site → test row in
 
 ## Implemented hardening
 
-Durable claims/leases and guarded transitions; atomic approval; persistent
+Durable claims/leases and guarded transitions; atomic approval resolution; persistent
 budgets; redaction at report, CLI and tool-output egress boundaries; deterministic
 PoC verifier;
 SHA-256 evidence; tamper-evident event chain (`verify-log`); shell allowlist with

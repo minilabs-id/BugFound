@@ -4,7 +4,8 @@
 //! `interrupt` a session to request cancellation. Wakeups coalesce so that a
 //! burst of prompts produces at most one pending wake per session.
 
-use std::collections::HashMap;
+use agentbug_store::Store;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Notify;
 
@@ -47,6 +48,12 @@ impl Default for RuntimeState {
 pub struct ExecutionCoordinator {
     inner: Arc<Mutex<HashMap<String, RuntimeState>>>,
     notify: Arc<Notify>,
+    /// Store used to persist cross-process stop flags. Registered by the
+    /// runner so `interrupt` is visible to runners in other processes.
+    stop_store: Arc<Mutex<Option<Store>>>,
+    /// Sessions whose stop flag has already been honored by a finished run.
+    /// A fresh `resume` clears this so a new stop request is observed again.
+    stop_acked: Arc<Mutex<HashSet<String>>>,
 }
 
 static GLOBAL: OnceLock<ExecutionCoordinator> = OnceLock::new();
@@ -62,7 +69,27 @@ impl ExecutionCoordinator {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
+            stop_store: Arc::new(Mutex::new(None)),
+            stop_acked: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Register the store whose `stop_requested` flag `interrupt` writes.
+    pub fn register_store(&self, store: Store) {
+        *self.stop_store.lock().unwrap() = Some(store);
+    }
+
+    /// Mark a session's stop flag as consumed. Called by the runner when it
+    /// finishes, so a later resume is not blocked by a stale flag.
+    pub fn ack_stop(&self, session_id: &str) {
+        self.stop_acked
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string());
+    }
+
+    pub fn is_stop_acked(&self, session_id: &str) -> bool {
+        self.stop_acked.lock().unwrap().contains(session_id)
     }
 
     /// The process-wide coordinator.
@@ -80,6 +107,8 @@ impl ExecutionCoordinator {
         state.cancel_requested = false;
         state.generation += 1;
         self.notify.notify_waiters();
+        // A fresh run starts with a clean stop-flag slate.
+        self.stop_acked.lock().unwrap().remove(session_id);
         !was_active
     }
 
@@ -107,6 +136,14 @@ impl ExecutionCoordinator {
     /// `is_cancelled` before its next step. Returns `true` if a live run was
     /// actually interrupted.
     pub fn interrupt(&self, session_id: &str) -> bool {
+        // Persist the stop request so runners in other processes observe it at
+        // their next step boundary, not just the local in-process cancel flag.
+        {
+            let guard = self.stop_store.lock().unwrap();
+            if let Some(store) = guard.as_ref() {
+                let _ = store.set_session_flag(session_id, crate::STOP_REQUESTED_FLAG);
+            }
+        }
         let mut inner = self.inner.lock().unwrap();
         let state = inner.entry(session_id.to_string()).or_default();
         let was_active = state.state.is_active();

@@ -20,6 +20,18 @@ pub mod execution;
 pub mod inbox;
 pub mod step;
 
+/// Durable per-session flag used to request an interrupt from any process.
+pub const STOP_REQUESTED_FLAG: &str = "stop_requested";
+
+/// Request that a running session stop at its next step boundary. The flag is
+/// durable, so a runner in another process observes it through the shared
+/// store (`has_session_flag`), not just the in-process coordinator.
+pub fn request_stop(store: &Store, session_id: &str) {
+    if let Err(e) = store.set_session_flag(session_id, STOP_REQUESTED_FLAG) {
+        warn!(error=%e, session=session_id, "failed to set stop flag");
+    }
+}
+
 // Re-export the wired core capabilities so other crates can use the documented
 // paths (e.g. `agentbug_core::ExecutionCoordinator::global()`).
 pub use compaction::CompactionV2;
@@ -33,6 +45,22 @@ const DEFAULT_LEASE_SECS: i64 = 120;
 const MAX_DUPLICATE_REPEATS: usize = 2;
 /// Window during which a 429/403 target stays on cooldown.
 const COOLDOWN_SECS: u64 = 30;
+
+/// Marker on a guard result that still needs a human approval. The runner
+/// parks; an explicit resume satisfies it.
+const GUARD_APPROVAL: &str = "approval:";
+/// Marker on a guard result that appeared *after* an approval was granted, so
+/// a resume must obtain a fresh one before executing.
+const GUARD_REAPPROVE: &str = "reapprove:";
+/// Marker on a hard policy/goal denial; the tool result reports `DENIED`.
+const GUARD_DENY: &str = "deny:";
+
+fn strip_guard_prefix(reason: &str) -> &str {
+    [GUARD_APPROVAL, GUARD_REAPPROVE, GUARD_DENY]
+        .into_iter()
+        .find_map(|prefix| reason.strip_prefix(prefix))
+        .unwrap_or(reason)
+}
 
 /// Digest binding a run to its original goal and scope. Any drift is a
 /// security event: a tool output must not silently redefine the engagement.
@@ -434,6 +462,7 @@ impl Runner {
         policy: PolicyEngine,
         agent: AgentConfig,
     ) -> Self {
+        execution::ExecutionCoordinator::global().register_store(store.clone());
         Self {
             store,
             llm,
@@ -507,6 +536,10 @@ impl Runner {
 
     /// Sweep stale running sessions in the store and emit audit events for them.
     pub fn recover_stale_sessions(&self) -> Result<Vec<String>> {
+        // A parked approval whose TTL elapsed must not block a resumed run.
+        if let Err(e) = self.store.expire_stale_approvals() {
+            warn!(error=%e, "failed to expire stale approvals");
+        }
         let ids = self.store.mark_stale_running_interrupted()?;
         for id in &ids {
             self.log_event(
@@ -594,9 +627,10 @@ impl Runner {
     }
 
     fn is_network_tool(spec: &agentbug_tools::ToolSpec) -> bool {
-        spec.risk == "network"
-            || spec.risk == "exec"
-            || spec.name.contains("http")
+        matches!(
+            spec.risk.as_str(),
+            "network" | "network-write" | "intrusive" | "exec"
+        ) || spec.name.contains("http")
             || spec.name.contains("dns")
             || spec.name.contains("scan")
             || spec.name.contains("probe")
@@ -632,6 +666,209 @@ impl Runner {
             ));
         }
         None
+    }
+
+    /// The durable stop flag is observable by every runner sharing the store.
+    /// Once a run has honored it, the coordinator ack keeps a later resume from
+    /// immediately re-aborting; `resume` clears that ack.
+    fn stop_requested(&self, session_id: &str) -> bool {
+        self.store
+            .has_session_flag(session_id, STOP_REQUESTED_FLAG)
+            .unwrap_or(false)
+            && !execution::ExecutionCoordinator::global().is_stop_acked(session_id)
+    }
+
+    /// Abort a run at a step boundary or immediately before a tool spawn.
+    fn check_stop(&self, session_id: &str) -> Result<()> {
+        if self.stop_requested(session_id) {
+            self.finish(
+                session_id,
+                "interrupted",
+                "warn",
+                "session.stopped",
+                "stop requested by operator",
+            );
+            return Err(anyhow!("aborted"));
+        }
+        Ok(())
+    }
+
+    /// Fail closed when a lock was expected but cannot be verified. A session
+    /// that already carries messages has an established goal, so a missing or
+    /// unreadable lock (or a drifted digest) is a violation.
+    fn goal_lock_violation(&self, session_id: &str) -> bool {
+        let has_messages = self
+            .store
+            .list_messages(session_id)
+            .map(|messages| !messages.is_empty())
+            .unwrap_or(true);
+        if !has_messages {
+            return false;
+        }
+        match (
+            self.store.get_session(session_id),
+            self.store.get_goal_lock(session_id),
+        ) {
+            (Ok(Some(session)), Ok(Some(lock))) => {
+                let expected = goal_digest(&session.goal, self.policy.scope_summary().as_deref());
+                lock != expected
+            }
+            _ => true,
+        }
+    }
+
+    /// Only explicitly listed, low-risk tools may be auto-approved. Dangerous
+    /// risks stay behind a human approval unless the operator opted out with
+    /// `auto_approve_all`.
+    fn auto_approve_allowed(&self, session_id: &str, spec: &agentbug_tools::ToolSpec) -> bool {
+        if !self
+            .agent
+            .auto_approve_tools
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&spec.name))
+        {
+            return false;
+        }
+        let dangerous = matches!(
+            spec.risk.as_str(),
+            "exec" | "intrusive" | "network-write" | "destructive"
+        );
+        if dangerous && !self.agent.auto_approve_all {
+            return false;
+        }
+        self.log_event(
+            session_id,
+            "info",
+            "approval.auto",
+            &format!(
+                "tool={} risk={} rule=auto_approve_tools",
+                spec.name, spec.risk
+            ),
+        );
+        true
+    }
+
+    /// The single guard chain shared by the initial run, an approval resume,
+    /// and deferred calls from the same batch. `Some(reason)` means the tool
+    /// must not run; the prefix tells the caller whether to park, deny, or
+    /// (for `GUARD_APPROVAL` on resume) treat the human approval as satisfying
+    /// the guard.
+    fn pre_execute_guards(
+        &self,
+        session_id: &str,
+        owner: &str,
+        spec: &agentbug_tools::ToolSpec,
+        args: &serde_json::Value,
+        target: Option<&str>,
+    ) -> Option<String> {
+        tracing::debug!(session=%session_id, owner=%owner, tool=%spec.name, "pre-execute guards");
+
+        if self.goal_lock_violation(session_id) {
+            self.log_event(
+                session_id,
+                "error",
+                "goal_lock.violation",
+                "session goal or scope changed after run start",
+            );
+            return Some(format!("{GUARD_DENY}goal/scope drift detected"));
+        }
+
+        let (mut decision, reason) = self.policy.evaluate(&ActionRequest {
+            tool: spec.name.clone(),
+            risk: spec.risk.clone(),
+            target: target.map(str::to_string),
+        });
+        if decision == Decision::Deny {
+            return Some(format!("{GUARD_DENY}{reason}"));
+        }
+
+        // Injection and target drift force a fresh approval in every mode
+        // unless the operator explicitly opted out. A listed safe tool can
+        // still be auto-approved, which clears the re-approval requirement.
+        let mut reapprove = None;
+        if !self.agent.auto_approve_all {
+            if self
+                .store
+                .has_session_flag(session_id, "injection_suspected")
+                .unwrap_or(false)
+            {
+                reapprove = Some("context flagged for suspected prompt injection");
+            } else if self.target_changed(session_id, target) {
+                reapprove = Some("target differs from previously approved targets");
+            }
+        }
+        if decision == Decision::Ask && self.auto_approve_allowed(session_id, spec) {
+            decision = Decision::Allow;
+            reapprove = None;
+        }
+
+        // Budget, cooldown and duplicate limits are checked for tools that are
+        // cleared to run now. For a tool that only asks, the run parks first;
+        // a resume re-runs this chain and then checks the budget itself.
+        if decision == Decision::Allow {
+            let signature = normalized_args_signature(&spec.name, args);
+            let seen = durable_duplicate_count(&self.store, session_id, &signature) + 1;
+            if seen > MAX_DUPLICATE_REPEATS {
+                return Some(format!(
+                    "duplicate tool call ignored ({seen} repeats): choose a different target or parameter"
+                ));
+            }
+            // Mirror the count durably so a fresh Runner sees the repeats.
+            let _ = self
+                .store
+                .set_session_flag(session_id, &format!("dup:{signature}:{seen}"));
+            if let Some(cooldown) = self.target_cooldown(session_id, target) {
+                return Some(cooldown);
+            }
+            if let Some(gate) = self.budget_gate(session_id, spec) {
+                return Some(gate);
+            }
+        }
+
+        if let Some(reason) = reapprove {
+            return Some(format!("{GUARD_REAPPROVE}{reason}"));
+        }
+        if decision == Decision::Ask {
+            return Some(format!("{GUARD_APPROVAL}{reason}"));
+        }
+        None
+    }
+
+    /// Emit the durable tool result and audit event for a guarded call that
+    /// must not run. Keeps the original (pre-extraction) message/event shapes.
+    fn report_blocked_call(
+        &self,
+        session_id: &str,
+        spec: &agentbug_tools::ToolSpec,
+        tool_call_id: Option<&str>,
+        block: &str,
+        deny_prefix: &str,
+    ) -> Result<()> {
+        let reason = strip_guard_prefix(block);
+        let (message, kind) = if let Some(raw) = block.strip_prefix(GUARD_DENY) {
+            (
+                format!("DENIED tool={} reason={deny_prefix}{raw}", spec.name),
+                "tool.denied",
+            )
+        } else if reason.contains("duplicate tool call") {
+            (format!("ok=false error={reason}"), "tool.duplicate_skipped")
+        } else if reason.contains("cooldown") {
+            (format!("ok=false error={reason}"), "target.cooldown_hit")
+        } else if reason.starts_with("BUDGET") || reason.starts_with("RATE_LIMITED") {
+            (format!("ok=false error={reason}"), "budget.exceeded")
+        } else {
+            (format!("ok=false error={reason}"), "tool.denied")
+        };
+        self.store.add_message_full(
+            session_id,
+            "tool",
+            &message,
+            tool_call_id,
+            None,
+            Some(&spec.name),
+        )?;
+        self.log_event(session_id, "warn", kind, &message);
+        Ok(())
     }
 
     /// Account for a tool that actually ran, in the same durable store the
@@ -822,6 +1059,7 @@ impl Runner {
         // The cancellation has been honored by parking/ending this run; do not
         // leave a stale flag behind for a later resume.
         coordinator.clear_cancel(session_id);
+        coordinator.ack_stop(session_id);
         match self.store.transition_state(
             session_id,
             &["running", "waiting_approval", "interrupted"],
@@ -1124,36 +1362,18 @@ impl Runner {
         let spec = tool.spec();
         let args: serde_json::Value =
             serde_json::from_str(&call.args_json).unwrap_or_else(|_| serde_json::json!({}));
-        let (decision, reason) = self.policy.evaluate(&ActionRequest {
-            tool: spec.name.clone(),
-            risk: spec.risk.clone(),
-            target: extract_policy_target(&args),
-        });
-        if decision != Decision::Allow {
-            let msg = format!("DENIED tool={} reason={}", spec.name, reason);
-            self.store.add_message_full(
-                session_id,
-                "tool",
-                &msg,
-                call.tool_call_id.as_deref(),
-                None,
-                Some(&spec.name),
-            )?;
-            self.log_event(session_id, "warn", "tool.denied", &msg);
+        let target = extract_policy_target(&args);
+        // Re-run the full guard chain: approval of an earlier call in the
+        // batch must not bypass goal-lock, injection, target, cooldown, budget
+        // or policy checks. A plain policy `Ask` is satisfied by the human
+        // approval; every other guard still blocks the deferred call.
+        let block =
+            self.pre_execute_guards(session_id, &self.owner_id, &spec, &args, target.as_deref());
+        if let Some(block) = block.as_deref().filter(|b| !b.starts_with(GUARD_APPROVAL)) {
+            self.report_blocked_call(session_id, &spec, call.tool_call_id.as_deref(), block, "")?;
             return Ok(());
         }
-        if let Some(gate) = self.budget_gate(session_id, &spec) {
-            self.store.add_message_full(
-                session_id,
-                "tool",
-                &format!("ok=false error={gate}"),
-                call.tool_call_id.as_deref(),
-                None,
-                Some(&spec.name),
-            )?;
-            self.log_event(session_id, "warn", "budget.exceeded", &gate);
-            return Ok(());
-        }
+        self.check_stop(session_id)?;
         match tool.run(args.clone()).await {
             Ok(result) => {
                 self.record_call(session_id, &spec);
@@ -1223,36 +1443,40 @@ impl Runner {
             .or_else(|| self.pending_tool_call_id(session_id, &approval.tool_name));
 
         if approved {
-            // Re-evaluate policy with current config/scope before executing.
-            let (verdict, reason) = self.policy.evaluate(&ActionRequest {
-                tool: spec.name.clone(),
-                risk: spec.risk.clone(),
-                target: extract_policy_target(&args),
-            });
-            // `Ask` is satisfied by the human approval; only a hardened
-            // `Deny` (e.g. scope changed while parked) must block execution.
-            if verdict == Decision::Deny {
-                let msg = format!("DENIED tool={} reason=policy changed: {reason}", spec.name);
-                self.store.add_message_full(
-                    session_id,
-                    "tool",
-                    &msg,
-                    tool_call_id.as_deref(),
-                    None,
-                    Some(&spec.name),
-                )?;
-                self.log_event(session_id, "warn", "tool.denied", &msg);
-            } else if let Some(gate) = self.budget_gate(session_id, &spec) {
-                self.store.add_message_full(
-                    session_id,
-                    "tool",
-                    &format!("ok=false error={gate}"),
-                    tool_call_id.as_deref(),
-                    None,
-                    Some(&spec.name),
-                )?;
-                self.log_event(session_id, "warn", "budget.exceeded", &gate);
+            let target = extract_policy_target(&args);
+            // Re-run the guard chain with current config/scope. A plain policy
+            // `Ask` is satisfied by the human approval; every other guard —
+            // goal drift, injection, target change, budget, cooldown, duplicate
+            // and a hardened `Deny` — still blocks execution after parking.
+            let block = self.pre_execute_guards(
+                session_id,
+                &self.owner_id,
+                &spec,
+                &args,
+                target.as_deref(),
+            );
+            // A human approval satisfies a plain policy `Ask`, but the budget
+            // still applies after parking. Any other guard (goal drift,
+            // injection, target change, duplicate, cooldown, policy Deny)
+            // blocks the approved call outright.
+            let block = if block
+                .as_deref()
+                .is_some_and(|b| b.starts_with(GUARD_APPROVAL))
+            {
+                self.budget_gate(session_id, &spec)
             } else {
+                block
+            };
+            if let Some(block) = block.as_deref() {
+                self.report_blocked_call(
+                    session_id,
+                    &spec,
+                    tool_call_id.as_deref(),
+                    block,
+                    "policy changed: ",
+                )?;
+            } else {
+                self.check_stop(session_id)?;
                 self.log_event(
                     session_id,
                     "info",
@@ -1345,7 +1569,6 @@ impl Runner {
     async fn run_loop(&self, session_id: &str, model: &str) -> Result<String> {
         self.store.ensure_budget(session_id)?;
         let mut step = self.store.budget_usage(session_id)?.steps_used;
-        let mut duplicate_calls: HashMap<String, usize> = HashMap::new();
         let mut last_evidence = self.evidence_count(session_id);
         let mut stalled_steps = 0usize;
         while step < self.effective_max_steps() {
@@ -1381,6 +1604,8 @@ impl Runner {
                 );
                 return Err(anyhow!("interrupted"));
             }
+            // Durable cross-process stop request: check at every step boundary.
+            self.check_stop(session_id)?;
             self.store.record_step(session_id)?;
             step += 1;
             self.renew_claim(session_id);
@@ -1521,138 +1746,24 @@ impl Runner {
                     };
                     let spec = tool.spec();
                     let target = extract_policy_target(&tc.arguments);
-                    let (decision, reason) = self.policy.evaluate(&ActionRequest {
-                        tool: spec.name.clone(),
-                        risk: spec.risk.clone(),
-                        target: target.clone(),
-                    });
-                    let mut decision = decision;
-                    let mut reason = reason;
-                    if let (Ok(Some(lock)), Ok(Some(session))) = (
-                        self.store.get_goal_lock(session_id),
-                        self.store.get_session(session_id),
-                    ) {
-                        let expected =
-                            goal_digest(&session.goal, self.policy.scope_summary().as_deref());
-                        if lock != expected {
-                            self.log_event(
-                                session_id,
-                                "error",
-                                "goal_lock.violation",
-                                "session goal or scope changed after run start",
-                            );
-                            decision = Decision::Deny;
-                            reason = "goal/scope drift detected".to_string();
-                        }
-                    }
-                    if decision == Decision::Allow
-                        && !self.agent.auto_approve_all
-                        && self
-                            .store
-                            .has_session_flag(session_id, "injection_suspected")
-                            .unwrap_or(false)
-                    {
-                        decision = Decision::Ask;
-                        reason = "context flagged for suspected prompt injection".to_string();
-                    }
-                    // Target changes and injection flags force a fresh approval
-                    // in every mode, including FullAuto. `auto_approve_all` is
-                    // the explicit operator opt-out for pre-approved actions.
-                    let (decision, reason) = if decision == Decision::Allow
-                        && !self.agent.auto_approve_all
-                        && self.target_changed(session_id, target.as_deref())
-                    {
-                        (
-                            Decision::Ask,
-                            "target differs from previously approved targets".to_string(),
-                        )
-                    } else if decision == Decision::Ask
-                        && self
-                            .agent
-                            .auto_approve_tools
-                            .iter()
-                            .any(|name| name.eq_ignore_ascii_case(&spec.name))
-                    {
-                        self.log_event(
-                            session_id,
-                            "info",
-                            "approval.auto",
-                            &format!(
-                                "tool={} risk={} rule=auto_approve_tools",
-                                spec.name, spec.risk
-                            ),
-                        );
-                        (Decision::Allow, "auto-approved safe tool".to_string())
-                    } else {
-                        (decision, reason)
-                    };
-                    match decision {
-                        Decision::Allow => {
+                    // One guard chain for every tool call, shared with resume
+                    // and deferred calls so parking cannot bypass it.
+                    let block = self.pre_execute_guards(
+                        session_id,
+                        &self.owner_id,
+                        &spec,
+                        &tc.arguments,
+                        target.as_deref(),
+                    );
+                    match block {
+                        None => {
+                            self.check_stop(session_id)?;
                             self.log_event(
                                 session_id,
                                 "info",
                                 "tool.allowed",
-                                &format!("tool={} risk={} reason={}", spec.name, spec.risk, reason),
+                                &format!("tool={} risk={} reason=allowed", spec.name, spec.risk),
                             );
-                            let signature = normalized_args_signature(&spec.name, &tc.arguments);
-                            let seen =
-                                duplicate_calls.entry(signature.clone()).or_insert_with(|| {
-                                    durable_duplicate_count(&self.store, session_id, &signature)
-                                });
-                            *seen += 1;
-                            if *seen > MAX_DUPLICATE_REPEATS {
-                                let msg = format!(
-                                    "ok=false error=duplicate tool call ignored ({} repeats): choose a different target or parameter",
-                                    *seen
-                                );
-                                self.store.add_message_full(
-                                    session_id,
-                                    "tool",
-                                    &msg,
-                                    Some(&tc.id),
-                                    None,
-                                    Some(&spec.name),
-                                )?;
-                                self.log_event(session_id, "warn", "tool.duplicate_skipped", &msg);
-                                continue;
-                            }
-                            // Mirror the normalized signature count so a fresh
-                            // Runner with the same store still sees repeats.
-                            let _ = self.store.set_session_flag(
-                                session_id,
-                                &format!("dup:{signature}:{}", *seen),
-                            );
-                            if let Some(cooldown) =
-                                self.target_cooldown(session_id, target.as_deref())
-                            {
-                                self.store.add_message_full(
-                                    session_id,
-                                    "tool",
-                                    &format!("ok=false error={cooldown}"),
-                                    Some(&tc.id),
-                                    None,
-                                    Some(&spec.name),
-                                )?;
-                                self.log_event(
-                                    session_id,
-                                    "warn",
-                                    "target.cooldown_hit",
-                                    &cooldown,
-                                );
-                                continue;
-                            }
-                            if let Some(gate) = self.budget_gate(session_id, &spec) {
-                                self.store.add_message_full(
-                                    session_id,
-                                    "tool",
-                                    &format!("ok=false error={gate}"),
-                                    Some(&tc.id),
-                                    None,
-                                    Some(&spec.name),
-                                )?;
-                                self.log_event(session_id, "warn", "budget.exceeded", &gate);
-                                continue;
-                            }
                             let result = tool.run(tc.arguments.clone()).await;
                             match result {
                                 Ok(r) => {
@@ -1705,7 +1816,11 @@ impl Runner {
                                 }
                             }
                         }
-                        Decision::Ask => {
+                        Some(block)
+                            if block.starts_with(GUARD_APPROVAL)
+                                || block.starts_with(GUARD_REAPPROVE) =>
+                        {
+                            let reason = strip_guard_prefix(&block).to_string();
                             let args_str = serde_json::to_string(&tc.arguments)
                                 .unwrap_or_else(|_| "{}".to_string());
                             let approval: Approval = self.store.create_approval(
@@ -1757,22 +1872,10 @@ impl Runner {
                             ));
                             // continue loop to emit deferred results for any remaining tool calls
                         }
-                        Decision::Deny => {
-                            let msg = format!("DENIED tool={} reason={}", spec.name, reason);
-                            self.store.add_message_full(
-                                session_id,
-                                "tool",
-                                &msg,
-                                Some(&tc.id),
-                                None,
-                                Some(&spec.name),
-                            )?;
-                            self.log_event(
-                                session_id,
-                                "warn",
-                                "tool.denied",
-                                &format!("tool={} reason={}", spec.name, reason),
-                            );
+                        Some(block) => {
+                            // Hard block (goal drift, duplicate, cooldown,
+                            // budget or policy deny): no approval is offered.
+                            self.report_blocked_call(session_id, &spec, Some(&tc.id), &block, "")?;
                         }
                     }
                 }
@@ -1832,13 +1935,6 @@ pub fn extract_target(input: &serde_json::Value) -> Option<String> {
         "ip",
         "endpoint",
         "asset",
-        "value",
-        "name",
-        "path",
-        "query",
-        "uri",
-        "site",
-        "address",
         "fqdn",
         "subdomain",
     ];

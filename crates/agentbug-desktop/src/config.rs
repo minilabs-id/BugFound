@@ -36,10 +36,6 @@ pub struct AgentCfg {
     pub requests_per_minute: u64,
     pub auto_approve_tools: Vec<String>,
     pub max_estimated_tokens: u64,
-    /// Explicit opt-in to network-write tools during an engagement.
-    pub allow_network_write: bool,
-    /// Explicit opt-in to intrusive/fuzzing tools during an engagement.
-    pub allow_intrusive: bool,
     /// Escape hatch: skip every approval prompt. Default off.
     pub auto_approve_all: bool,
 }
@@ -56,6 +52,10 @@ pub struct NetworkCfg {
     pub allow_proxy: bool,
     pub proxy_url: Option<String>,
     pub trusted_local_targets: Vec<String>,
+    /// Opt in to network-write tools during an engagement. Default off.
+    pub allow_network_write: bool,
+    /// Opt in to intrusive/fuzzing tools during an engagement. Default off.
+    pub allow_intrusive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,8 +90,6 @@ impl Default for AgentCfg {
             requests_per_minute: 60,
             auto_approve_tools: vec!["echo".into()],
             max_estimated_tokens: 0,
-            allow_network_write: false,
-            allow_intrusive: false,
             auto_approve_all: false,
         }
     }
@@ -201,7 +199,37 @@ mod tests {
         assert_eq!(cfg.llm.timeout_ms, 60_000);
         assert_eq!(cfg.storage.path, ".agentbug/agentbug.db");
         assert!(!cfg.network.allow_proxy);
+        assert!(!cfg.network.allow_network_write);
+        assert!(!cfg.network.allow_intrusive);
+        assert!(!cfg.agent.auto_approve_all);
         assert!(cfg.external_tools.auto_detect);
+    }
+
+    #[test]
+    fn engagement_opt_ins_share_the_cli_config_layout() {
+        // Same `[network]` / `[agent]` keys the CLI FileConfig accepts.
+        const TEXT: &str = r#"
+[llm]
+api_key = "test-key"
+
+[agent]
+mode = "full_auto"
+auto_approve_all = true
+
+[network]
+allow_network_write = true
+allow_intrusive = true
+"#;
+        let cfg: AppConfig = toml::from_str(TEXT).expect("parse config");
+        cfg.validate().expect("validate config");
+        assert!(cfg.network.allow_network_write);
+        assert!(cfg.network.allow_intrusive);
+        assert!(cfg.agent.auto_approve_all);
+        let saved = toml::to_string_pretty(&cfg).expect("serialize config");
+        let reloaded: AppConfig = toml::from_str(&saved).expect("reparse config");
+        assert!(reloaded.network.allow_network_write);
+        assert!(reloaded.network.allow_intrusive);
+        assert!(reloaded.agent.auto_approve_all);
     }
 
     #[test]

@@ -304,7 +304,16 @@ fn interrupt_engagement_sessions(db: &Path, engagement_id: &str) {
     };
     let marker = format!("engagement_id={engagement_id}");
     for session in sessions {
-        if session.state == "running" && session.goal.contains(&marker) {
+        if !session.goal.contains(&marker) {
+            continue;
+        }
+        // TC-3: persist a stop flag for every runner session of this
+        // engagement. A runner in another process observes it at its next step
+        // boundary (and immediately before spawning a tool), so a pause/abort
+        // issued by the CLI/desktop takes effect within one step. The in-process
+        // coordinator interrupt remains as the fast path for a local runner.
+        agentbug_core::request_stop(&store, &session.id);
+        if session.state == "running" {
             agentbug_core::ExecutionCoordinator::global().interrupt(&session.id);
         }
     }
@@ -832,17 +841,36 @@ async fn run_engagement(
         }
 
         let tools = build_tools(workspace, &profile, &roe, &options)?;
+        // TC-4: make the fail-closed method gate observable in the replay log
+        // and the event stream so an auditor can see why generic HTTP is gone.
+        if !roe.allow_state_change {
+            emit(
+                tx,
+                Some(replay),
+                EngagementEvent::Action {
+                    tool: "tool_registry".into(),
+                    target: None,
+                    ok: true,
+                    detail: "ROE forbids state changes: http_request withheld; read-only http_probe and dns_lookup retained".into(),
+                },
+            );
+        }
         // H-01: only safe/read tools are auto-approved by default. Network-write
         // and intrusive tools require an explicit operator opt-in, and blanket
         // auto-approval is a separate explicit escape hatch.
         let auto_approve_tools = auto_approvable_tools(&tools, &options);
-        let agent = agent_config(&options, &scope_reminder, auto_approve_tools);
+        let agent = agent_config(&options, &scope_reminder, auto_approve_tools, &roe);
+        // TC-4: FullAuto no longer implicitly trusts intrusive/network-write
+        // tools. Every such tool is denied by name unless the operator opted in.
+        let denied_tools = default_denied_tools(&tools, &options);
         let policy = build_policy_config(PolicyConfig {
             mode: options.mode,
             deny_destructive: true,
             scope: profile.scope.clone(),
+            denied_tools,
             budgets: BudgetConfig {
                 requests_per_minute: options.requests_per_minute,
+                max_network_calls: agent.max_network_calls,
                 ..BudgetConfig::default()
             },
             ..PolicyConfig::default()
@@ -1612,10 +1640,24 @@ fn agent_config(
     options: &EngagementOptions,
     scope_reminder: &str,
     auto_approve_tools: Vec<String>,
+    roe: &RoePolicy,
 ) -> AgentConfig {
+    // TC-4: the brief's request ceiling is a hard cap. An operator may lower it
+    // but never raise the runner's network budget above what the ROE allows.
+    let max_network_calls = match roe.max_requests {
+        Some(ceiling) if ceiling > 0 => {
+            let ceiling = ceiling as usize;
+            if options.max_network_calls == 0 {
+                ceiling
+            } else {
+                options.max_network_calls.min(ceiling)
+            }
+        }
+        _ => options.max_network_calls,
+    };
     let budgets = BudgetConfig {
         max_tool_calls: options.max_tool_calls,
-        max_network_calls: options.max_network_calls,
+        max_network_calls,
         requests_per_minute: options.requests_per_minute,
         max_steps: options.max_steps,
         max_tokens: options.max_estimated_tokens,
@@ -1635,13 +1677,32 @@ fn agent_config(
         rate_limits: budgets.clone(),
         rate_limit: budgets,
         max_tool_calls: options.max_tool_calls,
-        max_network_calls: options.max_network_calls,
+        max_network_calls,
         requests_per_minute: options.requests_per_minute,
         max_estimated_tokens: options.max_estimated_tokens,
         auto_approve_tools,
         auto_approve_all: options.auto_approve_all,
         ..AgentConfig::default()
     }
+}
+
+/// FullAuto must not implicitly trust tools whose risk needs an explicit
+/// operator opt-in. Everything with an `intrusive` or `network-write` risk is
+/// denied by name until the matching flag is enabled (TC-4).
+fn default_denied_tools(
+    tools: &agentbug_tools::ToolRegistry,
+    options: &EngagementOptions,
+) -> Vec<String> {
+    tools
+        .specs()
+        .into_iter()
+        .filter(|spec| match spec.risk.as_str() {
+            "intrusive" => !options.allow_intrusive,
+            "network-write" => !options.allow_network_write,
+            _ => false,
+        })
+        .map(|spec| spec.name)
+        .collect()
 }
 
 /// Only safe/read tools are auto-approved by default. Network-write and
@@ -2183,18 +2244,33 @@ fn build_tools(
         ..Default::default()
     };
     let registry = try_default_registry_with_options(workspace, tool_options)?;
-    if roe.allow_fuzzing && options.allow_intrusive {
-        return Ok(registry);
-    }
-    // Fail-closed tool surface: never register fuzzing or destructive adapters
-    // when the brief or the operator did not authorise them.
+    // Fail-closed tool surface: the registry is the enforcement boundary, so a
+    // tool that is not authorised must not be present at all (TC-4).
     let mut filtered = agentbug_tools::ToolRegistry::new();
     for spec in registry.specs() {
         let name = spec.name.to_ascii_lowercase();
-        if !roe.allow_fuzzing && name.contains("fuzz") {
+        let risk = spec.risk.as_str();
+        // Fuzzing needs both the brief's authorisation and the operator opt-in.
+        if name.contains("fuzz") && !(roe.allow_fuzzing && options.allow_intrusive) {
             continue;
         }
-        if !options.allow_intrusive && spec.risk == "destructive" {
+        // The generic HTTP tool can issue arbitrary state-changing methods.
+        // `ToolOptions` has no `allowed_methods` gate, so a no-state-change ROE
+        // fails closed by withholding `http_request` entirely; the read-only
+        // `http_probe` and `dns_lookup` tools stay available. Callers document
+        // this decision with an Action event.
+        if !roe.allow_state_change && name == "http_request" {
+            continue;
+        }
+        // `deny_destructive` is unconditional in the policy, so destructive
+        // tools never enter the registry either.
+        if risk == "destructive" {
+            continue;
+        }
+        if !options.allow_intrusive && risk == "intrusive" {
+            continue;
+        }
+        if !options.allow_network_write && risk == "network-write" {
             continue;
         }
         if let Some(tool) = registry.get(&spec.name) {
@@ -2272,7 +2348,12 @@ No DoS testing. Do not modify data. No disclosure.
             allow_intrusive: false,
             auto_approve_all: false,
         };
-        let config = agent_config(&options, "in_scope=example.com", vec!["echo".into()]);
+        let config = agent_config(
+            &options,
+            "in_scope=example.com",
+            vec!["echo".into()],
+            &RoePolicy::default(),
+        );
         assert_eq!(config.mode, Mode::Ask);
         assert_eq!(config.max_steps, 7);
         assert_eq!(config.max_tool_calls, 3);
@@ -2314,6 +2395,181 @@ No DoS testing. Do not modify data. No disclosure.
             .specs()
             .iter()
             .any(|spec| spec.name.to_ascii_lowercase().contains("fuzz")));
+    }
+
+    #[test]
+    fn roe_request_cap_limits_network_budget() {
+        let options = EngagementOptions {
+            max_network_calls: 100,
+            ..EngagementOptions::default()
+        };
+        let roe = RoePolicy {
+            max_requests: Some(7),
+            ..RoePolicy::default()
+        };
+        let config = agent_config(&options, "in_scope=example.com", vec![], &roe);
+        assert_eq!(config.max_network_calls, 7);
+        assert_eq!(config.budgets.max_network_calls, 7);
+        assert_eq!(config.rate_limits.max_network_calls, 7);
+
+        // A stricter operator limit wins over the brief ceiling.
+        let strict = EngagementOptions {
+            max_network_calls: 3,
+            ..EngagementOptions::default()
+        };
+        assert_eq!(
+            agent_config(&strict, "in_scope=example.com", vec![], &roe).max_network_calls,
+            3
+        );
+        // No ROE ceiling keeps the operator value.
+        assert_eq!(
+            agent_config(
+                &options,
+                "in_scope=example.com",
+                vec![],
+                &RoePolicy::default()
+            )
+            .max_network_calls,
+            100
+        );
+    }
+
+    #[test]
+    fn no_state_change_brief_removes_generic_http_tool() {
+        let brief = "In scope:\n- example.com\nRules:\nNo state change. Read-only testing only.\n";
+        let roe = parse_roe(brief);
+        assert!(!roe.allow_state_change);
+        let profile = extract_profile_from_text(brief, "https://example.com/security");
+        let workspace =
+            std::env::temp_dir().join(format!("agentbug-roe-methods-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&workspace);
+        let registry = build_tools(&workspace, &profile, &roe, &EngagementOptions::default())
+            .expect("build tools");
+        assert!(
+            registry.get("http_request").is_none(),
+            "generic http_request must be withheld when state changes are forbidden"
+        );
+        assert!(registry.get("http_probe").is_some());
+        assert!(registry.get("dns_lookup").is_some());
+
+        // An explicit state-change authorisation keeps the tool.
+        let permissive = RoePolicy {
+            allow_state_change: true,
+            ..roe
+        };
+        let registry = build_tools(
+            &workspace,
+            &profile,
+            &permissive,
+            &EngagementOptions::default(),
+        )
+        .expect("build tools");
+        assert!(registry.get("http_request").is_some());
+    }
+
+    #[test]
+    fn intrusive_and_network_write_tools_require_opt_in() {
+        let profile = extract_profile_from_text(
+            "In scope:\n- example.com\nRead-only testing only.\n",
+            "https://example.com/security",
+        );
+        let roe = parse_roe(&profile.scope.in_scope.join("\n"));
+        let workspace =
+            std::env::temp_dir().join(format!("agentbug-roe-risk-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&workspace);
+        let default = build_tools(&workspace, &profile, &roe, &EngagementOptions::default())
+            .expect("build tools");
+        for name in ["http_fuzz", "port_scan", "vuln_scan"] {
+            assert!(
+                default.get(name).is_none(),
+                "{name} should be absent by default"
+            );
+        }
+        let allowed = build_tools(
+            &workspace,
+            &profile,
+            &RoePolicy {
+                allow_fuzzing: true,
+                ..roe.clone()
+            },
+            &EngagementOptions {
+                allow_intrusive: true,
+                allow_network_write: true,
+                ..EngagementOptions::default()
+            },
+        )
+        .expect("build tools");
+        assert!(allowed.get("http_fuzz").is_some());
+        assert!(allowed.get("port_scan").is_some());
+        assert!(allowed.get("vuln_scan").is_some());
+    }
+
+    #[test]
+    fn full_auto_denies_intrusive_and_network_write_by_default() {
+        let workspace =
+            std::env::temp_dir().join(format!("agentbug-roe-denied-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&workspace);
+        // Use the raw registry: the deny list is a second line of defence for
+        // any privileged tool that survives the registry filter.
+        let raw = try_default_registry_with_options(
+            &workspace,
+            ToolOptions {
+                enable_external_tools: true,
+                ..ToolOptions::default()
+            },
+        )
+        .expect("build raw tools");
+        let denied = default_denied_tools(&raw, &EngagementOptions::default());
+        for name in ["http_fuzz", "port_scan", "vuln_scan"] {
+            assert!(
+                denied.iter().any(|n| n == name),
+                "{name} should be denied by default"
+            );
+        }
+
+        let opt_in = EngagementOptions {
+            allow_intrusive: true,
+            allow_network_write: true,
+            ..EngagementOptions::default()
+        };
+        assert!(default_denied_tools(&raw, &opt_in).is_empty());
+    }
+
+    #[test]
+    fn pause_and_abort_request_stop_for_runner_sessions() {
+        let db = temp_db("request-stop");
+        let store = Store::open(&db).unwrap();
+        let engagement = store
+            .create_engagement("https://example.com/program")
+            .unwrap();
+        let marker = format!("engagement_id={}", engagement.id);
+        let session = store
+            .create_session(&format!("{marker}\nprobe example.com"))
+            .unwrap();
+        store.set_session_state(&session.id, "running").unwrap();
+        let other = store.create_session("unrelated goal").unwrap();
+        store.set_session_state(&other.id, "running").unwrap();
+
+        pause_at(&db, &engagement.id).unwrap();
+        assert!(
+            store
+                .has_session_flag(&session.id, agentbug_core::STOP_REQUESTED_FLAG)
+                .unwrap(),
+            "pause must set the durable stop flag on engagement runner sessions"
+        );
+        assert!(!store
+            .has_session_flag(&other.id, agentbug_core::STOP_REQUESTED_FLAG)
+            .unwrap());
+
+        // A fresh session for the same engagement observes an abort as well.
+        let second = store
+            .create_session(&format!("{marker}\nsecond task"))
+            .unwrap();
+        store.set_session_state(&second.id, "running").unwrap();
+        abort_at(&db, &engagement.id).unwrap();
+        assert!(store
+            .has_session_flag(&second.id, agentbug_core::STOP_REQUESTED_FLAG)
+            .unwrap());
     }
 
     #[test]

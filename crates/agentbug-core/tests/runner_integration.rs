@@ -1,7 +1,7 @@
 use agentbug_core::inbox::{Delivery, Inbox, InboxKind};
 use agentbug_core::{
-    build_policy, build_policy_config, normalized_args_signature, record_provider_usage,
-    AgentConfig, Runner,
+    build_policy, build_policy_config, extract_policy_target, normalized_args_signature,
+    record_provider_usage, request_stop, AgentConfig, Runner,
 };
 use agentbug_llm::{ChatMessage, ChatResponse, Llm, ToolCall, ToolSpec as LlmToolSpec};
 use agentbug_policy::Mode;
@@ -66,6 +66,53 @@ impl Tool for MockExecTool {
         Ok(ToolResult {
             ok: true,
             output: format!("ran:{cmd}"),
+            structured: None,
+        })
+    }
+}
+
+/// A low-risk tool whose name still requires approval in `Ask` mode, so the
+/// `auto_approve_tools` branch can be exercised without a dangerous risk.
+struct MockSafeShell;
+
+#[async_trait]
+impl Tool for MockSafeShell {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "shell_exec".into(),
+            description: "Safe command echo for approval tests".into(),
+            input_schema: json!({"type":"object","properties":{"cmd":{"type":"string"}}}),
+            risk: "safe".into(),
+        }
+    }
+
+    async fn run(&self, args: Value) -> Result<ToolResult> {
+        let cmd = args.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+        Ok(ToolResult {
+            ok: true,
+            output: format!("safe:{cmd}"),
+            structured: None,
+        })
+    }
+}
+
+struct MockIntrusiveTool;
+
+#[async_trait]
+impl Tool for MockIntrusiveTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "intrusive_probe".into(),
+            description: "Intrusive network-capable tool".into(),
+            input_schema: json!({"type":"object"}),
+            risk: "intrusive".into(),
+        }
+    }
+
+    async fn run(&self, _args: Value) -> Result<ToolResult> {
+        Ok(ToolResult {
+            ok: true,
+            output: "intrusive ran".into(),
             structured: None,
         })
     }
@@ -853,6 +900,8 @@ impl Tool for TargetNetTool {
 #[tokio::test]
 async fn configured_auto_approve_tool_runs_without_parking() {
     let store = Store::open(":memory:").unwrap();
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(MockSafeShell));
     let llm = Arc::new(MockLlm::new(
         "mock-model",
         vec![
@@ -860,7 +909,7 @@ async fn configured_auto_approve_tool_runs_without_parking() {
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: "c1".into(),
-                    name: "mock_exec".into(),
+                    name: "shell_exec".into(),
                     arguments: json!({"cmd":"echo hi"}),
                 }],
                 model: "mock-model".into(),
@@ -875,12 +924,12 @@ async fn configured_auto_approve_tool_runs_without_parking() {
     let runner = Runner::new(
         store.clone(),
         llm,
-        base_tools_with_mock_exec(),
+        tools,
         build_policy(Mode::Ask),
         AgentConfig {
             mode: Mode::Ask,
             max_steps: 5,
-            auto_approve_tools: vec!["mock_exec".into()],
+            auto_approve_tools: vec!["shell_exec".into()],
             ..Default::default()
         },
     );
@@ -891,9 +940,46 @@ async fn configured_auto_approve_tool_runs_without_parking() {
     let session = store.list_sessions(10).unwrap().remove(0);
     assert_eq!(session.state, "completed");
     let msgs = store.list_messages(&session.id).unwrap();
-    assert!(msgs.iter().any(|m| m.content.contains("ran:echo hi")));
+    assert!(msgs.iter().any(|m| m.content.contains("safe:echo hi")));
     let events = store.list_events(&session.id, 100).unwrap();
     assert!(events.iter().any(|e| e.kind == "approval.auto"));
+}
+
+#[tokio::test]
+async fn auto_approve_tools_refuses_dangerous_risks() {
+    let store = Store::open(":memory:").unwrap();
+    let llm = Arc::new(MockLlm::new(
+        "mock-model",
+        vec![ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "mock_exec".into(),
+                arguments: json!({"cmd":"echo hi"}),
+            }],
+            model: "mock-model".into(),
+        }],
+    ));
+    let runner = Runner::new(
+        store.clone(),
+        llm,
+        base_tools_with_mock_exec(),
+        build_policy(Mode::Ask),
+        AgentConfig {
+            mode: Mode::Ask,
+            max_steps: 5,
+            auto_approve_tools: vec!["mock_exec".into()],
+            ..Default::default()
+        },
+    );
+    let out = runner.run_goal("dangerous auto approve").await.unwrap();
+    assert!(out.contains("waiting approval"));
+    let session = store.list_sessions(10).unwrap().remove(0);
+    assert_eq!(session.state, "waiting_approval");
+    let msgs = store.list_messages(&session.id).unwrap();
+    assert!(!msgs.iter().any(|m| m.content.contains("ran:echo hi")));
+    let events = store.list_events(&session.id, 100).unwrap();
+    assert!(!events.iter().any(|e| e.kind == "approval.auto"));
 }
 
 #[tokio::test]
@@ -1435,6 +1521,349 @@ async fn duplicate_guard_uses_normalized_arguments() {
     let session = store.list_sessions(10).unwrap().remove(0);
     let events = store.list_events(&session.id, 100).unwrap();
     assert!(events.iter().any(|e| e.kind == "tool.duplicate_skipped"));
+}
+
+#[tokio::test]
+async fn resume_after_injection_flag_does_not_execute_approved_tool() {
+    let store = Store::open(":memory:").unwrap();
+    let responses = vec![
+        ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "mock_exec".into(),
+                arguments: json!({"cmd": "echo hi"}),
+            }],
+            model: "mock-model".into(),
+        },
+        ChatResponse {
+            content: Some("finished".into()),
+            tool_calls: vec![],
+            model: "mock-model".into(),
+        },
+    ];
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new("mock-model", responses)),
+        base_tools_with_mock_exec(),
+        build_policy(Mode::Ask),
+        AgentConfig {
+            mode: Mode::Ask,
+            max_steps: 5,
+            ..Default::default()
+        },
+    );
+    runner.run_goal("park then flag").await.unwrap();
+    let session = store.list_sessions(10).unwrap().remove(0);
+    assert_eq!(session.state, "waiting_approval");
+
+    // A tool output was flagged while the session was parked.
+    store
+        .set_session_flag(&session.id, "injection_suspected")
+        .unwrap();
+
+    let out = runner.resume_session(&session.id, "approve").await.unwrap();
+    assert_eq!(out, "finished");
+    let msgs = store.list_messages(&session.id).unwrap();
+    assert!(!msgs.iter().any(|m| m.content.contains("ran:echo hi")));
+    let events = store.list_events(&session.id, 100).unwrap();
+    assert!(events
+        .iter()
+        .any(|e| e.kind == "tool.denied" && e.message.contains("suspected prompt injection")));
+}
+
+#[tokio::test]
+async fn resume_after_goal_lock_change_does_not_execute_approved_tool() {
+    let store = Store::open(":memory:").unwrap();
+    let responses = vec![
+        ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "mock_exec".into(),
+                arguments: json!({"cmd": "echo hi"}),
+            }],
+            model: "mock-model".into(),
+        },
+        ChatResponse {
+            content: Some("finished".into()),
+            tool_calls: vec![],
+            model: "mock-model".into(),
+        },
+    ];
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new("mock-model", responses)),
+        base_tools_with_mock_exec(),
+        build_policy(Mode::Ask),
+        AgentConfig {
+            mode: Mode::Ask,
+            max_steps: 5,
+            ..Default::default()
+        },
+    );
+    runner.run_goal("park then drift").await.unwrap();
+    let session = store.list_sessions(10).unwrap().remove(0);
+    assert_eq!(session.state, "waiting_approval");
+
+    // The lock no longer matches the session goal/scope after parking.
+    store.set_goal_lock(&session.id, "stale-digest").unwrap();
+
+    let out = runner.resume_session(&session.id, "approve").await.unwrap();
+    assert_eq!(out, "finished");
+    let msgs = store.list_messages(&session.id).unwrap();
+    assert!(!msgs.iter().any(|m| m.content.contains("ran:echo hi")));
+    let events = store.list_events(&session.id, 100).unwrap();
+    assert!(events.iter().any(|e| e.kind == "goal_lock.violation"));
+}
+
+#[tokio::test]
+async fn request_stop_aborts_runner_at_next_step() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("stop me").unwrap();
+    store.set_session_state(&session.id, "running").unwrap();
+    store.set_session_model(&session.id, "mock-model").unwrap();
+    store.add_message(&session.id, "user", "work").unwrap();
+    request_stop(&store, &session.id);
+
+    // The model keeps asking for tools; the durable stop flag must still win.
+    let responses = (0..8)
+        .map(|i| ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: format!("c{i}"),
+                name: "echo".into(),
+                arguments: json!({"text": format!("work-{i}")}),
+            }],
+            model: "mock-model".into(),
+        })
+        .collect();
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(agentbug_tools::EchoTool));
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new("mock-model", responses)),
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            auto_approve_all: true,
+            max_steps: 8,
+            ..Default::default()
+        },
+    );
+
+    let err = runner
+        .resume_session(&session.id, "approve")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("aborted"));
+    let state = store.get_session(&session.id).unwrap().unwrap();
+    assert_eq!(state.state, "interrupted");
+    let events = store.list_events(&session.id, 100).unwrap();
+    assert!(events.iter().any(|e| e.kind == "session.stopped"));
+    // `finish` consumes the stop flag; a later resume clears the ack and
+    // therefore starts with a clean slate.
+    assert!(agentbug_core::execution::ExecutionCoordinator::global().is_stop_acked(&session.id));
+}
+
+#[tokio::test]
+async fn request_stop_aborts_before_tool_spawn() {
+    struct StopDuringChat {
+        store: Store,
+    }
+    #[async_trait]
+    impl Llm for StopDuringChat {
+        async fn resolve_model(&self) -> Result<String> {
+            Ok("mock-model".into())
+        }
+        async fn chat(
+            &self,
+            _model: &str,
+            _messages: &[ChatMessage],
+            _tools: &[LlmToolSpec],
+        ) -> Result<ChatResponse> {
+            // The flag is raised after the step-boundary check but before the
+            // tool is spawned; the pre-tool check must still stop the run.
+            if let Some(session) = self
+                .store
+                .list_sessions(10)
+                .ok()
+                .and_then(|sessions| sessions.into_iter().next())
+            {
+                request_stop(&self.store, &session.id);
+            }
+            Ok(ChatResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    arguments: json!({"text": "should not run"}),
+                }],
+                model: "mock-model".into(),
+            })
+        }
+    }
+
+    let store = Store::open(":memory:").unwrap();
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(agentbug_tools::EchoTool));
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(StopDuringChat {
+            store: store.clone(),
+        }),
+        tools,
+        build_policy(Mode::Ask),
+        AgentConfig {
+            mode: Mode::Ask,
+            max_steps: 5,
+            ..Default::default()
+        },
+    );
+    let err = runner.run_goal("stop before spawn").await.unwrap_err();
+    assert!(err.to_string().contains("aborted"));
+    let session = store.list_sessions(10).unwrap().remove(0);
+    assert_eq!(session.state, "interrupted");
+    let msgs = store.list_messages(&session.id).unwrap();
+    assert!(!msgs.iter().any(|m| m.content.contains("should not run")));
+}
+
+#[tokio::test]
+async fn intrusive_risk_tool_counts_toward_network_budget() {
+    let store = Store::open(":memory:").unwrap();
+    let responses = (0..2)
+        .map(|i| ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: format!("i{i}"),
+                name: "intrusive_probe".into(),
+                arguments: json!({"target": format!("host-{i}.example")}),
+            }],
+            model: "mock-model".into(),
+        })
+        .chain(std::iter::once(ChatResponse {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            model: "mock-model".into(),
+        }))
+        .collect();
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(MockIntrusiveTool));
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new("mock-model", responses)),
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            auto_approve_all: true,
+            max_steps: 5,
+            max_network_calls: 1,
+            ..Default::default()
+        },
+    );
+    assert_eq!(runner.run_goal("intrusive budget").await.unwrap(), "done");
+    let session = store.list_sessions(10).unwrap().remove(0);
+    let msgs = store.list_messages(&session.id).unwrap();
+    assert_eq!(
+        msgs.iter()
+            .filter(|m| m.content.contains("intrusive ran"))
+            .count(),
+        1
+    );
+    assert!(msgs
+        .iter()
+        .any(|m| m.content.contains("max_network_calls=1")));
+}
+
+#[test]
+fn extract_policy_target_uses_only_narrow_network_keys() {
+    assert_eq!(
+        extract_policy_target(&json!({"url": "https://example.com/a"})).as_deref(),
+        Some("https://example.com/a")
+    );
+    assert_eq!(
+        extract_policy_target(&json!({"target": "example.com"})).as_deref(),
+        Some("example.com")
+    );
+    for key in ["value", "name", "path", "query", "uri", "site", "address"] {
+        assert_eq!(
+            extract_policy_target(&json!({ key: "example.com" })),
+            None,
+            "key {key} must not be treated as a policy target"
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_goal_lock_fails_closed_on_tool_call() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("no lock").unwrap();
+    store.set_session_state(&session.id, "interrupted").unwrap();
+    store.set_session_model(&session.id, "mock-model").unwrap();
+    store.add_message(&session.id, "user", "continue").unwrap();
+    // No goal lock was ever set for this session.
+
+    let responses = vec![
+        ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "echo".into(),
+                arguments: json!({"text": "hello"}),
+            }],
+            model: "mock-model".into(),
+        },
+        ChatResponse {
+            content: Some("finished".into()),
+            tool_calls: vec![],
+            model: "mock-model".into(),
+        },
+    ];
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(agentbug_tools::EchoTool));
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new("mock-model", responses)),
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            auto_approve_all: true,
+            max_steps: 5,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        runner.resume_session(&session.id, "approve").await.unwrap(),
+        "finished"
+    );
+    let msgs = store.list_messages(&session.id).unwrap();
+    assert!(!msgs.iter().any(|m| m.content.contains("ok=true")));
+    let events = store.list_events(&session.id, 100).unwrap();
+    assert!(events.iter().any(|e| e.kind == "goal_lock.violation"));
+}
+
+#[tokio::test]
+async fn recover_stale_sessions_expires_stale_approvals() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("stale approval").unwrap();
+    // An already-expired pending approval.
+    store
+        .create_approval_with_ttl(&session.id, "echo", "{}", "safe", "stale", None, -1)
+        .unwrap();
+
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new("mock-model", vec![])),
+        ToolRegistry::new(),
+        build_policy(Mode::Ask),
+        AgentConfig::default(),
+    );
+    runner.recover_stale_sessions().unwrap();
+    // Recovery already expired the approval: a second sweep finds nothing.
+    assert_eq!(store.expire_stale_approvals().unwrap(), 0);
 }
 
 #[test]

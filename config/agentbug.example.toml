@@ -27,6 +27,8 @@ requests_per_minute = 60
 auto_approve_tools = ["echo"]
 # Hard cap on estimated tokens per session (0 = unlimited)
 max_estimated_tokens = 0
+# Bypass per-tool approval for every tool (engagement runs only). Keep false.
+auto_approve_all = false
 
 [storage]
 path = ".agentbug/agentbug.db"
@@ -47,6 +49,9 @@ allow_proxy = false
 # proxy_url = "http://127.0.0.1:8080"
 # Local lab/staging targets are blocked by default; opt in explicitly.
 trusted_local_targets = []
+# Risk opt-ins. Keep false unless the engagement brief explicitly allows them.
+allow_network_write = false
+allow_intrusive = false
 
 # External recon adapters are disabled by default. Binaries must be installed.
 [external_tools]

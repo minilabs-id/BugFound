@@ -483,6 +483,7 @@ fn build_runner(cfg: &FileConfig, cwd: &str, mode: Mode, open_store: bool) -> Re
         max_network_calls: cfg.agent.max_network_calls.unwrap_or(0),
         requests_per_minute: cfg.agent.requests_per_minute.unwrap_or(0),
         auto_approve_tools: cfg.agent.auto_approve_tools.clone(),
+        auto_approve_all: cfg.agent.auto_approve_all,
         max_estimated_tokens: cfg.agent.max_estimated_tokens.unwrap_or(0),
         cost_per_1k_input: cfg.llm.cost_per_1k_input,
         cost_per_1k_output: cfg.llm.cost_per_1k_output,
@@ -576,6 +577,13 @@ timeout_ms = 60000
 [agent]
 mode = "ask"          # ask | full_auto
 max_steps = 20
+# Escape hatch: skip every approval prompt (off by default).
+auto_approve_all = false
+
+[network]
+# Explicit opt-ins needed for state-changing / intrusive engagements.
+allow_network_write = false
+allow_intrusive = false
 
 [storage]
 path = ".agentbug/agentbug.db"
@@ -1059,4 +1067,48 @@ path = ".agentbug/agentbug.db"
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OPT_IN_CONFIG: &str = r#"
+[llm]
+base_url = "https://api.openai.com"
+api_key = "test-key"
+
+[agent]
+mode = "full_auto"
+auto_approve_all = true
+
+[network]
+allow_network_write = true
+allow_intrusive = true
+"#;
+
+    #[test]
+    fn engagement_opt_ins_are_parsed_and_forwarded() {
+        let cfg: FileConfig = toml::from_str(OPT_IN_CONFIG).expect("parse config");
+        cfg.validate().expect("validate config");
+        assert!(cfg.network.allow_network_write);
+        assert!(cfg.network.allow_intrusive);
+        assert!(cfg.agent.auto_approve_all);
+        let options = engagement_options(&cfg);
+        assert!(options.allow_network_write);
+        assert!(options.allow_intrusive);
+        assert!(options.auto_approve_all);
+    }
+
+    #[test]
+    fn config_defaults_are_fail_closed() {
+        let cfg = FileConfig::default();
+        assert!(!cfg.network.allow_network_write);
+        assert!(!cfg.network.allow_intrusive);
+        assert!(!cfg.agent.auto_approve_all);
+        let options = engagement_options(&cfg);
+        assert!(!options.allow_network_write);
+        assert!(!options.allow_intrusive);
+        assert!(!options.auto_approve_all);
+    }
 }

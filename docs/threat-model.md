@@ -18,7 +18,7 @@ dari environment bukan dari image. Rincian ada di `deployment.md`.
 
 | ID | Aset | Ancaman | Mitigasi di kode | Risiko residual | Rujukan |
 | --- | --- | --- | --- | --- | --- |
-| F-01 | Integritas host & workspace | `shell_exec` dilabeli `risk:"write"`, scope tidak dicek; denylist substring bisa dilewati | `ExternalCommandTool` dengan allowlist argv tanpa shell, env allowlist, risk `exec`, approval `ask` | Sedang — tetap butuh isolasi OS; allowlist bukan sandbox | H-01, H-12 (matrix #4, #6) |
+| F-01 | Integritas host & workspace | `shell_exec` bisa jadi RCE lewat `git`/`cargo`/alias shell dan akses file di luar cwd | `shell_exec` risk `exec`, allowlist ketat hanya `echo`/`whoami`, env tanpa HOME/USERPROFILE, argumen divalidasi; `ExternalCommandTool` argv tanpa shell + scope check | Sedang — allowlist bukan sandbox; isolasi host tetap disarankan | TC-1, TC-7 |
 | F-02 | Validasi alamat & jalur egress | DNS pinning kalah saat proxy aktif → DNS rebinding / TOCTOU | `HttpRequestTool` memakai `dns_overrides`, `no_proxy`, blokir IP private/reserved | Sedang — proxy eksplisit tetap harus diaudit operator | H-02, H-12 (matrix #7) |
 | F-03 | Budget & kuota sesi | Counter in-memory reset saat resume/restart → limit efektif unbounded | Tabel `session_budgets`, `ensure_budget`/`budget_usage`, step index durable | Rendah — verifikasi ulang concurrency saat integrasi | H-01 (matrix #3) |
 | F-04 | Approval & session claim | Dua proses `approve` bisa sama-sama mengklaim & menjalankan aksi | `resolve_approval` berpredikat `status='pending'`, `claim_session`/`transition_state_owned` conditional + owner/lease | Rendah — race lintas proses diuji via tes store | H-01, H-10 (matrix #1, #2) |

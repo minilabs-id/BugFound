@@ -49,7 +49,7 @@ Kriteria penerimaan:
 **File:** `crates/agentbug-engagement/src/lib.rs`, `crates/agentbug-tools/src/lib.rs`.
 
 Aksi:
-- `RoePolicy { ua_marker, max_rps, max_requests, allow_fuzzing, allow_state_change, allow_disclosure, login_portals }`.
+- `RoePolicy { ua_marker, max_rps, max_requests, allow_fuzzing, allow_state_change, allow_disclosure }`.
 - Parse dari **teks brief utuh**, bukan `reporting_rules` yang sudah difilter.
 - Intersect scope hasil LLM dengan parse deterministik; kalau bertentangan → fail-closed.
 - `fetch_brief`: blokir IP privat, redirect 0, tolak non-2xx/login page.

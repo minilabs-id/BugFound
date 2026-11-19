@@ -1,0 +1,51 @@
+# cargo-deny configuration for the MiniBug workspace.
+# Run from the workspace root with: cargo deny check
+# See https://embarkstudios.github.io/cargo-deny/
+
+version = 2
+
+[advisories]
+# Never build against a yanked crate version.
+yanked = "deny"
+# Triaged advisories may be added here with a comment and an expiry date.
+ignore = []
+
+[licenses]
+# Copyleft (GPL/AGPL/LGPL/SSPL/...) and unlicensed crates are denied by
+# omission: only the permissive licenses below are allowed. Extend this list
+# only for another well-known permissive license, never for copyleft.
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+]
+
+[bans]
+# Reject more than one version of the same crate in the dependency graph.
+multiple-versions = "deny"
+# Reject wildcard (*) version requirements in manifests.
+wildcards = "deny"
+# Small, explicit allowlist of transitive duplicates that cannot currently be
+# collapsed upstream. Remove entries as soon as dependencies converge.
+skip = [
+    { name = "base64", version = "=0.22.1" },
+    { name = "getrandom", version = "=0.2.17" },
+    { name = "hashbrown", version = "=0.14.5" },
+    { name = "syn", version = "=2.0.119" },
+    { name = "thiserror", version = "=1.0.69" },
+    { name = "thiserror-impl", version = "=1.0.69" },
+    { name = "windows-sys", version = "=0.52.0" },
+]
+
+[sources]
+# Only crates from the official registry are allowed; no ad-hoc git sources.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

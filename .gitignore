@@ -1,0 +1,4 @@
+/target
+/.minibug
+/minibug.toml
+**/*.rs.bk

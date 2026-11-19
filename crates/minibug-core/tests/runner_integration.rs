@@ -890,7 +890,7 @@ async fn configured_auto_approve_tool_runs_without_parking() {
 }
 
 #[tokio::test]
-async fn switching_target_after_approval_requires_new_approval() {
+async fn autonomous_mode_allows_multi_target_batches() {
     let store = Store::open(":memory:").unwrap();
     let llm = Arc::new(MockLlm::new(
         "mock-model",
@@ -934,15 +934,11 @@ async fn switching_target_after_approval_requires_new_approval() {
         },
     );
     let out = runner.run_goal("two targets").await.unwrap();
-    assert!(out.contains("waiting approval"));
+    assert_eq!(out, "done");
     let session = store.list_sessions(10).unwrap().remove(0);
-    assert_eq!(session.state, "waiting_approval");
-    let approval = store.get_pending_approval(&session.id).unwrap().unwrap();
-    assert!(approval
-        .reason
-        .unwrap_or_default()
-        .contains("differs from previously approved"));
-    assert_eq!(store.coverage_count(&session.id).unwrap(), 1);
+    assert_eq!(session.state, "completed");
+    assert!(store.get_pending_approval(&session.id).unwrap().is_none());
+    assert_eq!(store.coverage_count(&session.id).unwrap(), 2);
 }
 
 #[tokio::test]
@@ -1111,4 +1107,78 @@ async fn injection_output_flags_context_and_forces_approval() {
     assert!(events
         .iter()
         .any(|e| e.kind == "prompt_injection.suspected"));
+}
+
+#[tokio::test]
+async fn stall_guard_stops_repetitive_playbooks() {
+    let store = Store::open(":memory:").unwrap();
+    let responses = (0..8)
+        .map(|i| ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: format!("s{i}"),
+                name: "echo".into(),
+                arguments: json!({"text": format!("repeat-{i}")}),
+            }],
+            model: "mock-model".into(),
+        })
+        .collect();
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(minibug_tools::EchoTool));
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new("mock-model", responses)),
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            max_steps: 8,
+            stall_limit: 2,
+            ..Default::default()
+        },
+    );
+    let out = runner.run_goal("stall").await.unwrap();
+    assert!(out.contains("No new findings"));
+    let session = store.list_sessions(10).unwrap().remove(0);
+    assert_eq!(session.state, "completed");
+    let events = store.list_events(&session.id, 100).unwrap();
+    assert!(events.iter().any(|e| e.kind == "runner.stall_stop"));
+}
+
+#[tokio::test]
+async fn duplicate_tool_calls_are_skipped() {
+    let store = Store::open(":memory:").unwrap();
+    let responses = (0..3)
+        .map(|i| ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: format!("d{i}"),
+                name: "echo".into(),
+                arguments: json!({"text": "same"}),
+            }],
+            model: "mock-model".into(),
+        })
+        .chain(std::iter::once(ChatResponse {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            model: "mock-model".into(),
+        }))
+        .collect();
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(minibug_tools::EchoTool));
+    let runner = Runner::new(
+        store.clone(),
+        Arc::new(MockLlm::new("mock-model", responses)),
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            max_steps: 5,
+            ..Default::default()
+        },
+    );
+    assert_eq!(runner.run_goal("dupes").await.unwrap(), "done");
+    let session = store.list_sessions(10).unwrap().remove(0);
+    let events = store.list_events(&session.id, 100).unwrap();
+    assert!(events.iter().any(|e| e.kind == "tool.duplicate_skipped"));
 }

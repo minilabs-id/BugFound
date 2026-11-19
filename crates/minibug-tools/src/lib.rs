@@ -5,13 +5,14 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::time::{sleep, timeout, Duration};
 
 const MAX_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024;
@@ -50,6 +51,12 @@ pub struct ToolOptions {
     /// When true, external adapters are registered only if their binary is
     /// discovered on PATH.
     pub auto_detect_external: bool,
+    /// Full User-Agent override required by an engagement's rules of engagement.
+    pub user_agent: Option<String>,
+    /// Hard cap on outgoing HTTP requests per second (ROE enforcement).
+    pub max_rps: Option<u64>,
+    /// Shared rolling window used by the rate limiter (Clone/Default friendly).
+    pub rate_window: Arc<Mutex<VecDeque<Instant>>>,
 }
 
 #[async_trait]
@@ -608,13 +615,14 @@ fn apply_proxy(builder: reqwest::ClientBuilder, options: &ToolOptions) -> reqwes
 }
 
 fn build_http_client(options: &ToolOptions) -> reqwest::Client {
+    let ua = options.user_agent.as_deref().unwrap_or("minibug/0.1");
     let builder = apply_proxy(
         reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             // Redirects are disabled: following one could land on an internal
             // address that passed validation only for the original target.
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("minibug/0.1"),
+            .user_agent(ua),
         options,
     );
     builder.build().unwrap_or_else(|_| {
@@ -622,10 +630,36 @@ fn build_http_client(options: &ToolOptions) -> reqwest::Client {
             .timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
-            .user_agent("minibug/0.1")
+            .user_agent(ua)
             .build()
             .expect("http client")
     })
+}
+
+/// Wait until an outgoing request fits inside the configured ROE rate limit.
+async fn obey_rate_limit(options: &ToolOptions) {
+    let Some(max_rps) = options.max_rps.filter(|value| *value > 0) else {
+        return;
+    };
+    loop {
+        let wait = {
+            let mut window = options.rate_window.lock().unwrap();
+            let now = Instant::now();
+            window.retain(|at| now.duration_since(*at) < Duration::from_secs(1));
+            if window.len() < max_rps as usize {
+                window.push_back(now);
+                None
+            } else {
+                window
+                    .front()
+                    .map(|at| Duration::from_secs(1) - now.duration_since(*at))
+            }
+        };
+        match wait {
+            None => return,
+            Some(delay) => sleep(delay.max(Duration::from_millis(1))).await,
+        }
+    }
 }
 
 /// Proxy configuration is operator-supplied and must stay local. Anything
@@ -723,7 +757,7 @@ impl Tool for HttpRequestTool {
                 reqwest::Client::builder()
                     .timeout(Duration::from_secs(30))
                     .redirect(reqwest::redirect::Policy::none())
-                    .user_agent("minibug/0.1")
+                    .user_agent(self.options.user_agent.as_deref().unwrap_or("minibug/0.1"))
                     .resolve(host, ip),
                 &self.options,
             )
@@ -761,6 +795,7 @@ impl Tool for HttpRequestTool {
         if let Some(body) = input.get("body").and_then(|v| v.as_str()) {
             req = req.body(body.to_string());
         }
+        obey_rate_limit(&self.options).await;
         let resp = timeout(Duration::from_millis(timeout_ms), req.send())
             .await
             .context("http timeout")??;
@@ -812,8 +847,12 @@ pub struct ValidatePoCTool {
 
 impl ValidatePoCTool {
     pub fn new() -> Self {
+        Self::with_options(ToolOptions::default())
+    }
+
+    pub fn with_options(options: ToolOptions) -> Self {
         Self {
-            http: HttpRequestTool::new(),
+            http: HttpRequestTool::with_options(options),
         }
     }
 }
@@ -1438,7 +1477,7 @@ pub fn try_default_registry_with_options(
     reg.register(Arc::new(RecordAssetTool));
     reg.register(Arc::new(SaveArtifactTool::new(cwd)?));
     reg.register(Arc::new(EchoTool));
-    reg.register(Arc::new(ValidatePoCTool::new()));
+    reg.register(Arc::new(ValidatePoCTool::with_options(options.clone())));
     if options.enable_external_tools {
         reg.register(Arc::new(PipelineTool::new(reg.clone(), cwd)));
     }

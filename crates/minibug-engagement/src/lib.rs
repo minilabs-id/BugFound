@@ -96,7 +96,22 @@ pub fn engage(
         .enable_all()
         .build()
         .context("build tokio runtime for engagement")?;
-    runtime.block_on(engage_async(program_url, workspace, db_path, tx))
+    runtime.block_on(engage_async(program_url, workspace, db_path, tx, false))
+}
+
+/// Read-only evaluation: ingest the public brief, extract scope/ROE and build
+/// the WSTG plan, but do not execute any tool against the target.
+pub fn engage_brief_only(
+    program_url: &str,
+    workspace: &Path,
+    db_path: &Path,
+    tx: Sender<EngagementEvent>,
+) -> Result<EngagementProfile> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for brief-only engagement")?;
+    runtime.block_on(engage_async(program_url, workspace, db_path, tx, true))
 }
 
 static ENGAGEMENT_DB: OnceLock<PathBuf> = OnceLock::new();
@@ -319,6 +334,7 @@ async fn engage_async(
     workspace: &Path,
     db_path: &Path,
     tx: Sender<EngagementEvent>,
+    brief_only: bool,
 ) -> Result<EngagementProfile> {
     std::fs::create_dir_all(workspace)
         .with_context(|| format!("create workspace {}", workspace.display()))?;
@@ -351,7 +367,7 @@ async fn engage_async(
         },
     );
 
-    let outcome = run_engagement(&store, &id, program_url, workspace, &tx).await;
+    let outcome = run_engagement(&store, &id, program_url, workspace, &tx, brief_only).await;
     match outcome {
         Ok(profile) => Ok(profile),
         Err(error) => {
@@ -381,6 +397,7 @@ async fn run_engagement(
     program_url: &str,
     workspace: &Path,
     tx: &Sender<EngagementEvent>,
+    brief_only: bool,
 ) -> Result<EngagementProfile> {
     // 1. BriefReader — no proxy, 5 redirects, 15s timeout, 1MB body cap.
     let (raw_html, brief_text) = fetch_brief(program_url).await?;
@@ -405,11 +422,17 @@ async fn run_engagement(
         .filter(|key| !key.trim().is_empty());
     let base_url =
         std::env::var("MINIBUG_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".to_string());
+    // Optional explicit model: lets the operator choose a large-context model
+    // instead of relying on model-discovery "first entry" behaviour.
+    let model = std::env::var("MINIBUG_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let llm_client = match &api_key {
         Some(key) => Some(LlmClient::new(LlmConfig {
             base_url,
             api_key: key.clone(),
-            default_model: None,
+            default_model: model,
             timeout_ms: 60_000,
         })?),
         None => None,
@@ -473,8 +496,29 @@ async fn run_engagement(
         store.add_hypothesis(id, statement)?; // engagement id doubles as the session key
         statements.push((*statement).to_string());
     }
-    update_control(id, |control| control.tasks_total = statements.len());
+    let planned_count = statements.len();
+    update_control(id, |control| control.tasks_total = planned_count);
     emit(tx, EngagementEvent::PlanUpdated { tasks: statements });
+
+    if brief_only {
+        let _ = store.set_engagement_state(id, "brief_only");
+        let _ = store.upsert_engagement_control(id, "brief_only");
+        update_control(id, |control| {
+            control.finished = true;
+            control.state = ControlState::Running;
+        });
+        emit(
+            tx,
+            EngagementEvent::Finished {
+                summary: format!(
+                    "Brief-only evaluation for {} completed: {} playbooks planned, no tools executed",
+                    profile.engagement,
+                    planned_count
+                ),
+            },
+        );
+        return Ok(profile);
+    }
 
     // 4. Execution loop — a fresh Runner per task, never auto-submitting.
     let runner_llm: Arc<dyn Llm + Send + Sync> = match llm_client {
@@ -502,15 +546,16 @@ async fn run_engagement(
         }
 
         let tools = build_tools(workspace, &profile)?;
-        let auto_approve_tools = tools
-            .specs()
-            .into_iter()
-            .filter(|spec| matches!(spec.risk.as_str(), "safe" | "read"))
-            .map(|spec| spec.name)
-            .collect();
+        // Autonomous engagement: the operator already authorised the run. Auto-approve
+        // every registered tool so a multi-target batch is never parked at an approval.
+        // Destructive actions remain blocked by policy, and intrusive adapters stay gated.
+        let auto_approve_tools = tools.specs().into_iter().map(|spec| spec.name).collect();
         let agent = AgentConfig {
             mode: Mode::FullAuto,
-            max_steps: 500,
+            // Bounded playbooks + stall guard: stop looping when no new
+            // evidence appears, instead of burning hundreds of LLM/tool calls.
+            max_steps: 60,
+            stall_limit: 6,
             system_prompt: Some(format!(
                 "You are MiniBug testing only the engagement scope: {scope_reminder}. \
                  Stay within scope, collect evidence, and never submit reports or findings to third parties."
@@ -546,6 +591,13 @@ async fn run_engagement(
                 continue;
             }
             task_coverage += store.coverage_count(&session.id).unwrap_or(0);
+            // Coverage is recorded per runner session; mirror it onto the
+            // engagement so `status` and the final report see it.
+            if let Ok(rows) = store.list_coverage(&session.id) {
+                for row in rows {
+                    let _ = store.record_coverage(id, &row.target, &row.method, &row.path);
+                }
+            }
             observe_session(store, id, Some(&task.id), &session.id, tx)?;
         }
 
@@ -752,26 +804,25 @@ async fn fetch_brief(url: &str) -> Result<(String, String)> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::limited(5))
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(45))
         .build()
         .context("build brief HTTP client")?;
     // A login-walled program still returns a public HTML page; use whatever is
     // served rather than rejecting on status. Scope extraction is fail-closed.
-    let mut response = client
+    let response = client
         .get(url)
+        .header(
+            "user-agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+        )
         .send()
         .await
         .with_context(|| format!("fetch program brief {url}"))?;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.context("stream brief body")? {
-        if bytes.len() + chunk.len() > MAX_BRIEF_BYTES {
-            let remaining = MAX_BRIEF_BYTES.saturating_sub(bytes.len());
-            bytes.extend_from_slice(&chunk[..remaining]);
-            break;
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    let raw_html = String::from_utf8_lossy(&bytes).to_string();
+    // Buffer the whole body with a generous timeout, then cap to 1 MB. Some
+    // SPA pages send many small chunks and streaming can stall on slow links.
+    let body = response.bytes().await.context("stream brief body")?;
+    let end = body.len().min(MAX_BRIEF_BYTES);
+    let raw_html = String::from_utf8_lossy(&body[..end]).to_string();
     let text = html_to_text(&raw_html);
     Ok((raw_html, text))
 }
@@ -1321,6 +1372,37 @@ impl Llm for OfflineLlm {
     }
 }
 
+/// Translate program ROE prose into tool-level enforcement: a required
+/// User-Agent marker and a hard request-rate cap.
+pub fn roe_overrides(rules: &[String]) -> (Option<String>, Option<u64>) {
+    let mut user_agent = None;
+    let mut max_rps = None;
+    let quoted = Regex::new(r#"['"]([^'"]+)['"]"#).unwrap();
+    let rps_pattern = Regex::new(r"(\d+)\s*requests?\s*per\s*second").unwrap();
+    for rule in rules {
+        let lower = rule.to_ascii_lowercase();
+        if user_agent.is_none() && lower.contains("user-agent") {
+            if let Some(captures) = quoted.captures(rule) {
+                let marker = captures
+                    .get(1)
+                    .map(|m| m.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !marker.trim().is_empty() {
+                    user_agent = Some(format!("minibug/0.1 {marker}"));
+                }
+            }
+        }
+        if max_rps.is_none() && lower.contains("requests per second") {
+            max_rps = rps_pattern
+                .captures(&lower)
+                .and_then(|captures| captures.get(1))
+                .and_then(|value| value.as_str().parse::<u64>().ok());
+        }
+    }
+    (user_agent, max_rps)
+}
+
 fn build_tools(
     workspace: &Path,
     profile: &EngagementProfile,
@@ -1340,6 +1422,7 @@ fn build_tools(
         .collect();
     let enable_external_tools = !external_commands.is_empty()
         || std::env::var_os("MINIBUG_ENABLE_EXTERNAL_TOOLS").is_some();
+    let (user_agent, max_rps) = roe_overrides(&profile.reporting_rules);
     let options = ToolOptions {
         allow_proxy: false,
         proxy_url: None,
@@ -1349,6 +1432,9 @@ fn build_tools(
         scope_in: profile.scope.in_scope.clone(),
         scope_out: profile.scope.out_of_scope.clone(),
         auto_detect_external: false,
+        user_agent,
+        max_rps,
+        ..Default::default()
     };
     try_default_registry_with_options(workspace, options)
 }

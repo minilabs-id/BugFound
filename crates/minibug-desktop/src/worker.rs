@@ -68,6 +68,7 @@ fn build_runner(config: &AppConfig, cwd: &str, mode: Mode) -> Result<Runner> {
         auto_detect_external: config.external_tools.auto_detect,
         scope_in: config.scope.in_scope.clone(),
         scope_out: config.scope.out_of_scope.clone(),
+        ..Default::default()
     };
     let tools = try_default_registry_with_options(cwd, options)?;
 

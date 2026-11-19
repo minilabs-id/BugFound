@@ -141,6 +141,10 @@ pub struct AgentConfig {
     pub cost_per_1k_input: f64,
     #[serde(default)]
     pub cost_per_1k_output: f64,
+    /// Stop a playbook after this many consecutive steps without new evidence.
+    /// 0 disables the stall guard.
+    #[serde(default)]
+    pub stall_limit: usize,
 }
 fn default_max_steps() -> usize {
     20
@@ -163,6 +167,7 @@ impl Default for AgentConfig {
             max_estimated_tokens: 0,
             cost_per_1k_input: 0.0,
             cost_per_1k_output: 0.0,
+            stall_limit: 0,
         }
     }
 }
@@ -498,6 +503,27 @@ impl Runner {
         {
             warn!(error=%e, session=%session_id, "failed to persist budget usage");
         }
+    }
+
+    /// Count of durable evidence items for a session, used by the stall guard.
+    fn evidence_count(&self, session_id: &str) -> usize {
+        let findings = self
+            .store
+            .list_findings(session_id)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let assets = self
+            .store
+            .list_assets(session_id)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let artifacts = self
+            .store
+            .list_artifacts(session_id)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let coverage = self.store.coverage_count(session_id).unwrap_or(0);
+        findings + assets + artifacts + coverage
     }
 
     fn target_cooldown(&self, target: Option<&str>) -> Option<String> {
@@ -1183,7 +1209,27 @@ impl Runner {
     async fn run_loop(&self, session_id: &str, model: &str) -> Result<String> {
         self.store.ensure_budget(session_id)?;
         let mut step = self.store.budget_usage(session_id)?.steps_used;
+        let mut duplicate_calls: HashMap<String, usize> = HashMap::new();
+        let mut last_evidence = self.evidence_count(session_id);
+        let mut stalled_steps = 0usize;
         while step < self.effective_max_steps() {
+            let evidence_now = self.evidence_count(session_id);
+            if evidence_now > last_evidence {
+                stalled_steps = 0;
+            } else {
+                stalled_steps += 1;
+            }
+            last_evidence = evidence_now;
+            if self.agent.stall_limit > 0 && stalled_steps >= self.agent.stall_limit {
+                let text = format!(
+                    "No new findings, assets or coverage after {} steps; concluding playbook.",
+                    self.agent.stall_limit
+                );
+                self.log_event(session_id, "warn", "runner.stall_stop", &text);
+                self.store.add_message(session_id, "assistant", &text)?;
+                self.finish(session_id, "completed", "info", "session.completed", &text);
+                return Ok(text);
+            }
             if execution::ExecutionCoordinator::global().is_cancelled(session_id) {
                 self.finish(
                     session_id,
@@ -1356,6 +1402,7 @@ impl Runner {
                         reason = "context flagged for suspected prompt injection".to_string();
                     }
                     let (decision, reason) = if decision == Decision::Allow
+                        && self.agent.mode == Mode::Ask
                         && self.target_changed(session_id, target.as_deref())
                     {
                         (
@@ -1390,6 +1437,25 @@ impl Runner {
                                 "tool.allowed",
                                 &format!("tool={} risk={} reason={}", spec.name, spec.risk, reason),
                             );
+                            let signature = format!("{}|{}", spec.name, tc.arguments);
+                            let seen = duplicate_calls.entry(signature).or_insert(0);
+                            *seen += 1;
+                            if *seen > 2 {
+                                let msg = format!(
+                                    "ok=false error=duplicate tool call ignored ({} repeats): choose a different target or parameter",
+                                    *seen
+                                );
+                                self.store.add_message_full(
+                                    session_id,
+                                    "tool",
+                                    &msg,
+                                    Some(&tc.id),
+                                    None,
+                                    Some(&spec.name),
+                                )?;
+                                self.log_event(session_id, "warn", "tool.duplicate_skipped", &msg);
+                                continue;
+                            }
                             if let Some(cooldown) = self.target_cooldown(target.as_deref()) {
                                 self.store.add_message_full(
                                     session_id,

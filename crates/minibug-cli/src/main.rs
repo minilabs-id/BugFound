@@ -176,6 +176,9 @@ enum Commands {
         cwd: String,
         #[arg(long)]
         db: Option<String>,
+        /// Only ingest the public brief and plan; never execute tools against the target
+        #[arg(long)]
+        brief_only: bool,
     },
     /// Inspect/control a running engagement
     Engagement {
@@ -450,6 +453,7 @@ fn build_runner(cfg: &FileConfig, cwd: &str, mode: Mode, open_store: bool) -> Re
         auto_detect_external: cfg.external_tools.auto_detect,
         scope_in: cfg.scope.in_scope.clone(),
         scope_out: cfg.scope.out_of_scope.clone(),
+        ..Default::default()
     };
     let tools = try_default_registry_with_options(cwd, options)?;
     let policy = minibug_core::build_policy_config(minibug_policy::PolicyConfig {
@@ -875,7 +879,12 @@ path = ".minibug/minibug.db"
                 std::process::exit(1);
             }
         }
-        Commands::Engage { url, cwd, db } => {
+        Commands::Engage {
+            url,
+            cwd,
+            db,
+            brief_only,
+        } => {
             let db_path = db.unwrap_or_else(|| cfg.storage.path.clone());
             let (tx, rx) = std::sync::mpsc::channel::<minibug_engagement::EngagementEvent>();
 
@@ -905,12 +914,21 @@ path = ".minibug/minibug.db"
             let worker_cwd = cwd.clone();
             let worker_db = db_path.clone();
             let worker = std::thread::spawn(move || {
-                minibug_engagement::engage(
-                    &worker_url,
-                    Path::new(&worker_cwd),
-                    Path::new(&worker_db),
-                    tx,
-                )
+                if brief_only {
+                    minibug_engagement::engage_brief_only(
+                        &worker_url,
+                        Path::new(&worker_cwd),
+                        Path::new(&worker_db),
+                        tx,
+                    )
+                } else {
+                    minibug_engagement::engage(
+                        &worker_url,
+                        Path::new(&worker_cwd),
+                        Path::new(&worker_db),
+                        tx,
+                    )
+                }
             });
 
             let mut exit_code = loop {

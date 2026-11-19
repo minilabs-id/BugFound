@@ -1,4 +1,4 @@
-use minibug_engagement::{cvss_base, extract_profile_from_text, wstg_playbooks};
+use minibug_engagement::{cvss_base, extract_profile_from_text, roe_overrides, wstg_playbooks};
 
 #[test]
 fn heuristic_extracts_scope_from_local_html() {
@@ -26,6 +26,17 @@ fn heuristic_extracts_scope_from_local_html() {
         .reporting_rules
         .iter()
         .any(|rule| rule.to_ascii_lowercase().contains("report")));
+}
+
+#[test]
+fn roe_rules_are_translated_into_tool_enforcement() {
+    let rules = vec![
+        "Do not use automated scanners or tools that generate large amounts of network traffic. Use automated tools gently, with a maximum of 10 requests per second.".to_string(),
+        "Add the string ' -BugBounty-boursobank-31337 ' to the User-Agent header in your requests.".to_string(),
+    ];
+    let (ua, rps) = roe_overrides(&rules);
+    assert_eq!(rps, Some(10));
+    assert!(ua.unwrap().contains("-BugBounty-boursobank-31337"));
 }
 
 #[test]

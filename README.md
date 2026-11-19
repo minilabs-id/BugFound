@@ -66,5 +66,6 @@ an isolated container/VM with a restricted egress path, keep `mode = "ask"`
 unless the engagement explicitly authorizes autonomy, review approval prompts,
 and keep credentials out of the workspace (the API key is read from the
 environment). The shell allowlist is defense in depth; it is not a substitute
-for OS-level isolation. Context compaction, external recon adapters and
-clustering are still open (see `docs/PRODUCTION_PLAN.md`).
+for OS-level isolation. Context compaction is implemented (older turns are
+summarized once prompts exceed 32 KB). External recon adapters and clustering
+are still open (see `docs/PRODUCTION_PLAN.md`).

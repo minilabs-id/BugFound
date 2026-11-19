@@ -29,6 +29,7 @@ Phase 0–2 dan sebagian Phase 3 sudah dieksekusi. Ringkasan perubahan:
 | F-16 schema/index | partial | `schema_version` + index ada; migrasi `ALTER` masih best-effort |
 | F-17 tool output framing | done | `<untrusted_tool_output>` + redaction |
 | F-18 tests | partial | tes baru untuk mayoritas finding; soak/E2E belum |
+| P4-1 context compaction | done | `build_llm_messages` ringkas history >32KB, jaga tool_call/tool result tetap valid; 2 tes unit |
 | P0 release hygiene | done* | Git repo di branch `dev`, commit `ae9049c`, tag `v0.1.0-mvp`, `Cargo.lock` di-commit, CI+Dockerfile+deny.toml+runbook; `cargo deny check` dijalankan di CI (binary tidak terpasang lokal) |
 
 Verifikasi terakhir: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,

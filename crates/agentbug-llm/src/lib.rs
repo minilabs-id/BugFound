@@ -3,7 +3,15 @@ use async_trait::async_trait;
 use reqwest::header::RETRY_AFTER;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Token counts reported by the provider (when the response includes `usage`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
@@ -88,12 +96,26 @@ pub trait Llm: Send + Sync {
         messages: &[ChatMessage],
         tools: &[ToolSpec],
     ) -> Result<ChatResponse>;
+
+    /// Like `chat`, but also returns provider-reported token usage when the
+    /// response includes a `usage` object. Mock implementations fall back to
+    /// `None` and callers use their token estimator instead.
+    async fn chat_with_usage(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> Result<(ChatResponse, Option<TokenUsage>)> {
+        let response = self.chat(model, messages, tools).await?;
+        Ok((response, None))
+    }
 }
 
 #[derive(Clone)]
 pub struct LlmClient {
     cfg: LlmConfig,
     http: Client,
+    last_usage: Arc<Mutex<Option<TokenUsage>>>,
 }
 
 impl LlmClient {
@@ -109,7 +131,11 @@ impl LlmClient {
         let http = Client::builder()
             .timeout(Duration::from_millis(cfg.timeout_ms.max(1000)))
             .build()?;
-        Ok(Self { cfg, http })
+        Ok(Self {
+            cfg,
+            http,
+            last_usage: Arc::new(Mutex::new(None)),
+        })
     }
 
     fn api_base(&self) -> String {
@@ -283,6 +309,17 @@ impl Llm for LlmClient {
                 Ok(r) => {
                     if r.status().is_success() {
                         let v: serde_json::Value = r.json().await.context("invalid chat json")?;
+                        let usage = v.get("usage").map(|usage| TokenUsage {
+                            prompt_tokens: usage
+                                .get("prompt_tokens")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0),
+                            completion_tokens: usage
+                                .get("completion_tokens")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0),
+                        });
+                        *self.last_usage.lock().unwrap() = usage;
                         return parse_chat_response(&v, model);
                     }
                     let status = r.status();
@@ -324,6 +361,18 @@ impl Llm for LlmClient {
             }
         }
         Err(last_err.unwrap_or_else(|| anyhow!("chat failed")))
+    }
+
+    async fn chat_with_usage(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> Result<(ChatResponse, Option<TokenUsage>)> {
+        *self.last_usage.lock().unwrap() = None;
+        let response = self.chat(model, messages, tools).await?;
+        let usage = self.last_usage.lock().unwrap().take();
+        Ok((response, usage))
     }
 }
 

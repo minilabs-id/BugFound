@@ -1440,32 +1440,40 @@ impl Runner {
                 })
                 .collect();
 
-            let resp = match self.llm.chat(model, &msgs, &tool_specs).await {
-                Ok(r) => r,
-                Err(e) => {
-                    // Classify before surfacing the error so callers get a
-                    // stable category (retryable/blocked/fatal/...) while the
-                    // original message is preserved in the durable event.
-                    let classified = error::AgentError::classify(&e.to_string());
-                    self.log_event(
-                        session_id,
-                        "error",
-                        "llm.chat_failed",
-                        &format!("step={step} category={} error={}", classified.category(), e),
-                    );
-                    return Err(anyhow!(classified.to_string()));
-                }
-            };
+            let (resp, provider_usage) =
+                match self.llm.chat_with_usage(model, &msgs, &tool_specs).await {
+                    Ok(value) => value,
+                    Err(e) => {
+                        // Classify before surfacing the error so callers get a
+                        // stable category (retryable/blocked/fatal/...) while the
+                        // original message is preserved in the durable event.
+                        let classified = error::AgentError::classify(&e.to_string());
+                        self.log_event(
+                            session_id,
+                            "error",
+                            "llm.chat_failed",
+                            &format!("step={step} category={} error={}", classified.category(), e),
+                        );
+                        return Err(anyhow!(classified.to_string()));
+                    }
+                };
 
-            let completion_tokens = estimate_tokens(resp.content.as_deref().unwrap_or(""));
-            let cost = (prompt_tokens as f64 / 1000.0) * self.agent.cost_per_1k_input
-                + (completion_tokens as f64 / 1000.0) * self.agent.cost_per_1k_output;
-            if let Err(e) =
-                self.store
-                    .record_token_usage(session_id, prompt_tokens, completion_tokens, cost)
-            {
-                warn!(error=%e, session=%session_id, "failed to record token usage");
-            }
+            let (recorded_prompt, recorded_completion) = match provider_usage {
+                Some(usage) => (usage.prompt_tokens, usage.completion_tokens),
+                None => (
+                    prompt_tokens,
+                    estimate_tokens(resp.content.as_deref().unwrap_or("")),
+                ),
+            };
+            let cost = (recorded_prompt as f64 / 1000.0) * self.agent.cost_per_1k_input
+                + (recorded_completion as f64 / 1000.0) * self.agent.cost_per_1k_output;
+            record_provider_usage(
+                &self.store,
+                session_id,
+                recorded_prompt,
+                recorded_completion,
+                cost,
+            );
 
             if !resp.tool_calls.is_empty() {
                 // Persist assistant message with tool_calls (OpenAI-compatible shape).

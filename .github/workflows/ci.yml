@@ -31,6 +31,10 @@ jobs:
       - name: Lint with Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Audit dependencies
+        uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check
+
       - name: Run tests
         run: cargo test --workspace
 

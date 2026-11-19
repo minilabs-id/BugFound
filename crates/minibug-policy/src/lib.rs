@@ -30,6 +30,9 @@ pub struct BudgetConfig {
     pub requests_per_minute: u64,
     #[serde(default)]
     pub max_steps: usize,
+    /// Hard cap on estimated prompt+completion tokens for a session (0 = unlimited).
+    #[serde(default)]
+    pub max_tokens: u64,
 }
 
 /// Engagement/scope policy for bug bounty operations.
@@ -442,6 +445,7 @@ impl PolicyEngine {
             max_network_calls: pick(|b| b.max_network_calls),
             requests_per_minute: pick_u64(|b| b.requests_per_minute),
             max_steps: pick(|b| b.max_steps),
+            max_tokens: pick_u64(|b| b.max_tokens),
         }
     }
 }

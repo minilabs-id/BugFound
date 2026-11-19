@@ -42,6 +42,14 @@ pub struct ToolOptions {
     pub trusted_local_targets: Vec<String>,
     pub enable_external_tools: bool,
     pub external_commands: BTreeMap<String, String>,
+    /// Inclusive scope entries. When non-empty, a target must match at least
+    /// one entry before any request is made.
+    pub scope_in: Vec<String>,
+    /// Exclusive scope entries. A matching target is always denied.
+    pub scope_out: Vec<String>,
+    /// When true, external adapters are registered only if their binary is
+    /// discovered on PATH.
+    pub auto_detect_external: bool,
 }
 
 #[async_trait]
@@ -275,6 +283,73 @@ fn validate_host_with_options(host: &str, options: &ToolOptions) -> Result<()> {
         return Ok(());
     }
     validate_host_string(host)
+}
+
+/// Reduce a scope target to a comparable host string. URLs are reduced to
+/// their host so scope entries can stay host-oriented.
+fn normalize_scope_target(target: &str) -> String {
+    let trimmed = target.trim();
+    if trimmed.contains("://") {
+        if let Ok(parsed) = url::Url::parse(trimmed) {
+            if let Some(host) = parsed.host_str() {
+                return normalize_host(host);
+            }
+        }
+    }
+    normalize_host(trimmed)
+}
+
+/// One scope entry against one normalized target. Supports exact hosts,
+/// plain suffixes (including a leading dot), `*.suffix` wildcards and IPv4
+/// CIDR blocks.
+fn scope_entry_matches(entry: &str, target: &str) -> bool {
+    let entry = entry.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    let entry = entry.trim_end_matches('.');
+    if entry.is_empty() {
+        return false;
+    }
+    if let Some(suffix) = entry.strip_prefix("*.") {
+        return !suffix.is_empty() && target != suffix && target.ends_with(&format!(".{suffix}"));
+    }
+    if entry.contains('/') {
+        return target
+            .parse::<Ipv4Addr>()
+            .map(|ip| ipv4_in_cidr(ip, entry))
+            .unwrap_or(false);
+    }
+    if let Some(suffix) = entry.strip_prefix('.') {
+        return !suffix.is_empty() && (target == suffix || target.ends_with(&format!(".{suffix}")));
+    }
+    let ip_match = entry
+        .parse::<Ipv4Addr>()
+        .map(|entry_ip| {
+            target
+                .parse::<Ipv4Addr>()
+                .map(|ip| ip == entry_ip)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    ip_match || target == entry || target.ends_with(&format!(".{entry}"))
+}
+
+/// Decide whether `target` is permitted by an inclusive/exclusive scope.
+/// Exclusive entries always win. An empty inclusive list allows any target
+/// that is not explicitly excluded.
+pub fn scope_target_allowed(target: &str, in_scope: &[String], out_of_scope: &[String]) -> bool {
+    let target = normalize_scope_target(target);
+    if target.is_empty() {
+        return false;
+    }
+    if out_of_scope
+        .iter()
+        .any(|entry| scope_entry_matches(entry, &target))
+    {
+        return false;
+    }
+    in_scope.is_empty()
+        || in_scope
+            .iter()
+            .any(|entry| scope_entry_matches(entry, &target))
 }
 
 /// Resolve a trusted host without the public-address restriction. Only used
@@ -553,6 +628,36 @@ fn build_http_client(options: &ToolOptions) -> reqwest::Client {
     })
 }
 
+/// Proxy configuration is operator-supplied and must stay local. Anything
+/// other than an http(s) proxy on a loopback host is rejected in `run()` so a
+/// bad configuration cannot silently route scoped traffic off-box.
+fn validate_proxy_url(options: &ToolOptions) -> Result<()> {
+    if !options.allow_proxy {
+        return Ok(());
+    }
+    let Some(raw) = options.proxy_url.as_deref() else {
+        return Ok(());
+    };
+    let parsed = url::Url::parse(raw).context("invalid proxy_url")?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => anyhow::bail!("proxy_url must use http or https"),
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("proxy_url has no host"))?;
+    let host = host
+        .trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "0.0.0.0") {
+        Ok(())
+    } else {
+        anyhow::bail!("proxy_url host must be loopback, got '{host}'")
+    }
+}
+
 impl HttpRequestTool {
     pub fn new() -> Self {
         Self::with_options(ToolOptions::default())
@@ -593,9 +698,16 @@ impl Tool for HttpRequestTool {
             "http" | "https" => {}
             _ => anyhow::bail!("only http/https allowed"),
         }
+        // Validate the proxy configuration and engagement scope before any
+        // network work. Scope is enforced in code even when a proxy is in use,
+        // because the DNS pin below does not apply to proxied requests.
+        validate_proxy_url(&self.options)?;
         let host = parsed
             .host_str()
             .ok_or_else(|| anyhow!("url has no host"))?;
+        if !scope_target_allowed(host, &self.options.scope_in, &self.options.scope_out) {
+            anyhow::bail!("target '{host}' is not permitted by scope policy");
+        }
         validate_host_with_options(host, &self.options)?;
         let pinned_ip = if host.parse::<IpAddr>().is_ok() {
             None
@@ -682,6 +794,109 @@ impl Tool for HttpRequestTool {
             ok: (200..400).contains(&status),
             output: truncate(&out.to_string()),
             structured: Some(out),
+        })
+    }
+}
+
+/// Pure verdict logic for PoC validation. Kept public so it can be tested
+/// without performing any network request.
+pub fn poc_verdict(status: u16, expected: u16, marker_found: bool, marker_required: bool) -> bool {
+    status == expected && (!marker_required || marker_found)
+}
+
+/// Validate a proof-of-concept: replay a request through the scoped HTTP tool
+/// and check the response status and optional body marker.
+pub struct ValidatePoCTool {
+    http: HttpRequestTool,
+}
+
+impl ValidatePoCTool {
+    pub fn new() -> Self {
+        Self {
+            http: HttpRequestTool::new(),
+        }
+    }
+}
+
+impl Default for ValidatePoCTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for ValidatePoCTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "validate_poc".into(),
+            description: "Replay a proof-of-concept request and validate its status code and optional response marker.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Absolute http/https URL to validate"},
+                    "method": {"type": "string", "enum": ["GET","HEAD","POST","PUT","DELETE","OPTIONS"], "default": "GET"},
+                    "expected_status": {"type": "number", "default": 200},
+                    "marker": {"type": "string", "description": "Substring that must appear in the response body"}
+                },
+                "required": ["url"]
+            }),
+            risk: "network".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let url = input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("url required"))?;
+        let method = input
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET");
+        let expected_status = input
+            .get("expected_status")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(200);
+        let expected_status =
+            u16::try_from(expected_status).context("expected_status out of range")?;
+        let marker = input.get("marker").and_then(|v| v.as_str());
+
+        let response = self.http.run(json!({"url": url, "method": method})).await?;
+        let status = response
+            .structured
+            .as_ref()
+            .and_then(|v| v.get("status"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let status = u16::try_from(status).unwrap_or(0);
+        let body = response
+            .structured
+            .as_ref()
+            .and_then(|v| v.get("body"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let marker_found = marker.map(|m| body.contains(m)).unwrap_or(false);
+        let valid =
+            response.ok && poc_verdict(status, expected_status, marker_found, marker.is_some());
+
+        let structured = json!({
+            "valid": valid,
+            "status": status,
+            "marker_found": marker_found,
+            "url": url,
+        });
+        let output = if valid {
+            format!("PoC validated for {url}: status {status}, marker found: {marker_found}")
+        } else {
+            format!(
+                "PoC not validated for {url}: status {status} (expected {expected_status}), ok={}, marker found: {marker_found}",
+                response.ok
+            )
+        };
+        Ok(ToolResult {
+            ok: valid,
+            output: truncate(&output),
+            structured: Some(structured),
         })
     }
 }
@@ -975,6 +1190,96 @@ impl Tool for EchoTool {
     }
 }
 
+/// Chain pre-registered tools into a recon pipeline. Each step receives the
+/// previous step's first non-empty output line as its `target`. No shell and
+/// no dynamic code are involved: steps are looked up in the registry only.
+pub struct PipelineTool {
+    registry: ToolRegistry,
+    cwd: PathBuf,
+}
+
+impl PipelineTool {
+    pub fn new(registry: ToolRegistry, cwd: impl AsRef<Path>) -> Self {
+        Self {
+            registry,
+            cwd: cwd.as_ref().to_path_buf(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for PipelineTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "recon_pipeline".into(),
+            description: "Run an ordered list of registered recon tools, feeding each step's first output line into the next step's target.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "steps": {"type": "array", "items": {"type": "string"}, "description": "Ordered tool names"},
+                    "target": {"type": "string", "description": "Initial target for the first step"}
+                },
+                "required": ["steps", "target"]
+            }),
+            risk: "network".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let steps = input
+            .get("steps")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow!("steps required"))?;
+        let mut target = input
+            .get("target")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("target required"))?
+            .to_string();
+        let mut report: Vec<Value> = Vec::new();
+        for step in steps {
+            let name = step
+                .as_str()
+                .ok_or_else(|| anyhow!("pipeline step names must be strings"))?;
+            let tool = self
+                .registry
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown pipeline step: {name}"))?;
+            let result = tool.run(json!({"target": target})).await?;
+            let first_line = result
+                .output
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            report.push(json!({
+                "name": name,
+                "ok": result.ok,
+                "output_first_line": first_line,
+            }));
+            target = first_line;
+        }
+        let all_ok = report
+            .iter()
+            .all(|step| step.get("ok").and_then(|v| v.as_bool()).unwrap_or(false));
+        let output = format!(
+            "recon pipeline completed {} step(s) in {}: {}",
+            report.len(),
+            self.cwd.display(),
+            if all_ok {
+                "all steps succeeded"
+            } else {
+                "at least one step failed"
+            }
+        );
+        Ok(ToolResult {
+            ok: all_ok,
+            output: truncate(&output),
+            structured: Some(json!({"steps": report})),
+        })
+    }
+}
+
 const MAX_EXTERNAL_LINES: usize = 200;
 
 /// Single-pass placeholder substitution. Values are never re-scanned, so an
@@ -1128,6 +1433,10 @@ pub fn try_default_registry_with_options(
     reg.register(Arc::new(RecordAssetTool));
     reg.register(Arc::new(SaveArtifactTool::new(cwd)?));
     reg.register(Arc::new(EchoTool));
+    reg.register(Arc::new(ValidatePoCTool::new()));
+    if options.enable_external_tools {
+        reg.register(Arc::new(PipelineTool::new(reg.clone(), cwd)));
+    }
     // Aliases for convenience / common tool names.
     let fs_read = Arc::new(FsReadTool::new(cwd)?);
     let fs_write = Arc::new(FsWriteTool::new(cwd)?);
@@ -1146,7 +1455,63 @@ pub fn try_default_registry_with_options(
     Ok(reg)
 }
 
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+/// Discover well-known recon binaries by scanning PATH (plus the common
+/// `/usr/local/bin`) with std only. Missing entries map to `None`.
+pub fn external_tool_availability() -> BTreeMap<String, Option<PathBuf>> {
+    const KEYS: &[&str] = &["subfinder", "dnsx", "katana", "ffuf", "nuclei", "nmap"];
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    dirs.push(PathBuf::from("/usr/local/bin"));
+
+    #[cfg(windows)]
+    let extensions: Vec<String> = {
+        let raw = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        raw.split(';')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    #[cfg(not(windows))]
+    let extensions: Vec<String> = vec![String::new()];
+
+    let mut out = BTreeMap::new();
+    for key in KEYS {
+        let mut found = None;
+        'search: for dir in &dirs {
+            for ext in &extensions {
+                let candidate = dir.join(format!("{key}{ext}"));
+                if is_executable_file(&candidate) {
+                    found = Some(candidate);
+                    break 'search;
+                }
+            }
+        }
+        out.insert((*key).to_string(), found);
+    }
+    out
+}
+
 fn register_external_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &ToolOptions) {
+    let detected = if options.auto_detect_external {
+        Some(external_tool_availability())
+    } else {
+        None
+    };
     let adapters = [
         (
             "subfinder",
@@ -1192,6 +1557,11 @@ fn register_external_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &Tool
         ),
     ];
     for (name, description, command, arg_template, risk) in adapters {
+        if let Some(map) = &detected {
+            if map.get(name).and_then(|v| v.as_ref()).is_none() {
+                continue;
+            }
+        }
         reg.register(Arc::new(ExternalCommandTool::new(
             name,
             description,
@@ -1493,6 +1863,209 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn scope_target_allowed_enforces_inclusion_and_exclusion() {
+        let empty: Vec<String> = Vec::new();
+        assert!(scope_target_allowed("example.com", &empty, &empty));
+        assert!(!scope_target_allowed("", &empty, &empty));
+
+        let in_scope = vec!["example.com".to_string()];
+        assert!(scope_target_allowed("example.com", &in_scope, &empty));
+        assert!(scope_target_allowed("api.example.com", &in_scope, &empty));
+        assert!(scope_target_allowed(
+            "https://api.example.com/path",
+            &in_scope,
+            &empty
+        ));
+        assert!(!scope_target_allowed("evil-example.com", &in_scope, &empty));
+        assert!(!scope_target_allowed("other.org", &in_scope, &empty));
+
+        let wildcard = vec!["*.example.com".to_string()];
+        assert!(scope_target_allowed("api.example.com", &wildcard, &empty));
+        assert!(!scope_target_allowed("example.com", &wildcard, &empty));
+
+        let suffix = vec![".example.com".to_string()];
+        assert!(scope_target_allowed("api.example.com", &suffix, &empty));
+        assert!(scope_target_allowed("example.com", &suffix, &empty));
+
+        let cidr = vec!["10.0.0.0/8".to_string()];
+        assert!(scope_target_allowed("10.1.2.3", &cidr, &empty));
+        assert!(!scope_target_allowed("11.0.0.1", &cidr, &empty));
+
+        let out = vec!["admin.example.com".to_string()];
+        assert!(!scope_target_allowed("admin.example.com", &in_scope, &out));
+        let all_subdomains = vec!["*.example.com".to_string()];
+        assert!(!scope_target_allowed(
+            "api.example.com",
+            &empty,
+            &all_subdomains
+        ));
+    }
+
+    #[test]
+    fn proxy_url_requires_loopback_http() {
+        for url in [
+            "http://127.0.0.1:3128",
+            "http://localhost:8080",
+            "http://[::1]:3128",
+            "https://0.0.0.0:443",
+        ] {
+            let options = ToolOptions {
+                allow_proxy: true,
+                proxy_url: Some(url.to_string()),
+                ..ToolOptions::default()
+            };
+            assert!(validate_proxy_url(&options).is_ok(), "{url}");
+        }
+        for url in [
+            "ftp://127.0.0.1:21",
+            "http://evil.example.com:8080",
+            "http://192.168.1.10:8080",
+            "not a url",
+            "http://",
+        ] {
+            let options = ToolOptions {
+                allow_proxy: true,
+                proxy_url: Some(url.to_string()),
+                ..ToolOptions::default()
+            };
+            assert!(validate_proxy_url(&options).is_err(), "{url}");
+        }
+        let disabled = ToolOptions {
+            proxy_url: Some("http://evil.example.com".to_string()),
+            ..ToolOptions::default()
+        };
+        assert!(validate_proxy_url(&disabled).is_ok());
+    }
+
+    #[tokio::test]
+    async fn http_rejects_bad_proxy_and_out_of_scope_without_network() {
+        let options = ToolOptions {
+            allow_proxy: true,
+            proxy_url: Some("http://evil.example.com:8080".to_string()),
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+        let err = tool
+            .run(json!({"url": "http://example.com/"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("loopback"), "{err}");
+
+        let options = ToolOptions {
+            scope_in: vec!["example.com".to_string()],
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+        let err = tool
+            .run(json!({"url": "http://other.org/"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("scope"), "{err}");
+    }
+
+    #[test]
+    fn poc_verdict_requires_status_and_optional_marker() {
+        assert!(poc_verdict(200, 200, false, false));
+        assert!(!poc_verdict(201, 200, false, false));
+        assert!(poc_verdict(200, 200, true, true));
+        assert!(!poc_verdict(200, 200, false, true));
+    }
+
+    #[test]
+    fn validate_poc_tool_has_expected_spec() {
+        let spec = ValidatePoCTool::new().spec();
+        assert_eq!(spec.name, "validate_poc");
+        assert_eq!(spec.risk, "network");
+        assert_eq!(spec.input_schema["required"], json!(["url"]));
+        assert_eq!(
+            spec.input_schema["properties"]["method"]["default"],
+            json!("GET")
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["expected_status"]["default"],
+            json!(200)
+        );
+        assert!(spec.input_schema["properties"]["marker"].is_object());
+    }
+
+    struct StepTool;
+
+    #[async_trait]
+    impl Tool for StepTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "step".into(),
+                description: String::new(),
+                input_schema: json!({}),
+                risk: "safe".into(),
+            }
+        }
+        async fn run(&self, input: Value) -> Result<ToolResult> {
+            let target = input.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            Ok(ToolResult {
+                ok: true,
+                output: format!("value-{target}\nfooter"),
+                structured: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_feeds_previous_output_line_as_target() {
+        let dir = std::env::temp_dir().join(format!("mbt-pipe-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(StepTool));
+        let tool = PipelineTool::new(registry, &dir);
+        assert_eq!(tool.spec().name, "recon_pipeline");
+        let result = tool
+            .run(json!({"steps": ["step", "step"], "target": "example.com"}))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let steps = &result.structured.as_ref().unwrap()["steps"];
+        assert_eq!(steps[0]["name"], json!("step"));
+        assert_eq!(steps[0]["ok"], json!(true));
+        assert_eq!(steps[0]["output_first_line"], json!("value-example.com"));
+        assert_eq!(
+            steps[1]["output_first_line"],
+            json!("value-value-example.com")
+        );
+        let err = tool
+            .run(json!({"steps": ["missing"], "target": "x"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown pipeline step"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_tool_availability_has_expected_keys() {
+        let map = external_tool_availability();
+        for key in ["subfinder", "dnsx", "katana", "ffuf", "nuclei", "nmap"] {
+            assert!(map.contains_key(key), "missing {key}");
+        }
+    }
+
+    #[test]
+    fn redact_covers_pii_without_touching_common_numbers() {
+        let out = redact("mail alice@example.com or bob.smith+tag@sub.example.co.uk");
+        assert!(!out.contains("alice@example.com"));
+        assert!(!out.contains("bob.smith+tag"));
+
+        let out = redact("SSN 123-45-6789 and phone +1-555-123-4567");
+        assert!(!out.contains("123-45-6789"));
+        assert!(!out.contains("555-123-4567"));
+
+        let out = redact("card 4111111111111111 amex 378282246310005");
+        assert!(!out.contains("4111111111111111"));
+        assert!(!out.contains("378282246310005"));
+
+        let plain = "port 8080 status 200 date 2026-11-19 version 1.2.3";
+        assert_eq!(redact(plain), plain);
+    }
+
     fn uuid_like() -> String {
         format!(
             "{}",
@@ -1509,6 +2082,170 @@ pub type DnsTool = DnsLookupTool;
 pub type DnsResolveTool = DnsLookupTool;
 pub type WriteFileTool = FsWriteTool;
 pub type FsWrite = FsWriteTool;
+
+fn apply_ranges(s: &mut String, mut ranges: Vec<(usize, usize)>) {
+    if ranges.is_empty() {
+        return;
+    }
+    ranges.sort_unstable_by_key(|r| r.0);
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if start < last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    let original = std::mem::take(s);
+    let mut out = String::with_capacity(original.len());
+    let mut cursor = 0;
+    for (start, end) in merged {
+        if start < cursor {
+            continue;
+        }
+        out.push_str(&original[cursor..start]);
+        out.push_str("[REDACTED]");
+        cursor = end;
+    }
+    out.push_str(&original[cursor..]);
+    *s = out;
+}
+
+fn is_email_local(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'+' | b'-' | b'\'')
+}
+
+fn is_email_domain(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-')
+}
+
+fn email_ranges(s: &str) -> Vec<(usize, usize)> {
+    let b = s.as_bytes();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'@' {
+            let mut start = i;
+            while start > 0 && is_email_local(b[start - 1]) {
+                start -= 1;
+            }
+            let mut end = i + 1;
+            while end < b.len() && is_email_domain(b[end]) {
+                end += 1;
+            }
+            while end > i + 1 && b[end - 1] == b'.' {
+                end -= 1;
+            }
+            let local = &s[start..i];
+            let domain = &s[i + 1..end];
+            let tld = domain.rsplit('.').next().unwrap_or("");
+            if !local.is_empty()
+                && domain.contains('.')
+                && tld.len() >= 2
+                && tld.bytes().all(|c| c.is_ascii_alphabetic())
+            {
+                ranges.push((start, end));
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    ranges
+}
+
+fn ssn_ranges(s: &str) -> Vec<(usize, usize)> {
+    let b = s.as_bytes();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i + 11 <= b.len() {
+        let shape = b[i..i + 3].iter().all(|c| c.is_ascii_digit())
+            && b[i + 3] == b'-'
+            && b[i + 4..i + 6].iter().all(|c| c.is_ascii_digit())
+            && b[i + 6] == b'-'
+            && b[i + 7..i + 11].iter().all(|c| c.is_ascii_digit());
+        let bounded = (i == 0 || !(b[i - 1].is_ascii_digit() || b[i - 1] == b'-'))
+            && (i + 11 == b.len() || !(b[i + 11].is_ascii_digit() || b[i + 11] == b'-'));
+        if shape && bounded {
+            ranges.push((i, i + 11));
+            i += 11;
+        } else {
+            i += 1;
+        }
+    }
+    ranges
+}
+
+fn is_numeric_span_byte(b: u8) -> bool {
+    b.is_ascii_digit() || matches!(b, b' ' | b'-' | b'(' | b')' | b'+')
+}
+
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'@')
+}
+
+/// Contiguous runs of digits with optional phone/card separators. Returns the
+/// byte span and the number of digits it contains.
+fn numeric_spans(s: &str) -> Vec<(usize, usize, usize)> {
+    let b = s.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() || b[i] == b'+' || b[i] == b'(' {
+            let start = i;
+            let mut end = i;
+            while end < b.len() && is_numeric_span_byte(b[end]) {
+                end += 1;
+            }
+            while end > start && !b[end - 1].is_ascii_digit() {
+                end -= 1;
+            }
+            let digits = b[start..end].iter().filter(|c| c.is_ascii_digit()).count();
+            let bounded = (start == 0 || !is_token_byte(b[start - 1]))
+                && (end == b.len() || !is_token_byte(b[end]));
+            if digits > 0 && bounded {
+                spans.push((start, end, digits));
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    spans
+}
+
+/// Skip epoch-millisecond and compact timestamp values so common numeric
+/// identifiers are not mistaken for payment cards.
+fn looks_like_timestamp(digits: &str) -> bool {
+    let b = digits.as_bytes();
+    if b.len() == 13 && b[0] == b'1' {
+        return true;
+    }
+    if b.len() == 14 {
+        let year = &digits[..4];
+        let month: u32 = digits[4..6].parse().unwrap_or(0);
+        if (year.starts_with("19") || year.starts_with("20")) && (1..=12).contains(&month) {
+            return true;
+        }
+    }
+    false
+}
+
+fn redact_pii(out: &mut String) {
+    apply_ranges(out, email_ranges(out));
+    apply_ranges(out, ssn_ranges(out));
+    let mut numeric = Vec::new();
+    for (start, end, digits) in numeric_spans(out) {
+        let is_card = (13..=19).contains(&digits) && !looks_like_timestamp(&out[start..end]);
+        let is_phone = (10..=12).contains(&digits);
+        if is_card || is_phone {
+            numeric.push((start, end));
+        }
+    }
+    apply_ranges(out, numeric);
+}
 
 /// Redact likely secrets from free text.
 pub fn redact(input: &str) -> String {
@@ -1586,6 +2323,7 @@ pub fn redact(input: &str) -> String {
             }
         }
     }
+    redact_pii(&mut out);
     out
 }
 pub fn redact_sensitive(input: &str) -> String {

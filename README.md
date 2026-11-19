@@ -33,11 +33,13 @@ execution, durable sessions, evidence capture, and redacted reports.
 - **Concurrency safety**: approvals resolve once (`status='pending'` guard) and
   expire after 15 minutes, session claims use atomic conditional updates, and
   runner transitions are guarded by owner/lease.
-- **Operator workflow**: proxy mode (opt-in, for Burp/ZAP), lab mode for trusted
-  local targets, auto-approve rules for safe tools, per-target cooldown after
-  429/403, coverage ledger + hypothesis tracking, deduped findings with
-  request/response evidence, CVSS/CWE fields, and snapshot resume for
-  interrupted sessions. External recon adapters are opt-in and gated.
+- **Operator workflow**: proxy mode (opt-in, for Burp/ZAP) with in-code scope
+  gate, lab mode for trusted local targets, auto-approve rules, per-target
+  cooldown after 429/403, coverage ledger + hypothesis-driven planning,
+  deduped findings with request/response evidence + CVSS/CWE + PoC validation,
+  goal lock and prompt-injection flags, token/cost accounting, tamper-evident
+  event hash chain, PII redaction, and snapshot resume. External recon adapters
+  are auto-detected, opt-in and gated; a pipeline tool chains their outputs.
 
 ## CLI
 
@@ -56,6 +58,10 @@ minibug approvals --session <id>       # pending approvals + expiry
 minibug doctor                         # validate config/env
 minibug scope-import --file brief.txt --program "Acme"
 minibug hypothesis --session <id> --add "IDOR on /api/users"
+minibug plan --session <id>              # uncovered in-scope targets
+minibug tools                            # external adapter availability
+minibug tokens --session <id>            # estimated tokens + cost
+minibug verify-log --session <id>        # event hash chain integrity
 ```
 
 Configuration example: `config/minibug.example.toml`. Set `scope.in_scope` for
@@ -71,8 +77,9 @@ cargo build --release
 
 ## Operational notes
 
-This is a hardened MVP, not a sandbox. For live engagements, run the binary in
-an isolated container/VM with a restricted egress path, keep `mode = "ask"`
+This is a hardened agent runtime, not an OS sandbox. For live engagements, run
+it on a dedicated isolated host/VM (or container) with a restricted egress path,
+keep `mode = "ask"`
 unless the engagement explicitly authorizes autonomy, review approval prompts,
 and keep credentials out of the workspace (the API key is read from the
 environment). The shell allowlist is defense in depth; it is not a substitute

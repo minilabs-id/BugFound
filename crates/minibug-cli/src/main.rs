@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use minibug_core::{AgentConfig, Runner};
+use minibug_core::{prioritize_targets, AgentConfig, Runner};
 use minibug_llm::{Llm, LlmConfig};
 use minibug_policy::{parse_scope_brief, Mode};
 use minibug_store::{redact, Store};
@@ -151,6 +151,23 @@ enum Commands {
         #[arg(long)]
         list: bool,
     },
+    /// Prioritize in-scope targets that have not been covered yet
+    Plan {
+        #[arg(long)]
+        session: String,
+    },
+    /// Show external adapter availability
+    Tools,
+    /// Show estimated token usage and cost
+    Tokens {
+        #[arg(long)]
+        session: String,
+    },
+    /// Verify the tamper-evident event hash chain
+    VerifyLog {
+        #[arg(long)]
+        session: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -251,6 +268,10 @@ struct LlmFile {
     default_model: Option<String>,
     #[serde(default = "d_timeout")]
     timeout_ms: u64,
+    #[serde(default)]
+    cost_per_1k_input: f64,
+    #[serde(default)]
+    cost_per_1k_output: f64,
 }
 impl Default for LlmFile {
     fn default() -> Self {
@@ -259,6 +280,8 @@ impl Default for LlmFile {
             api_key: String::new(),
             default_model: None,
             timeout_ms: d_timeout(),
+            cost_per_1k_input: 0.0,
+            cost_per_1k_output: 0.0,
         }
     }
 }
@@ -286,6 +309,8 @@ struct AgentFile {
     requests_per_minute: Option<u64>,
     #[serde(default)]
     auto_approve_tools: Vec<String>,
+    #[serde(default)]
+    max_estimated_tokens: Option<u64>,
 }
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 struct NetworkFile {
@@ -300,6 +325,8 @@ struct NetworkFile {
 struct ExternalFile {
     #[serde(default)]
     enabled: bool,
+    #[serde(default)]
+    auto_detect: bool,
     #[serde(default)]
     commands: std::collections::BTreeMap<String, String>,
 }
@@ -396,6 +423,9 @@ fn build_runner(cfg: &FileConfig, cwd: &str, mode: Mode, open_store: bool) -> Re
         trusted_local_targets: cfg.network.trusted_local_targets.clone(),
         enable_external_tools: cfg.external_tools.enabled,
         external_commands: cfg.external_tools.commands.clone(),
+        auto_detect_external: cfg.external_tools.auto_detect,
+        scope_in: cfg.scope.in_scope.clone(),
+        scope_out: cfg.scope.out_of_scope.clone(),
     };
     let tools = try_default_registry_with_options(cwd, options)?;
     let policy = minibug_core::build_policy_config(minibug_policy::PolicyConfig {
@@ -416,6 +446,9 @@ fn build_runner(cfg: &FileConfig, cwd: &str, mode: Mode, open_store: bool) -> Re
         max_network_calls: cfg.agent.max_network_calls.unwrap_or(0),
         requests_per_minute: cfg.agent.requests_per_minute.unwrap_or(0),
         auto_approve_tools: cfg.agent.auto_approve_tools.clone(),
+        max_estimated_tokens: cfg.agent.max_estimated_tokens.unwrap_or(0),
+        cost_per_1k_input: cfg.llm.cost_per_1k_input,
+        cost_per_1k_output: cfg.llm.cost_per_1k_output,
         ..Default::default()
     };
     let store = if open_store {
@@ -756,6 +789,47 @@ path = ".minibug/minibug.db"
                         redact(&hypothesis.statement)
                     );
                 }
+            }
+        }
+        Commands::Plan { session } => {
+            let store = Store::open(&cfg.storage.path)?;
+            let covered = store.coverage_targets(&session)?;
+            let hypotheses = store.list_hypotheses(&session)?;
+            let targets = prioritize_targets(&cfg.scope.in_scope, &covered, &hypotheses);
+            if targets.is_empty() {
+                println!("(no uncovered targets; refine scope or add hypotheses)");
+            }
+            for (index, target) in targets.iter().enumerate() {
+                println!("{}. {}", index + 1, redact(target));
+            }
+        }
+        Commands::Tools => {
+            for (name, path) in minibug_tools::external_tool_availability() {
+                println!(
+                    "{}\t{}",
+                    name,
+                    path.map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "not installed".into())
+                );
+            }
+        }
+        Commands::Tokens { session } => {
+            let store = Store::open(&cfg.storage.path)?;
+            let usage = store.token_usage(&session)?;
+            println!(
+                "prompt_tokens={} completion_tokens={} total={} cost_usd={:.6}",
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.prompt_tokens + usage.completion_tokens,
+                usage.cost_usd
+            );
+        }
+        Commands::VerifyLog { session } => {
+            let store = Store::open(&cfg.storage.path)?;
+            let valid = store.verify_event_chain(&session)?;
+            println!("event_chain={}", if valid { "valid" } else { "TAMPERED" });
+            if !valid {
+                std::process::exit(1);
             }
         }
     }

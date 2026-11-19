@@ -41,6 +41,14 @@ Phase 0–2 dan sebagian Phase 3 sudah dieksekusi. Ringkasan perubahan:
 | Kritik #9 target change | done | `approved_targets` + paksa approval saat target berubah |
 | Kritik #10 observability | done | `status`, `doctor`, `approvals` |
 | Kritik #11 crash resume | done | resume dari durable snapshot; tes `stale_running_session_is_recovered...` |
+| Orkestrasi adapter | done | auto-detect binary + `recon_pipeline` + `tools` CLI; 22 tes tools |
+| Proxy trust boundary | done | scope gate in-code + proxy loopback-only |
+| Prompt injection formal | done | goal lock + injection flag + re-approval; core tests |
+| PoC/PII/hash/planning | done | `validate_poc`, PII redaction, SHA-256 event chain + `verify-log`, `plan` CLI |
+| Token/cost | done | token_usage table, `max_estimated_tokens`, cost rates, `tokens` CLI |
+
+Verifikasi terakhir: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` (**88 tes**), `cargo build --release --workspace` — hijau.
 | P0 release hygiene | done* | Git repo di branch `dev`, commit `ae9049c`, tag `v0.1.0-mvp`, `Cargo.lock` di-commit, CI+Dockerfile+deny.toml+runbook; `cargo deny check` dijalankan di CI (binary tidak terpasang lokal) |
 
 Verifikasi terakhir: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,

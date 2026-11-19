@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -58,6 +59,10 @@ pub struct Event {
     pub kind: String,
     pub message: String,
     pub created_at: String,
+    #[serde(default)]
+    pub prev_hash: Option<String>,
+    #[serde(default)]
+    pub hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +93,10 @@ pub struct Finding {
     pub dedupe_key: Option<String>,
     #[serde(default)]
     pub evidence_hash: Option<String>,
+    #[serde(default)]
+    pub validated_at: Option<String>,
+    #[serde(default)]
+    pub validation_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +149,14 @@ pub struct BudgetUsage {
     pub calls_in_window: usize,
 }
 
+/// Accumulated token counts and estimated spend for a session.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cost_usd: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingCall {
     pub tool_call_id: Option<String>,
@@ -160,6 +177,12 @@ fn parse_ts(s: &str) -> Option<chrono::DateTime<Utc>> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|d| d.with_timezone(&Utc))
+}
+
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 impl Store {
@@ -186,13 +209,15 @@ impl Store {
                tool_name TEXT, args_json TEXT, risk TEXT, created_at TEXT, tool_call_id TEXT, expires_at TEXT
              );
              CREATE TABLE IF NOT EXISTS events(
-               id TEXT PRIMARY KEY, session_id TEXT NOT NULL, level TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL
+               id TEXT PRIMARY KEY, session_id TEXT NOT NULL, level TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL,
+               prev_hash TEXT, hash TEXT
              );
              CREATE TABLE IF NOT EXISTS findings(
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, title TEXT NOT NULL, severity TEXT NOT NULL,
                asset TEXT, vuln_type TEXT, description TEXT NOT NULL, reproduction TEXT, impact TEXT,
                remediation TEXT, evidence TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-               request TEXT, response TEXT, cvss TEXT, cwe TEXT, dedupe_key TEXT, evidence_hash TEXT
+               request TEXT, response TEXT, cvss TEXT, cwe TEXT, dedupe_key TEXT, evidence_hash TEXT,
+               validated_at TEXT, validation_detail TEXT
              );
              CREATE TABLE IF NOT EXISTS assets(
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL,
@@ -230,6 +255,18 @@ impl Store {
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, approval_id TEXT NOT NULL,
                tool_call_id TEXT, name TEXT NOT NULL, args_json TEXT NOT NULL, seq INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS token_usage(
+               id TEXT PRIMARY KEY, session_id TEXT NOT NULL, prompt_tokens INTEGER NOT NULL,
+               completion_tokens INTEGER NOT NULL, cost_usd REAL NOT NULL, created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_token_usage_session ON token_usage(session_id);
+             CREATE TABLE IF NOT EXISTS goal_locks(
+               session_id TEXT PRIMARY KEY, digest TEXT NOT NULL, created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS session_flags(
+               session_id TEXT NOT NULL, flag TEXT NOT NULL, created_at TEXT NOT NULL,
+               PRIMARY KEY(session_id,flag)
+             );
              CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
              CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
              CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id);
@@ -259,6 +296,10 @@ impl Store {
         let _ = conn.execute("ALTER TABLE findings ADD COLUMN cwe TEXT", []);
         let _ = conn.execute("ALTER TABLE findings ADD COLUMN dedupe_key TEXT", []);
         let _ = conn.execute("ALTER TABLE findings ADD COLUMN evidence_hash TEXT", []);
+        let _ = conn.execute("ALTER TABLE findings ADD COLUMN validated_at TEXT", []);
+        let _ = conn.execute("ALTER TABLE findings ADD COLUMN validation_detail TEXT", []);
+        let _ = conn.execute("ALTER TABLE events ADD COLUMN prev_hash TEXT", []);
+        let _ = conn.execute("ALTER TABLE events ADD COLUMN hash TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_call_id TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_calls_json TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN name TEXT", []);
@@ -694,18 +735,76 @@ impl Store {
         message: &str,
     ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
+        let created_at = now();
         let conn = self.conn.lock().unwrap();
+        let prev_hash: Option<String> = conn
+            .query_row(
+                "SELECT hash FROM events WHERE session_id=?1 ORDER BY rowid DESC LIMIT 1",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let prev = prev_hash.clone().unwrap_or_default();
+        let hash = sha256_hex(&format!(
+            "{prev}|{id}|{session_id}|{level}|{kind}|{message}|{created_at}"
+        ));
         conn.execute(
-            "INSERT INTO events(id,session_id,level,kind,message,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![id, session_id, level, kind, message, now()],
+            "INSERT INTO events(id,session_id,level,kind,message,created_at,prev_hash,hash)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, session_id, level, kind, message, created_at, prev_hash, hash],
         )?;
         Ok(())
+    }
+
+    /// Recompute the SHA-256 chain for a session in insertion order and
+    /// confirm every stored hash and link is intact.
+    pub fn verify_event_chain(&self, session_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,session_id,level,kind,message,created_at,prev_hash,hash
+             FROM events WHERE session_id=?1 ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            Ok(Event {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                level: r.get(2)?,
+                kind: r.get(3)?,
+                message: r.get(4)?,
+                created_at: r.get(5)?,
+                prev_hash: r.get(6)?,
+                hash: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+            })
+        })?;
+        let mut expected_prev = String::new();
+        for row in rows {
+            let event = row?;
+            if event.prev_hash.as_deref().unwrap_or_default() != expected_prev {
+                return Ok(false);
+            }
+            let recomputed = sha256_hex(&format!(
+                "{}|{}|{}|{}|{}|{}|{}",
+                expected_prev,
+                event.id,
+                event.session_id,
+                event.level,
+                event.kind,
+                event.message,
+                event.created_at
+            ));
+            if event.hash != recomputed {
+                return Ok(false);
+            }
+            expected_prev = recomputed;
+        }
+        Ok(true)
     }
 
     pub fn list_events(&self, session_id: &str, limit: usize) -> Result<Vec<Event>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,session_id,level,kind,message,created_at FROM events WHERE session_id=?1 ORDER BY rowid DESC LIMIT ?2",
+            "SELECT id,session_id,level,kind,message,created_at,prev_hash,hash
+             FROM events WHERE session_id=?1 ORDER BY rowid DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![session_id, limit as i64], |r| {
             Ok(Event {
@@ -715,6 +814,8 @@ impl Store {
                 kind: r.get(3)?,
                 message: r.get(4)?,
                 created_at: r.get(5)?,
+                prev_hash: r.get(6)?,
+                hash: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
             })
         })?;
         let mut out = vec![];
@@ -728,7 +829,8 @@ impl Store {
     pub fn list_all_events(&self, limit: usize) -> Result<Vec<Event>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,session_id,level,kind,message,created_at FROM events ORDER BY rowid DESC LIMIT ?1",
+            "SELECT id,session_id,level,kind,message,created_at,prev_hash,hash
+             FROM events ORDER BY rowid DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
             Ok(Event {
@@ -738,6 +840,8 @@ impl Store {
                 kind: r.get(3)?,
                 message: r.get(4)?,
                 created_at: r.get(5)?,
+                prev_hash: r.get(6)?,
+                hash: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
             })
         })?;
         let mut out = vec![];
@@ -784,6 +888,8 @@ impl Store {
             cwe: None,
             dedupe_key: None,
             evidence_hash: None,
+            validated_at: None,
+            validation_detail: None,
         };
         let conn = self.conn.lock().unwrap();
         Self::insert_finding(&conn, &f)?;
@@ -848,6 +954,8 @@ impl Store {
             cwe: cwe.map(|s| s.to_string()),
             dedupe_key: Some(dedupe_key),
             evidence_hash: Some(Self::evidence_hash(evidence, request, response)),
+            validated_at: None,
+            validation_detail: None,
         };
         Self::insert_finding(&conn, &f)?;
         Ok(Some(f))
@@ -855,12 +963,13 @@ impl Store {
 
     fn insert_finding(conn: &Connection, f: &Finding) -> Result<()> {
         conn.execute(
-            "INSERT INTO findings(id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+            "INSERT INTO findings(id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash,validated_at,validation_detail)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             params![
                 f.id, f.session_id, f.title, f.severity, f.asset, f.vuln_type, f.description,
                 f.reproduction, f.impact, f.remediation, f.evidence, f.status, f.created_at, f.updated_at,
-                f.request, f.response, f.cvss, f.cwe, f.dedupe_key, f.evidence_hash
+                f.request, f.response, f.cvss, f.cwe, f.dedupe_key, f.evidence_hash,
+                f.validated_at, f.validation_detail
             ],
         )?;
         Ok(())
@@ -881,7 +990,7 @@ impl Store {
     pub fn list_findings(&self, session_id: &str) -> Result<Vec<Finding>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash
+            "SELECT id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash,validated_at,validation_detail
              FROM findings WHERE session_id=?1 ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
@@ -906,6 +1015,8 @@ impl Store {
                 cwe: r.get(17)?,
                 dedupe_key: r.get(18)?,
                 evidence_hash: r.get(19)?,
+                validated_at: r.get(20)?,
+                validation_detail: r.get(21)?,
             })
         })?;
         let mut out = vec![];
@@ -913,6 +1024,21 @@ impl Store {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// Record the validation outcome of a finding, stamping the time it was checked.
+    pub fn set_finding_validation(
+        &self,
+        id: &str,
+        status: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE findings SET status=?2, validated_at=?3, validation_detail=?4 WHERE id=?1",
+            params![id, status, now(), detail],
+        )?;
+        Ok(())
     }
 
     pub fn upsert_asset(
@@ -1428,6 +1554,103 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Append one billing record; aggregates are derived at read time.
+    pub fn record_token_usage(
+        &self,
+        session_id: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        cost_usd: f64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO token_usage(id,session_id,prompt_tokens,completion_tokens,cost_usd,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                Uuid::new_v4().to_string(),
+                session_id,
+                prompt_tokens as i64,
+                completion_tokens as i64,
+                cost_usd,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn token_usage(&self, session_id: &str) -> Result<TokenUsage> {
+        let conn = self.conn.lock().unwrap();
+        let (prompt, completion, cost): (Option<i64>, Option<i64>, Option<f64>) = conn.query_row(
+            "SELECT SUM(prompt_tokens), SUM(completion_tokens), SUM(cost_usd)
+             FROM token_usage WHERE session_id=?1",
+            params![session_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(TokenUsage {
+            prompt_tokens: prompt.unwrap_or(0).max(0) as u64,
+            completion_tokens: completion.unwrap_or(0).max(0) as u64,
+            cost_usd: cost.unwrap_or(0.0),
+        })
+    }
+
+    /// Pin a session to a goal digest. Repeated calls replace the lock.
+    pub fn set_goal_lock(&self, session_id: &str, digest: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO goal_locks(session_id,digest,created_at) VALUES(?1,?2,?3)
+             ON CONFLICT(session_id) DO UPDATE SET digest=excluded.digest, created_at=excluded.created_at",
+            params![session_id, digest, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_goal_lock(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let digest = conn
+            .query_row(
+                "SELECT digest FROM goal_locks WHERE session_id=?1",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(digest)
+    }
+
+    pub fn set_session_flag(&self, session_id: &str, flag: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO session_flags(session_id,flag,created_at) VALUES(?1,?2,?3)",
+            params![session_id, flag, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_session_flag(&self, session_id: &str, flag: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM session_flags WHERE session_id=?1 AND flag=?2",
+                params![session_id, flag],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Distinct coverage targets in lexical order, used for progress reporting.
+    pub fn coverage_targets(&self, session_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT target FROM coverage WHERE session_id=?1 ORDER BY target ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| r.get::<_, String>(0))?;
+        let mut out = vec![];
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
 }
 
 const SENSITIVE_KEYS: &[&str] = &[
@@ -1570,8 +1793,162 @@ fn redact_prefixes(out: &mut String) {
     }
 }
 
-/// Redact secrets from structured JSON, key/value text, bearer tokens and
-/// well-known token prefixes. Used at every report and CLI output boundary.
+fn is_email_local_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-')
+}
+
+fn is_email_domain_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-')
+}
+
+/// Replace `local@domain.tld` tokens, keeping other uses of `@` intact.
+fn redact_emails(out: &mut String) {
+    let mut search = 0;
+    while let Some(rel) = out[search..].find('@') {
+        let at = search + rel;
+        let mut start = at;
+        while let Some(c) = out[..start].chars().next_back() {
+            if is_email_local_char(c) {
+                start -= c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let mut end = at + 1;
+        while end < out.len() {
+            let c = out[end..].chars().next().unwrap();
+            if is_email_domain_char(c) {
+                end += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let local = &out[start..at];
+        let domain = &out[at + 1..end];
+        let (label, tld) = domain.rsplit_once('.').unwrap_or(("", ""));
+        let looks_email = !local.is_empty()
+            && !label.is_empty()
+            && tld.len() >= 2
+            && tld.bytes().all(|b| b.is_ascii_alphabetic());
+        if looks_email {
+            out.replace_range(start..end, "[REDACTED]");
+            search = start + "[REDACTED]".len();
+        } else {
+            search = at + 1;
+        }
+    }
+}
+
+fn is_number_separator(c: char) -> bool {
+    matches!(c, ' ' | '-' | '(' | ')')
+}
+
+/// Year-first groups such as `2026-11-19 10` are timestamps, not phone numbers.
+fn looks_like_date(chunks: &[usize], digits: &str) -> bool {
+    chunks.len() >= 3
+        && chunks[0] == 4
+        && (digits.starts_with("19") || digits.starts_with("20"))
+        && chunks[1..].iter().all(|&n| n <= 2)
+}
+
+fn is_phone_chunks(chunks: &[usize], first_digit: char) -> bool {
+    match chunks {
+        [3, 3, 4] => true,
+        [1, 3, 3, 4] => first_digit == '1',
+        _ => false,
+    }
+}
+
+fn is_card_chunks(chunks: &[usize]) -> bool {
+    chunks.len() >= 2
+        && chunks[..chunks.len() - 1].iter().all(|&n| n == 4)
+        && (1..=4).contains(chunks.last().unwrap())
+}
+
+/// Redact phone numbers, payment cards and SSNs while leaving short numbers
+/// and dates alone. Separators are limited to spaces, dashes and parentheses.
+fn redact_pii_numbers(out: &mut String) {
+    let mut search = 0;
+    loop {
+        let bytes = out.as_bytes();
+        let mut candidate = None;
+        let mut j = search;
+        while j < bytes.len() {
+            let c = bytes[j] as char;
+            if c.is_ascii_digit()
+                || ((c == '+' || c == '(')
+                    && j + 1 < bytes.len()
+                    && (bytes[j + 1] as char).is_ascii_digit())
+            {
+                candidate = Some(j);
+                break;
+            }
+            j += 1;
+        }
+        let Some(start) = candidate else {
+            break;
+        };
+
+        let mut i = start;
+        if bytes[i] == b'+' || bytes[i] == b'(' {
+            i += 1;
+        }
+        let mut chunks = Vec::new();
+        let mut current = 0usize;
+        let mut digits = String::new();
+        let mut end = i;
+        while end < bytes.len() {
+            let c = bytes[end] as char;
+            if c.is_ascii_digit() {
+                digits.push(c);
+                current += 1;
+                end += 1;
+            } else if is_number_separator(c) {
+                let mut k = end;
+                while k < bytes.len() && is_number_separator(bytes[k] as char) {
+                    k += 1;
+                }
+                if k < bytes.len() && (bytes[k] as char).is_ascii_digit() {
+                    if current > 0 {
+                        chunks.push(current);
+                        current = 0;
+                    }
+                    end = k;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if current > 0 {
+            chunks.push(current);
+        }
+
+        let total: usize = chunks.iter().sum();
+        let first_digit = digits.chars().next().unwrap_or_default();
+        let is_ssn = chunks.as_slice() == [3, 2, 4];
+        let is_card = (13..=19).contains(&total) && (chunks.len() == 1 || is_card_chunks(&chunks));
+        let is_phone = if chunks.len() == 1 {
+            total == 10 || (total == 11 && first_digit == '1')
+        } else {
+            is_phone_chunks(&chunks, first_digit)
+        };
+        let should_redact = (is_card || is_ssn || is_phone) && !looks_like_date(&chunks, &digits);
+
+        if should_redact {
+            out.replace_range(start..end, "[REDACTED]");
+            search = start + "[REDACTED]".len();
+        } else {
+            search = end.max(start + 1);
+        }
+    }
+}
+
+/// Redact secrets and personally identifiable information from structured
+/// JSON, key/value text, bearer tokens, well-known token prefixes, email
+/// addresses, phone numbers, card numbers and SSNs. Used at every report and
+/// CLI output boundary.
 pub fn redact(input: &str) -> String {
     let mut out = if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(input) {
         if value.is_object() || value.is_array() {
@@ -1586,6 +1963,8 @@ pub fn redact(input: &str) -> String {
     redact_bearer(&mut out);
     redact_text_pairs(&mut out);
     redact_prefixes(&mut out);
+    redact_emails(&mut out);
+    redact_pii_numbers(&mut out);
     out
 }
 pub fn redact_sensitive(input: &str) -> String {
@@ -2030,5 +2409,188 @@ mod tests {
         assert!(report.contains("CWE:"));
         assert!(!report.contains("supersecret"));
         assert!(!report.contains("abc123"));
+    }
+
+    #[test]
+    fn event_hash_chain_and_tamper_detection() {
+        let store = Store::open(":memory:").unwrap();
+        let s = store.create_session("g").unwrap();
+        assert!(store.verify_event_chain(&s.id).unwrap());
+
+        store
+            .add_event(&s.id, "info", "session.start", "started")
+            .unwrap();
+        store
+            .add_event(&s.id, "warn", "tool.timeout", "timeout")
+            .unwrap();
+        let events = store.list_events(&s.id, 10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].prev_hash.is_none());
+        assert_eq!(events[0].hash.len(), 64);
+        assert_eq!(
+            events[1].prev_hash.as_deref(),
+            Some(events[0].hash.as_str())
+        );
+        assert_eq!(events[1].hash.len(), 64);
+        assert!(store.verify_event_chain(&s.id).unwrap());
+
+        // Tamper with a message directly; the stored hash no longer recomputes.
+        let tampered_id = events[1].id.clone();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE events SET message='tampered' WHERE id=?1",
+                params![tampered_id],
+            )
+            .unwrap();
+        }
+        assert!(!store.verify_event_chain(&s.id).unwrap());
+
+        // Restore it, then break the link by tampering with the stored hash.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE events SET message='timeout' WHERE id=?1",
+                params![tampered_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE events SET hash='deadbeef' WHERE id=?1",
+                params![events[0].id],
+            )
+            .unwrap();
+        }
+        assert!(!store.verify_event_chain(&s.id).unwrap());
+    }
+
+    #[test]
+    fn token_usage_accumulates_per_session() {
+        let store = Store::open(":memory:").unwrap();
+        let s = store.create_session("g").unwrap();
+        let empty = store.token_usage(&s.id).unwrap();
+        assert_eq!(empty.prompt_tokens, 0);
+        assert_eq!(empty.completion_tokens, 0);
+        assert_eq!(empty.cost_usd, 0.0);
+
+        store.record_token_usage(&s.id, 100, 20, 0.001).unwrap();
+        store.record_token_usage(&s.id, 50, 10, 0.0005).unwrap();
+        let usage = store.token_usage(&s.id).unwrap();
+        assert_eq!(usage.prompt_tokens, 150);
+        assert_eq!(usage.completion_tokens, 30);
+        assert!((usage.cost_usd - 0.0015).abs() < 1e-9);
+
+        let other = store.create_session("other").unwrap();
+        assert_eq!(store.token_usage(&other.id).unwrap().prompt_tokens, 0);
+    }
+
+    #[test]
+    fn finding_validation_is_persisted() {
+        let store = Store::open(":memory:").unwrap();
+        let s = store.create_session("g").unwrap();
+        let f = store
+            .add_finding(
+                &s.id, "Leak", "high", None, None, "desc", None, None, None, None,
+            )
+            .unwrap();
+        assert!(f.validated_at.is_none());
+        assert!(f.validation_detail.is_none());
+
+        store
+            .set_finding_validation(&f.id, "confirmed", Some("reproduced locally"))
+            .unwrap();
+        let findings = store.list_findings(&s.id).unwrap();
+        assert_eq!(findings[0].status, "confirmed");
+        assert!(findings[0].validated_at.is_some());
+        assert_eq!(
+            findings[0].validation_detail.as_deref(),
+            Some("reproduced locally")
+        );
+
+        store
+            .set_finding_validation(&f.id, "dismissed", None)
+            .unwrap();
+        let findings = store.list_findings(&s.id).unwrap();
+        assert_eq!(findings[0].status, "dismissed");
+        assert!(findings[0].validation_detail.is_none());
+        assert!(findings[0].validated_at.is_some());
+    }
+
+    #[test]
+    fn goal_locks_and_session_flags_are_scoped() {
+        let store = Store::open(":memory:").unwrap();
+        let s = store.create_session("g").unwrap();
+        let other = store.create_session("other").unwrap();
+
+        assert!(store.get_goal_lock(&s.id).unwrap().is_none());
+        store.set_goal_lock(&s.id, "digest-1").unwrap();
+        assert_eq!(
+            store.get_goal_lock(&s.id).unwrap().as_deref(),
+            Some("digest-1")
+        );
+        store.set_goal_lock(&s.id, "digest-2").unwrap();
+        assert_eq!(
+            store.get_goal_lock(&s.id).unwrap().as_deref(),
+            Some("digest-2")
+        );
+        assert!(store.get_goal_lock(&other.id).unwrap().is_none());
+
+        assert!(!store.has_session_flag(&s.id, "paused").unwrap());
+        store.set_session_flag(&s.id, "paused").unwrap();
+        store.set_session_flag(&s.id, "paused").unwrap();
+        store.set_session_flag(&s.id, "verified").unwrap();
+        assert!(store.has_session_flag(&s.id, "paused").unwrap());
+        assert!(store.has_session_flag(&s.id, "verified").unwrap());
+        assert!(!store.has_session_flag(&s.id, "missing").unwrap());
+        assert!(!store.has_session_flag(&other.id, "paused").unwrap());
+    }
+
+    #[test]
+    fn coverage_targets_are_distinct_and_sorted() {
+        let store = Store::open(":memory:").unwrap();
+        let s = store.create_session("g").unwrap();
+        store
+            .record_coverage(&s.id, "https://b.example", "GET", "/")
+            .unwrap();
+        store
+            .record_coverage(&s.id, "https://a.example", "GET", "/")
+            .unwrap();
+        store
+            .record_coverage(&s.id, "https://a.example", "POST", "/login")
+            .unwrap();
+        assert_eq!(
+            store.coverage_targets(&s.id).unwrap(),
+            vec![
+                "https://a.example".to_string(),
+                "https://b.example".to_string()
+            ]
+        );
+        assert!(store.coverage_targets(&s.id).unwrap().len() == 2);
+    }
+
+    #[test]
+    fn redaction_covers_pii_without_hiding_short_numbers() {
+        let out = redact("Contact alice.smith@example.com or call (415) 555-2671 today.");
+        assert!(!out.contains("alice.smith@example.com"));
+        assert!(!out.contains("415"));
+        assert!(!out.contains("555-2671"));
+        assert!(out.contains("Contact"));
+        assert!(out.contains("today."));
+
+        let out = redact("Card 4111 1111 1111 1111 and SSN 123-45-6789");
+        assert!(!out.contains("4111"));
+        assert!(!out.contains("123-45-6789"));
+        assert_eq!(out.matches("[REDACTED]").count(), 2);
+
+        let out = redact("phone 4155552671 card 4111111111111111");
+        assert!(!out.contains("4155552671"));
+        assert!(!out.contains("4111111111111111"));
+        assert_eq!(out.matches("[REDACTED]").count(), 2);
+
+        let out = redact(r#"{"to":"bob@example.org"}"#);
+        assert!(!out.contains("bob@example.org"));
+        assert!(out.contains("[REDACTED]"));
+
+        let plain = "port 8080 on 2026-11-19 at 10:30";
+        assert_eq!(redact(plain), plain);
     }
 }

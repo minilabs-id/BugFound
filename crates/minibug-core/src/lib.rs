@@ -13,6 +13,16 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+pub mod compaction;
+pub mod error;
+pub mod event;
+pub mod execution;
+pub mod inbox;
+pub mod skill;
+pub mod step;
+pub mod subagent;
+pub mod usage;
+
 const DEFAULT_LEASE_SECS: i64 = 120;
 
 /// Digest binding a run to its original goal and scope. Any drift is a
@@ -604,6 +614,12 @@ impl Runner {
 
     /// Terminal state transition, guarded and followed by lease release.
     fn finish(&self, session_id: &str, state: &str, level: &str, kind: &str, message: &str) {
+        let coordinator_state = match state {
+            "waiting_approval" => execution::ExecutionState::Waiting,
+            "interrupted" => execution::ExecutionState::Interrupted,
+            _ => execution::ExecutionState::Idle,
+        };
+        execution::ExecutionCoordinator::global().finish(session_id, coordinator_state);
         match self.store.transition_state(
             session_id,
             &["running", "waiting_approval", "interrupted"],
@@ -1168,6 +1184,16 @@ impl Runner {
         self.store.ensure_budget(session_id)?;
         let mut step = self.store.budget_usage(session_id)?.steps_used;
         while step < self.effective_max_steps() {
+            if execution::ExecutionCoordinator::global().is_cancelled(session_id) {
+                self.finish(
+                    session_id,
+                    "interrupted",
+                    "warn",
+                    "session.interrupted",
+                    "session interrupted by request",
+                );
+                return Err(anyhow!("interrupted"));
+            }
             self.store.record_step(session_id)?;
             step += 1;
             self.renew_claim(session_id);

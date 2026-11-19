@@ -1296,7 +1296,12 @@ fn substitute_placeholder(arg: &str, input: &Value) -> String {
             continue;
         };
         let key = &after[..end];
-        if ["target", "host", "url", "word"].contains(&key) {
+        if [
+            "target", "host", "url", "word", "domain", "ports", "param", "marker", "action",
+            "selector", "script", "match",
+        ]
+        .contains(&key)
+        {
             out.push_str(input.get(key).and_then(|v| v.as_str()).unwrap_or(""));
             rest = &after[end + 1..];
             continue;
@@ -1452,6 +1457,67 @@ pub fn try_default_registry_with_options(
     if options.enable_external_tools {
         register_external_adapters(&mut reg, cwd, &options);
     }
+    register_command_adapters(&mut reg, cwd, &options);
+
+    // New built-in tools. These are always present; network/intrusive ones
+    // that depend on an external binary return a gated result when absent.
+    reg.register(Arc::new(HttpFuzzTool {
+        http: HttpRequestTool::with_options(options.clone()),
+    }));
+    reg.register(Arc::new(HttpProbeTool {
+        http: HttpRequestTool::with_options(options.clone()),
+    }));
+    reg.register(Arc::new(PayloadForgeTool));
+    reg.register(Arc::new(JwtDecodeTool));
+    reg.register(Arc::new(HashUtilTool));
+    reg.register(Arc::new(KnowledgeLookupTool));
+    reg.register(Arc::new(ReportWriterTool));
+    reg.register(Arc::new(TaskPutTool));
+    reg.register(Arc::new(CluePutTool));
+
+    reg.register(Arc::new(ExternalBackedTool {
+        name: "subdomain_enum",
+        description:
+            "Enumerate subdomains via the registered subfinder adapter (gated when unavailable).",
+        risk: "network",
+        required: &["target", "domain"],
+        commands: &["subfinder"],
+        registry: reg.clone(),
+    }));
+    reg.register(Arc::new(ExternalBackedTool {
+        name: "port_scan",
+        description:
+            "Port scan via nmap/naabu; gated unless explicitly enabled in external_commands.",
+        risk: "intrusive",
+        required: &["host", "ports"],
+        commands: &["nmap", "naabu"],
+        registry: reg.clone(),
+    }));
+    reg.register(Arc::new(ExternalBackedTool {
+        name: "content_discovery",
+        description: "Discover content via ffuf/katana; gated when no adapter is available.",
+        risk: "network",
+        required: &["url", "wordlist"],
+        commands: &["ffuf", "katana"],
+        registry: reg.clone(),
+    }));
+    reg.register(Arc::new(ExternalBackedTool {
+        name: "vuln_scan",
+        description:
+            "Vulnerability scan via nuclei; gated unless explicitly enabled in external_commands.",
+        risk: "intrusive",
+        required: &["url", "target"],
+        commands: &["nuclei"],
+        registry: reg.clone(),
+    }));
+    reg.register(Arc::new(ExternalBackedTool {
+        name: "browser",
+        description: "Browser automation adapter via a configured playwright CLI (navigate/click/screenshot); gated when unavailable.",
+        risk: "network",
+        required: &["url", "action"],
+        commands: &["playwright"],
+        registry: reg.clone(),
+    }));
     Ok(reg)
 }
 
@@ -1571,7 +1637,12 @@ fn register_external_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &Tool
             cwd,
         )));
     }
-    for name in ["nuclei", "nmap"] {
+}
+
+/// Command-driven adapters are gated solely by `external_commands`: providing
+/// a command is the explicit opt-in, independent of `enable_external_tools`.
+fn register_command_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &ToolOptions) {
+    for name in ["nmap", "naabu", "nuclei", "playwright"] {
         let Some(command) = options.external_commands.get(name) else {
             continue;
         };
@@ -1597,6 +1668,1304 @@ pub fn default_registry(cwd: impl AsRef<Path>) -> ToolRegistry {
 
 pub fn default_registry_with_options(cwd: impl AsRef<Path>, options: ToolOptions) -> ToolRegistry {
     try_default_registry_with_options(cwd, options).expect("invalid workspace cwd")
+}
+
+// ---------------------------------------------------------------------------
+// Local encoding / hashing primitives.
+//
+// These are implemented in-tree so the crate does not need extra declared
+// dependencies. They back `jwt_decode`, `hash_util` and the evidence hashes in
+// `report_writer`.
+// ---------------------------------------------------------------------------
+
+const B64_STANDARD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_URLSAFE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+fn b64_encode(data: &[u8], url_safe: bool, pad: bool) -> String {
+    let table = if url_safe { B64_URLSAFE } else { B64_STANDARD };
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let (chunks, rem) = data.as_chunks::<3>();
+    for chunk in chunks {
+        let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
+        out.push(table[((n >> 18) & 63) as usize] as char);
+        out.push(table[((n >> 12) & 63) as usize] as char);
+        out.push(table[((n >> 6) & 63) as usize] as char);
+        out.push(table[(n & 63) as usize] as char);
+    }
+    if rem.len() == 1 {
+        let n = (rem[0] as u32) << 16;
+        out.push(table[((n >> 18) & 63) as usize] as char);
+        out.push(table[((n >> 12) & 63) as usize] as char);
+        if pad {
+            out.push_str("==");
+        }
+    } else if rem.len() == 2 {
+        let n = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
+        out.push(table[((n >> 18) & 63) as usize] as char);
+        out.push(table[((n >> 12) & 63) as usize] as char);
+        out.push(table[((n >> 6) & 63) as usize] as char);
+        if pad {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Accepts both standard and URL-safe alphabets, with or without padding.
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut vals: Vec<u8> = Vec::with_capacity(s.len());
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            b'\n' | b'\r' | b' ' | b'\t' => continue,
+            _ => return None,
+        };
+        vals.push(v);
+    }
+    if vals.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(vals.len() * 3 / 4);
+    let (full, rem) = vals.as_chunks::<4>();
+    for c in full {
+        let n =
+            ((c[0] as u32) << 18) | ((c[1] as u32) << 12) | ((c[2] as u32) << 6) | (c[3] as u32);
+        out.push((n >> 16) as u8);
+        out.push((n >> 8) as u8);
+        out.push(n as u8);
+    }
+    if rem.len() == 2 {
+        let n = ((rem[0] as u32) << 18) | ((rem[1] as u32) << 12);
+        out.push((n >> 16) as u8);
+    } else if rem.len() == 3 {
+        let n = ((rem[0] as u32) << 18) | ((rem[1] as u32) << 12) | ((rem[2] as u32) << 6);
+        out.push((n >> 16) as u8);
+        out.push((n >> 8) as u8);
+    }
+    Some(out)
+}
+
+fn hex_encode(data: &[u8]) -> String {
+    const H: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(data.len() * 2);
+    for &b in data {
+        out.push(H[(b >> 4) as usize] as char);
+        out.push(H[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn md5_hex(data: &[u8]) -> String {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const K: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+        0xeb86d391,
+    ];
+    let mut msg = data.to_vec();
+    let bit_len = (msg.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_le_bytes());
+
+    let (mut h0, mut h1, mut h2, mut h3) =
+        (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
+    for chunk in msg.as_chunks::<64>().0 {
+        let mut m = [0u32; 16];
+        for (i, word) in m.iter_mut().enumerate() {
+            let j = i * 4;
+            *word = u32::from_le_bytes([chunk[j], chunk[j + 1], chunk[j + 2], chunk[j + 3]]);
+        }
+        let (mut a, mut b, mut c, mut d) = (h0, h1, h2, h3);
+        for (i, (&k, &s)) in K.iter().zip(S.iter()).enumerate() {
+            let (f, g) = match i {
+                0..=15 => ((b & c) | (!b & d), i),
+                16..=31 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            let mixed = a
+                .wrapping_add(f)
+                .wrapping_add(k)
+                .wrapping_add(m[g])
+                .rotate_left(s);
+            let tmp = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(mixed);
+            a = tmp;
+        }
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+    }
+    let mut out = String::with_capacity(32);
+    // MD5 serialises each word in little-endian byte order.
+    for w in [h0, h1, h2, h3] {
+        out.push_str(&format!("{:08x}", w.swap_bytes()));
+    }
+    out
+}
+
+fn sha1_hex(data: &[u8]) -> String {
+    let mut msg = data.to_vec();
+    let bit_len = (msg.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    let mut h = [
+        0x67452301u32,
+        0xefcdab89,
+        0x98badcfe,
+        0x10325476,
+        0xc3d2e1f0,
+    ];
+    for chunk in msg.as_chunks::<64>().0 {
+        let mut w = [0u32; 80];
+        for (i, word) in w.iter_mut().enumerate().take(16) {
+            let j = i * 4;
+            *word = u32::from_be_bytes([chunk[j], chunk[j + 1], chunk[j + 2], chunk[j + 3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5a827999),
+                20..=39 => (b ^ c ^ d, 0x6ed9eba1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
+                _ => (b ^ c ^ d, 0xca62c1d6),
+            };
+            let t = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    let mut out = String::with_capacity(40);
+    for word in h {
+        out.push_str(&format!("{word:08x}"));
+    }
+    out
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut msg = data.to_vec();
+    let bit_len = (msg.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    let mut h = [
+        0x6a09e667u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    for chunk in msg.as_chunks::<64>().0 {
+        let mut w = [0u32; 64];
+        for (i, word) in w.iter_mut().enumerate().take(16) {
+            let j = i * 4;
+            *word = u32::from_be_bytes([chunk[j], chunk[j + 1], chunk[j + 2], chunk[j + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d) = (h[0], h[1], h[2], h[3]);
+        let (mut e, mut f, mut g, mut hh) = (h[4], h[5], h[6], h[7]);
+        for (i, &k) in K.iter().enumerate() {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(k)
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    let mut out = String::with_capacity(64);
+    for word in h {
+        out.push_str(&format!("{word:08x}"));
+    }
+    out
+}
+
+fn as_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+            .join(","),
+        _ => String::new(),
+    }
+}
+
+fn str_field<'a>(value: &'a Value, keys: &[&str], default: &'a str) -> &'a str {
+    for key in keys {
+        if let Some(s) = value.get(*key).and_then(Value::as_str) {
+            return s;
+        }
+    }
+    default
+}
+
+fn gated_result(name: &str, reason: &str, fields: Value) -> ToolResult {
+    let mut map = serde_json::Map::new();
+    map.insert("ok".into(), Value::Bool(false));
+    map.insert("gated".into(), Value::Bool(true));
+    map.insert("tool".into(), Value::String(name.to_string()));
+    map.insert("message".into(), Value::String(reason.to_string()));
+    if let Value::Object(extra) = fields {
+        for (key, value) in extra {
+            map.insert(key, value);
+        }
+    }
+    let structured = Value::Object(map);
+    ToolResult {
+        ok: false,
+        output: truncate(reason),
+        structured: Some(structured),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Safe, local-only tools.
+// ---------------------------------------------------------------------------
+
+/// Generate locally-computed payload strings for a vulnerability class.
+pub struct PayloadForgeTool;
+
+fn forge_payloads(kind: &str, context: &str, marker: &str) -> Vec<String> {
+    let mut payloads: Vec<String> = match kind {
+        "xss" => vec![
+            format!("<script>{marker}</script>"),
+            format!("<img src=x onerror=\"{marker}\">"),
+            format!("\"><svg onload={marker}>"),
+            format!("javascript:{marker}"),
+        ],
+        "sqli" => vec![
+            "' OR '1'='1".to_string(),
+            format!("' UNION SELECT NULL,{marker}--"),
+            "1' AND '1'='1".to_string(),
+            format!("' OR 1=1 -- {marker}"),
+        ],
+        "ssrf" => vec![
+            format!("http://{marker}/"),
+            "http://169.254.169.254/latest/meta-data/".to_string(),
+            "file:///etc/passwd".to_string(),
+            "gopher://127.0.0.1:6379/_INFO".to_string(),
+        ],
+        "ssti" => vec![
+            "{{7*7}}".to_string(),
+            "${7*7}".to_string(),
+            format!("<%= {marker} %>"),
+            format!("{{{{{marker}}}}}"),
+        ],
+        "cmdi" => vec![
+            format!("; {marker}"),
+            format!("| {marker}"),
+            format!("$({marker})"),
+            format!("`{marker}`"),
+        ],
+        _ => vec![marker.to_string()],
+    };
+    match context {
+        "html" => payloads.insert(0, format!("&lt;script&gt;{marker}&lt;/script&gt;")),
+        "attr" => {
+            for payload in &mut payloads {
+                *payload = format!("\" onmouseover=\"{payload}");
+            }
+        }
+        "js" => {
+            for payload in &mut payloads {
+                *payload = format!("'; {payload}; //");
+            }
+        }
+        "url" => {
+            for payload in &mut payloads {
+                *payload = b64_encode(payload.as_bytes(), true, false);
+            }
+        }
+        _ => {}
+    }
+    payloads
+}
+
+#[async_trait]
+impl Tool for PayloadForgeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "payload_forge".into(),
+            description: "Generate XSS/SQLi/SSRF/SSTI/CMDI payload strings locally without any network access.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["xss","sqli","ssrf","ssti","cmdi"]},
+                    "context": {"type": "string", "enum": ["html","attr","js","url","plain"]},
+                    "marker": {"type": "string"}
+                },
+                "required": ["kind"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let kind = input
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("kind required"))?;
+        let context = input
+            .get("context")
+            .and_then(Value::as_str)
+            .unwrap_or("plain");
+        let marker = input
+            .get("marker")
+            .and_then(Value::as_str)
+            .unwrap_or("MINIBUG");
+        let payloads = forge_payloads(kind, context, marker);
+        let structured = json!({
+            "ok": true,
+            "kind": kind,
+            "context": context,
+            "marker": marker,
+            "payloads": payloads,
+            "count": payloads.len()
+        });
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&format!("generated {} {kind} payload(s)", payloads.len())),
+            structured: Some(structured),
+        })
+    }
+}
+
+/// Decode a JWT's header and payload without verifying the signature.
+pub struct JwtDecodeTool;
+
+#[async_trait]
+impl Tool for JwtDecodeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "jwt_decode".into(),
+            description: "Decode a JWT's header and payload segments with base64url. Signature is never verified.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"token": {"type": "string"}},
+                "required": ["token"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let token = input
+            .get("token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("token required"))?;
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() < 2 {
+            return Ok(ToolResult {
+                ok: false,
+                output: "jwt must contain at least two dot-separated segments".into(),
+                structured: Some(json!({"ok": false, "error": "too few segments"})),
+            });
+        }
+        let header_bytes = b64_decode(parts[0]);
+        let payload_bytes = b64_decode(parts[1]);
+        let header_json = header_bytes
+            .as_deref()
+            .and_then(|b| serde_json::from_slice::<Value>(b).ok());
+        let payload_json = payload_bytes
+            .as_deref()
+            .and_then(|b| serde_json::from_slice::<Value>(b).ok());
+        let signature_bytes = parts.get(2).and_then(|s| b64_decode(s));
+        let decoded_header = header_bytes
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        let decoded_payload = payload_bytes
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        let ok = header_json.is_some() && payload_json.is_some();
+        let structured = json!({
+            "ok": ok,
+            "verified": false,
+            "part_count": parts.len(),
+            "segments": {
+                "header": {"raw": parts[0], "decoded": decoded_header, "json": header_json},
+                "payload": {"raw": parts[1], "decoded": decoded_payload, "json": payload_json},
+                "signature": {
+                    "raw": parts.get(2).cloned().unwrap_or(""),
+                    "bytes": signature_bytes.as_ref().map(Vec::len).unwrap_or(0)
+                }
+            },
+            "header": header_json,
+            "payload": payload_json
+        });
+        Ok(ToolResult {
+            ok,
+            output: truncate(&format!(
+                "jwt decoded (unverified): header={}, payload={}",
+                ok, ok
+            )),
+            structured: Some(structured),
+        })
+    }
+}
+
+/// Hash / encode / decode a value locally.
+pub struct HashUtilTool;
+
+#[async_trait]
+impl Tool for HashUtilTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "hash_util".into(),
+            description:
+                "Local hashing/encoding utility: md5, sha1, sha256, b64encode, b64decode, hex."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string"},
+                    "op": {"type": "string", "enum": ["md5","sha1","sha256","b64encode","b64decode","hex"]}
+                },
+                "required": ["value", "op"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let value = input
+            .get("value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("value required"))?;
+        let op = input
+            .get("op")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("op required"))?;
+        let result = match op {
+            "md5" => md5_hex(value.as_bytes()),
+            "sha1" => sha1_hex(value.as_bytes()),
+            "sha256" => sha256_hex(value.as_bytes()),
+            "b64encode" => b64_encode(value.as_bytes(), false, true),
+            "b64decode" => b64_decode(value)
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default(),
+            "hex" => hex_encode(value.as_bytes()),
+            _ => {
+                return Ok(ToolResult {
+                    ok: false,
+                    output: format!("unsupported op '{op}'"),
+                    structured: Some(json!({
+                        "ok": false,
+                        "op": op,
+                        "error": "unsupported op",
+                        "supported": ["md5","sha1","sha256","b64encode","b64decode","hex"]
+                    })),
+                });
+            }
+        };
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&result),
+            structured: Some(json!({"ok": true, "op": op, "value": value, "result": result})),
+        })
+    }
+}
+
+const KNOWLEDGE_BASE: &[(&str, &str, &[&str], &[&str])] = &[
+    (
+        "WSTG-INFO-01",
+        "Information Gathering",
+        &["recon", "enumerate", "fingerprint", "discovery", "osint"],
+        &["CWE-200"],
+    ),
+    (
+        "WSTG-CONF-01",
+        "Configuration and Deployment Management",
+        &["config", "header", "misconfig", "default", "cms"],
+        &["CWE-16", "CWE-693"],
+    ),
+    (
+        "WSTG-IDNT-01",
+        "Identity Management Testing",
+        &["identity", "username", "user enumeration", "account"],
+        &["CWE-204", "CWE-799"],
+    ),
+    (
+        "WSTG-ATHN-01",
+        "Authentication Testing",
+        &["login", "password", "auth", "brute", "mfa", "jwt"],
+        &["CWE-287", "CWE-307"],
+    ),
+    (
+        "WSTG-ATHZ-01",
+        "Authorization Testing",
+        &["idor", "access control", "privilege", "bypass", "rbac"],
+        &["CWE-284", "CWE-639"],
+    ),
+    (
+        "WSTG-SESS-01",
+        "Session Management Testing",
+        &["session", "cookie", "csrf", "token", "logout"],
+        &["CWE-384", "CWE-352"],
+    ),
+    (
+        "WSTG-INPV-01",
+        "Input Validation Testing",
+        &[
+            "xss",
+            "sqli",
+            " injection",
+            "fuzz",
+            "validation",
+            "ssrf",
+            "ssti",
+            "cmdi",
+        ],
+        &["CWE-79", "CWE-89", "CWE-918", "CWE-94", "CWE-78", "CWE-20"],
+    ),
+    (
+        "WSTG-ERRH-01",
+        "Error Handling",
+        &["error", "stack trace", "verbose", "exception"],
+        &["CWE-209"],
+    ),
+    (
+        "WSTG-CRYP-01",
+        "Cryptography Testing",
+        &["tls", "ssl", "cipher", "crypto", "certificate", "hash"],
+        &["CWE-327", "CWE-295"],
+    ),
+    (
+        "WSTG-BUSL-01",
+        "Business Logic Testing",
+        &["logic", "workflow", "race", "price", "transaction"],
+        &["CWE-840"],
+    ),
+    (
+        "WSTG-CLNT-01",
+        "Client-side Testing",
+        &["dom", "javascript", "cors", "clickjack", "browser"],
+        &["CWE-79", "CWE-346", "CWE-1021"],
+    ),
+    (
+        "WSTG-APIT-01",
+        "API Testing",
+        &["api", "graphql", "rest", "endpoint", "swagger"],
+        &["CWE-200", "CWE-284"],
+    ),
+];
+
+/// Look up bundled OWASP WSTG categories and CWE hints by keyword.
+pub struct KnowledgeLookupTool;
+
+#[async_trait]
+impl Tool for KnowledgeLookupTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "knowledge_lookup".into(),
+            description: "Search the bundled OWASP WSTG category and CWE hint list by keyword (no external service).".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let query = input
+            .get("query")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("query required"))?;
+        let needle = query.trim().to_ascii_lowercase();
+        let mut matches: Vec<Value> = Vec::new();
+        for (id, category, keywords, cwes) in KNOWLEDGE_BASE {
+            let haystack = format!("{id} {category} {}", keywords.join(" ")).to_ascii_lowercase();
+            let score = needle
+                .split_whitespace()
+                .filter(|word| !word.is_empty() && haystack.contains(word))
+                .count();
+            if score > 0 {
+                matches.push(json!({
+                    "id": id,
+                    "category": category,
+                    "cwe": cwes,
+                    "keywords": keywords,
+                    "score": score
+                }));
+            }
+        }
+        matches.sort_by(|a, b| {
+            b["score"]
+                .as_u64()
+                .unwrap_or(0)
+                .cmp(&a["score"].as_u64().unwrap_or(0))
+        });
+        let count = matches.len();
+        let structured = json!({"ok": true, "query": query, "matches": matches, "count": count});
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&format!("{count} knowledge entry(ies) matched '{query}'")),
+            structured: Some(structured),
+        })
+    }
+}
+
+fn render_report(input: &Value) -> (String, Vec<String>) {
+    let program = str_field(input, &["program", "name", "title"], "Unnamed program");
+    let scope = match input.get("scope") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+        Some(Value::String(s)) => s.clone(),
+        _ => "(not specified)".to_string(),
+    };
+    let findings = input
+        .get("findings")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    let mut markdown = String::new();
+    markdown.push_str(&format!("# Security Assessment Report — {program}\n\n"));
+    markdown.push_str("## Executive Summary\n\n");
+    markdown.push_str(&format!(
+        "This report documents {} validated finding(s) discovered during the engagement. Findings are prioritised by severity and include reproduction steps, proof of concept, impact, remediation and evidence integrity hashes.\n\n",
+        findings.len()
+    ));
+    markdown.push_str("## Scope\n\n");
+    markdown.push_str(&format!("**Scope:** {scope}\n\n"));
+    markdown.push_str("## Methodology\n\n");
+    markdown.push_str(
+        "Testing combined passive reconnaissance, scoped HTTP probing, parameter fuzzing and manual validation. Each candidate issue was reproduced and assessed against OWASP WSTG and CWE guidance.\n\n",
+    );
+    markdown.push_str("## Findings\n\n");
+    if findings.is_empty() {
+        markdown.push_str("_No findings were recorded._\n\n");
+    }
+    let mut evidence_hashes: Vec<String> = Vec::new();
+    let mut coverage: Vec<String> = Vec::new();
+    for (index, finding) in findings.iter().enumerate() {
+        let title = str_field(finding, &["title", "name"], "(untitled)");
+        let severity = str_field(finding, &["severity", "risk"], "info");
+        let cvss = str_field(finding, &["cvss", "cvss_score", "cvss_vector"], "N/A");
+        let cwe = str_field(finding, &["cwe"], "N/A");
+        let steps = str_field(finding, &["steps", "reproduction", "repro"], "Not provided");
+        let poc = str_field(
+            finding,
+            &["poc", "proof_of_concept", "request"],
+            "Not provided",
+        );
+        let impact = str_field(finding, &["impact"], "Not provided");
+        let remediation = str_field(finding, &["remediation", "fix"], "Not provided");
+        let evidence = str_field(finding, &["evidence", "response"], "");
+        let hash = sha256_hex(evidence.as_bytes());
+        evidence_hashes.push(hash.clone());
+        let asset = str_field(finding, &["asset", "target", "url", "host"], "");
+        if !asset.is_empty() && !coverage.iter().any(|c| c == asset) {
+            coverage.push(asset.to_string());
+        }
+        markdown.push_str(&format!("### F-{:02}: {title}\n\n", index + 1));
+        markdown.push_str(&format!("- **Severity:** {severity}\n"));
+        markdown.push_str(&format!("- **CVSS:** {cvss}\n"));
+        markdown.push_str(&format!("- **CWE:** {cwe}\n"));
+        markdown.push_str(&format!("- **Evidence SHA-256:** `{hash}`\n\n"));
+        markdown.push_str(&format!("#### Steps to Reproduce\n\n{steps}\n\n"));
+        markdown.push_str("#### Proof of Concept\n\n");
+        markdown.push_str(&format!("```\n{poc}\n```\n\n"));
+        markdown.push_str(&format!("#### Impact\n\n{impact}\n\n"));
+        markdown.push_str(&format!("#### Remediation\n\n{remediation}\n\n"));
+    }
+    markdown.push_str("## Coverage\n\n");
+    if coverage.is_empty() {
+        markdown.push_str("- No specific assets were tagged in the supplied findings.\n\n");
+    } else {
+        for asset in &coverage {
+            markdown.push_str(&format!("- `{asset}`\n"));
+        }
+        markdown.push('\n');
+    }
+    markdown.push_str("## Timeline\n\n");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    markdown.push_str(&format!("- Report generated at Unix epoch {now}.\n"));
+    markdown.push_str("- Activity order: reconnaissance → discovery → validation → reporting.\n\n");
+    markdown.push_str("## Appendices\n\n");
+    markdown.push_str("### A. Evidence Integrity\n\n");
+    for (index, hash) in evidence_hashes.iter().enumerate() {
+        markdown.push_str(&format!("- Finding F-{:02}: `{hash}`\n", index + 1));
+    }
+    markdown.push_str("\n### B. References\n\n");
+    markdown.push_str("- OWASP Web Security Testing Guide (WSTG)\n");
+    markdown.push_str("- MITRE CWE / Common Vulnerability Scoring System (CVSS)\n");
+    (markdown, evidence_hashes)
+}
+
+/// Render a Markdown report from structured findings.
+pub struct ReportWriterTool;
+
+#[async_trait]
+impl Tool for ReportWriterTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "report_writer".into(),
+            description: "Render a Markdown security report with Executive Summary, Scope, Methodology, Findings (CVSS/CWE/PoC/impact/remediation/evidence hash), Coverage, Timeline and Appendices.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "findings": {"type": "array", "items": {"type": "object"}},
+                    "program": {"type": "string"},
+                    "scope": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}
+                },
+                "required": ["findings"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let (markdown, hashes) = render_report(&input);
+        let finding_count = input
+            .get("findings")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let structured = json!({
+            "ok": true,
+            "markdown": markdown,
+            "finding_count": finding_count,
+            "evidence_hashes": hashes
+        });
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&markdown),
+            structured: Some(structured),
+        })
+    }
+}
+
+/// Echo a durable task record for the engagement layer to persist.
+pub struct TaskPutTool;
+
+#[async_trait]
+impl Tool for TaskPutTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "task_put".into(),
+            description: "Emit a structured task record (statement, playbook_id, target, priority) for the engagement layer to persist.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "statement": {"type": "string"},
+                    "playbook_id": {"type": "string"},
+                    "target": {"type": "string"},
+                    "priority": {"type": "string"}
+                },
+                "required": ["statement"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let task = json!({
+            "statement": as_text(input.get("statement")),
+            "playbook_id": as_text(input.get("playbook_id")),
+            "target": as_text(input.get("target")),
+            "priority": as_text(input.get("priority").or_else(|| input.get("severity"))),
+            "status": "pending"
+        });
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&format!(
+                "task queued (pending persist): {}",
+                task["statement"]
+            )),
+            structured: Some(json!({"ok": true, "task": task})),
+        })
+    }
+}
+
+/// Echo a durable clue record for the engagement layer to persist.
+pub struct CluePutTool;
+
+#[async_trait]
+impl Tool for CluePutTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "clue_put".into(),
+            description: "Emit a structured clue record (key, value, source_tool, task_id) for the engagement layer to persist.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "value": {"type": "string"},
+                    "source_tool": {"type": "string"},
+                    "task_id": {"type": "string"}
+                },
+                "required": ["key", "value"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let clue = json!({
+            "key": as_text(input.get("key")),
+            "value": as_text(input.get("value")),
+            "source_tool": as_text(input.get("source_tool")),
+            "task_id": as_text(input.get("task_id"))
+        });
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&format!("clue queued (pending persist): {}", clue["key"])),
+            structured: Some(json!({"ok": true, "clue": clue})),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP-backed tools. All requests go through HttpRequestTool so scope, DNS
+// pinning and redaction rules are preserved.
+// ---------------------------------------------------------------------------
+
+/// Fuzz a parameter (or an explicit marker) and record per-payload results.
+pub struct HttpFuzzTool {
+    http: HttpRequestTool,
+}
+
+fn fuzz_candidate(
+    base: &url::Url,
+    marker: &str,
+    param: Option<&str>,
+    payload: &str,
+) -> Option<url::Url> {
+    if base.as_str().contains(marker) {
+        return url::Url::parse(&base.as_str().replace(marker, payload)).ok();
+    }
+    let Some(param) = param else {
+        return Some(base.clone());
+    };
+    let mut candidate = base.clone();
+    let pairs: Vec<(String, String)> = candidate.query_pairs().into_owned().collect();
+    {
+        let mut query = candidate.query_pairs_mut();
+        query.clear();
+        let mut replaced = false;
+        for (key, value) in pairs {
+            if key == param {
+                query.append_pair(&key, payload);
+                replaced = true;
+            } else {
+                query.append_pair(&key, &value);
+            }
+        }
+        if !replaced {
+            query.append_pair(param, payload);
+        }
+    }
+    Some(candidate)
+}
+
+#[async_trait]
+impl Tool for HttpFuzzTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "http_fuzz".into(),
+            description: "Fuzz a URL parameter or marker with a wordlist using the scoped HTTP client. Records status, response length and marker presence per payload.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "method": {"type": "string", "default": "GET"},
+                    "param": {"type": "string"},
+                    "wordlist": {"type": "array", "items": {"type": "string"}},
+                    "marker": {"type": "string", "default": "FUZZ"},
+                    "match": {"type": "string"}
+                },
+                "required": ["url", "wordlist"]
+            }),
+            risk: "network-write".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let raw_url = input
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("url required"))?;
+        let base = url::Url::parse(raw_url).context("invalid url")?;
+        let wordlist = input
+            .get("wordlist")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("wordlist required"))?;
+        let method = input.get("method").and_then(Value::as_str).unwrap_or("GET");
+        let marker = input
+            .get("marker")
+            .and_then(Value::as_str)
+            .unwrap_or("FUZZ");
+        let param = input.get("param").and_then(Value::as_str);
+        let explicit_match = input.get("match").and_then(Value::as_str);
+        let mut results: Vec<Value> = Vec::new();
+        for payload in wordlist.iter().filter_map(Value::as_str) {
+            let mut entry = serde_json::Map::new();
+            entry.insert("payload".into(), Value::String(payload.to_string()));
+            let Some(candidate) = fuzz_candidate(&base, marker, param, payload) else {
+                entry.insert("ok".into(), Value::Bool(false));
+                entry.insert(
+                    "error".into(),
+                    Value::String("payload could not be encoded into url".into()),
+                );
+                results.push(Value::Object(entry));
+                continue;
+            };
+            entry.insert("url".into(), Value::String(candidate.to_string()));
+            match self
+                .http
+                .run(json!({"url": candidate.as_str(), "method": method}))
+                .await
+            {
+                Ok(response) => {
+                    let data = response.structured.unwrap_or_else(|| json!({}));
+                    let status = data.get("status").and_then(Value::as_u64).unwrap_or(0);
+                    let length = data.get("body_bytes").and_then(Value::as_u64).unwrap_or(0);
+                    let body = data.get("body").and_then(Value::as_str).unwrap_or("");
+                    let needle = explicit_match.unwrap_or(payload);
+                    let marker_found = !needle.is_empty() && body.contains(needle);
+                    entry.insert("status".into(), json!(status));
+                    entry.insert("length".into(), json!(length));
+                    entry.insert("marker_found".into(), Value::Bool(marker_found));
+                    entry.insert("ok".into(), Value::Bool(response.ok));
+                }
+                Err(err) => {
+                    entry.insert("status".into(), json!(0));
+                    entry.insert("length".into(), json!(0));
+                    entry.insert("marker_found".into(), Value::Bool(false));
+                    entry.insert("ok".into(), Value::Bool(false));
+                    entry.insert("error".into(), Value::String(redact(&err.to_string())));
+                }
+            }
+            results.push(Value::Object(entry));
+        }
+        let any_ok = results
+            .iter()
+            .any(|r| r.get("ok").and_then(Value::as_bool).unwrap_or(false));
+        let structured = json!({
+            "ok": any_ok,
+            "url": raw_url,
+            "param": param,
+            "marker": marker,
+            "results": results
+        });
+        Ok(ToolResult {
+            ok: any_ok,
+            output: truncate(&format!(
+                "fuzzed {} payload(s) against {}",
+                results.len(),
+                raw_url
+            )),
+            structured: Some(structured),
+        })
+    }
+}
+
+fn detect_tech(haystack: &str) -> Vec<String> {
+    const SIGNATURES: &[(&str, &str)] = &[
+        ("wp-content", "WordPress"),
+        ("wp-includes", "WordPress"),
+        ("joomla", "Joomla"),
+        ("drupal", "Drupal"),
+        ("django", "Django"),
+        ("laravel", "Laravel"),
+        ("express", "Express"),
+        ("next.js", "Next.js"),
+        ("react", "React"),
+        ("jquery", "jQuery"),
+        ("asp.net", "ASP.NET"),
+        ("php", "PHP"),
+        ("nginx", "nginx"),
+        ("apache", "Apache"),
+        ("cloudflare", "Cloudflare"),
+    ];
+    let mut tech: Vec<String> = Vec::new();
+    for (needle, name) in SIGNATURES {
+        if haystack.contains(needle) && !tech.iter().any(|t| t == name) {
+            tech.push((*name).to_string());
+        }
+    }
+    tech
+}
+
+fn extract_title(body: &str) -> Option<String> {
+    let lower = body.to_ascii_lowercase();
+    let start = lower.find("<title>")? + "<title>".len();
+    let end_rel = lower[start..].find("</title>")?;
+    Some(body[start..start + end_rel].trim().to_string())
+}
+
+/// Lightweight fingerprint of a single in-scope URL.
+pub struct HttpProbeTool {
+    http: HttpRequestTool,
+}
+
+#[async_trait]
+impl Tool for HttpProbeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "http_probe".into(),
+            description: "Probe a single in-scope URL for status, server header, technology hints and HTML title.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"]
+            }),
+            risk: "network".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let url = input
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("url required"))?;
+        let response = self.http.run(json!({"url": url})).await?;
+        let data = response.structured.unwrap_or_else(|| json!({}));
+        let headers = data.get("headers").cloned().unwrap_or_else(|| json!({}));
+        let body = data.get("body").and_then(Value::as_str).unwrap_or("");
+        let status = data.get("status").and_then(Value::as_u64).unwrap_or(0);
+        let server = headers
+            .as_object()
+            .and_then(|map| {
+                map.iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("server"))
+                    .and_then(|(_, value)| value.as_str())
+            })
+            .unwrap_or("")
+            .to_string();
+        let mut haystack = format!("{} {}", headers, body).to_ascii_lowercase();
+        if let Some(powered) = headers.as_object().and_then(|map| {
+            map.iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("x-powered-by"))
+                .and_then(|(_, value)| value.as_str())
+        }) {
+            haystack.push(' ');
+            haystack.push_str(&powered.to_ascii_lowercase());
+        }
+        let tech = detect_tech(&haystack);
+        let title = extract_title(body).unwrap_or_default();
+        let structured = json!({
+            "ok": response.ok,
+            "url": url,
+            "status": status,
+            "server": server,
+            "tech": tech,
+            "title": title,
+            "headers": headers
+        });
+        Ok(ToolResult {
+            ok: response.ok,
+            output: truncate(&format!(
+                "probe {url}: status {status}, server '{server}', tech {:?}, title '{title}'",
+                tech
+            )),
+            structured: Some(structured),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gated external adapters. Each tool is always registered; when its backing
+// command is unavailable it returns ok=false with a clear gated result.
+// ---------------------------------------------------------------------------
+
+struct ExternalBackedTool {
+    name: &'static str,
+    description: &'static str,
+    risk: &'static str,
+    required: &'static [&'static str],
+    commands: &'static [&'static str],
+    registry: ToolRegistry,
+}
+
+/// Merge derived aliases into the original input so any configured argv
+/// template (`{target}`, `{host}`, `{url}`, `{word}`, ...) can be satisfied.
+fn enrich_external_input(input: &Value) -> Value {
+    let mut map = input.as_object().cloned().unwrap_or_default();
+    let host = input
+        .get("host")
+        .and_then(Value::as_str)
+        .or_else(|| input.get("domain").and_then(Value::as_str))
+        .or_else(|| input.get("target").and_then(Value::as_str))
+        .unwrap_or("");
+    let url = input.get("url").and_then(Value::as_str).unwrap_or("");
+    let target = if url.is_empty() { host } else { url };
+    let word = as_text(input.get("wordlist").or_else(|| input.get("word")));
+    let ports = as_text(input.get("ports"));
+    map.entry("target")
+        .or_insert_with(|| Value::String(target.to_string()));
+    map.entry("host")
+        .or_insert_with(|| Value::String(host.to_string()));
+    map.entry("url")
+        .or_insert_with(|| Value::String(url.to_string()));
+    map.entry("word")
+        .or_insert_with(|| Value::String(if ports.is_empty() { word } else { ports }));
+    Value::Object(map)
+}
+
+#[async_trait]
+impl Tool for ExternalBackedTool {
+    fn spec(&self) -> ToolSpec {
+        let mut properties = serde_json::Map::new();
+        for key in self.required.iter().copied().chain(
+            ["marker", "selector", "script", "action", "ports"]
+                .iter()
+                .copied(),
+        ) {
+            properties.insert(key.to_string(), json!({"type": ["string", "array"]}));
+        }
+        ToolSpec {
+            name: self.name.into(),
+            description: self.description.into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": properties,
+                "required": self.required
+            }),
+            risk: self.risk.into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        if !self
+            .required
+            .iter()
+            .any(|key| !as_text(input.get(*key)).is_empty())
+        {
+            anyhow::bail!("one of {:?} is required", self.required);
+        }
+        let selected = self
+            .commands
+            .iter()
+            .find_map(|name| self.registry.get(name).map(|tool| (*name, tool)));
+        let Some((adapter_name, adapter)) = selected else {
+            let reason = format!(
+                "'{}' is gated: no configured external command ({}) is available. Explicitly enable it via ToolOptions.external_commands to allow execution.",
+                self.name,
+                self.commands.join(" or ")
+            );
+            return Ok(gated_result(
+                self.name,
+                &reason,
+                json!({
+                    "target": as_text(input.get("target").or_else(|| input.get("host")).or_else(|| input.get("url")))
+                }),
+            ));
+        };
+        let enriched = enrich_external_input(&input);
+        let result = adapter.run(enriched.clone()).await?;
+        let mut structured = result.structured.unwrap_or_else(|| json!({}));
+        if let Value::Object(map) = &mut structured {
+            map.insert("tool".into(), Value::String(self.name.to_string()));
+            map.insert("adapter".into(), Value::String(adapter_name.to_string()));
+            map.insert("ok".into(), Value::Bool(result.ok));
+            map.insert("input".into(), enriched);
+        }
+        Ok(ToolResult {
+            ok: result.ok,
+            output: result.output,
+            structured: Some(structured),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2066,6 +3435,202 @@ mod tests {
         assert_eq!(redact(plain), plain);
     }
 
+    #[tokio::test]
+    async fn payload_forge_generates_local_payloads() {
+        let tool = PayloadForgeTool;
+        let result = tool
+            .run(json!({"kind": "xss", "marker": "PROBE", "context": "attr"}))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        let payloads = data["payloads"].as_array().unwrap();
+        assert_eq!(data["count"], json!(payloads.len()));
+        assert!(payloads
+            .iter()
+            .any(|p| p.as_str().unwrap().contains("PROBE")));
+        assert!(payloads
+            .iter()
+            .any(|p| p.as_str().unwrap().contains("onmouseover")));
+
+        for kind in ["sqli", "ssrf", "ssti", "cmdi"] {
+            let result = tool.run(json!({"kind": kind})).await.unwrap();
+            assert!(result.ok, "{kind}");
+            assert!(!result.structured.unwrap()["payloads"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn jwt_decode_decodes_segments_without_verifying() {
+        let header = json!({"alg": "HS256", "typ": "JWT"}).to_string();
+        let payload = json!({"sub": "1234567890", "admin": true}).to_string();
+        let token = format!(
+            "{}.{}.c2lnbmF0dXJl",
+            b64_encode(header.as_bytes(), true, false),
+            b64_encode(payload.as_bytes(), true, false)
+        );
+        let result = JwtDecodeTool.run(json!({"token": token})).await.unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["verified"], json!(false));
+        assert_eq!(data["header"]["alg"], json!("HS256"));
+        assert_eq!(data["payload"]["sub"], json!("1234567890"));
+        assert_eq!(data["payload"]["admin"], json!(true));
+        assert_eq!(data["segments"]["signature"]["raw"], json!("c2lnbmF0dXJl"));
+
+        let malformed = JwtDecodeTool.run(json!({"token": "abc"})).await.unwrap();
+        assert!(!malformed.ok);
+    }
+
+    #[tokio::test]
+    async fn hash_util_matches_known_vectors() {
+        let tool = HashUtilTool;
+        for (op, value, expected) in [
+            ("md5", "", "d41d8cd98f00b204e9800998ecf8427e"),
+            ("sha1", "abc", "a9993e364706816aba3e25717850c26c9cd0d89d"),
+            (
+                "sha256",
+                "abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            ("b64encode", "hi", "aGk="),
+            ("hex", "AB", "4142"),
+        ] {
+            let result = tool.run(json!({"op": op, "value": value})).await.unwrap();
+            assert!(result.ok, "{op}");
+            assert_eq!(
+                result.structured.unwrap()["result"],
+                json!(expected),
+                "{op}"
+            );
+        }
+        let decoded = tool
+            .run(json!({"op": "b64decode", "value": "aGk="}))
+            .await
+            .unwrap();
+        assert_eq!(decoded.structured.unwrap()["result"], json!("hi"));
+        let bad = tool.run(json!({"op": "nope", "value": "x"})).await.unwrap();
+        assert!(!bad.ok);
+    }
+
+    #[tokio::test]
+    async fn knowledge_lookup_matches_wstg_and_cwe() {
+        let result = KnowledgeLookupTool
+            .run(json!({"query": "xss injection"}))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        let matches = data["matches"].as_array().unwrap();
+        assert!(matches.iter().any(|m| m["id"] == json!("WSTG-INPV-01")));
+        assert!(matches
+            .iter()
+            .any(|m| m["cwe"].as_array().unwrap().contains(&json!("CWE-79"))));
+    }
+
+    #[tokio::test]
+    async fn report_writer_renders_required_markdown_sections() {
+        let result = ReportWriterTool
+            .run(json!({
+                "program": "Acme Bug Bounty",
+                "scope": ["example.com", "*.example.com"],
+                "findings": [{
+                    "title": "Reflected XSS",
+                    "severity": "high",
+                    "cvss": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+                    "cwe": "CWE-79",
+                    "asset": "https://example.com/search",
+                    "steps": "1. Visit /search?q=<script>...",
+                    "poc": "GET /search?q=<script>alert(1)</script>",
+                    "impact": "Script execution in victim browsers",
+                    "remediation": "Encode output and add CSP",
+                    "evidence": "HTTP/1.1 200 OK"
+                }]
+            }))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        let markdown = data["markdown"].as_str().unwrap();
+        for section in [
+            "Executive Summary",
+            "Scope",
+            "Methodology",
+            "Findings",
+            "CVSS",
+            "CWE",
+            "Steps to Reproduce",
+            "Proof of Concept",
+            "Impact",
+            "Remediation",
+            "Evidence SHA-256",
+            "Coverage",
+            "Timeline",
+            "Appendices",
+        ] {
+            assert!(markdown.contains(section), "missing section: {section}");
+        }
+        assert!(markdown.contains("Acme Bug Bounty"));
+        assert_eq!(data["finding_count"], json!(1));
+        assert_eq!(
+            data["evidence_hashes"][0],
+            json!(sha256_hex(b"HTTP/1.1 200 OK"))
+        );
+    }
+
+    #[test]
+    fn new_tools_are_registered_and_gated_without_network() {
+        let dir = std::env::temp_dir().join(format!("mbt-new-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = default_registry(&dir);
+        for name in [
+            "http_fuzz",
+            "http_probe",
+            "subdomain_enum",
+            "port_scan",
+            "content_discovery",
+            "vuln_scan",
+            "browser",
+            "payload_forge",
+            "jwt_decode",
+            "hash_util",
+            "knowledge_lookup",
+            "report_writer",
+            "task_put",
+            "clue_put",
+        ] {
+            assert!(registry.get(name).is_some(), "missing tool: {name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn gated_tools_return_ok_false_without_configured_commands() {
+        let tool = ExternalBackedTool {
+            name: "port_scan",
+            description: "",
+            risk: "intrusive",
+            required: &["host"],
+            commands: &["nmap", "naabu"],
+            registry: ToolRegistry::new(),
+        };
+        let result = tool
+            .run(json!({"host": "example.com", "ports": "80,443"}))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["gated"], json!(true));
+        assert_eq!(data["ok"], json!(false));
+        assert!(data["message"]
+            .as_str()
+            .unwrap()
+            .contains("external_commands"));
+    }
+
     fn uuid_like() -> String {
         format!(
             "{}",
@@ -2240,7 +3805,10 @@ fn redact_pii(out: &mut String) {
     for (start, end, digits) in numeric_spans(out) {
         let is_card = (13..=19).contains(&digits) && !looks_like_timestamp(&out[start..end]);
         let is_phone = (10..=12).contains(&digits);
-        if is_card || is_phone {
+        let bytes = out.as_bytes();
+        let bounded = (start == 0 || !bytes[start - 1].is_ascii_alphanumeric())
+            && (end >= bytes.len() || !bytes[end].is_ascii_alphanumeric());
+        if (is_card || is_phone) && bounded {
             numeric.push((start, end));
         }
     }

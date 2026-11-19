@@ -193,17 +193,24 @@ pub fn parse_scope_brief(text: &str) -> ScopeConfig {
             scope.engagement = Some(value.trim().to_string());
             continue;
         }
-        if let Some(pattern) = line
-            .strip_prefix('-')
-            .or_else(|| line.strip_prefix('*'))
-            .map(str::trim)
-        {
-            if !pattern.is_empty() {
-                if out_section {
-                    scope.out_of_scope.push(pattern.to_string());
-                } else {
-                    scope.in_scope.push(pattern.to_string());
-                }
+        let candidate = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix('-'))
+            .unwrap_or(line)
+            .trim();
+        // Scope patterns are single tokens: hosts, `*.` wildcards, URLs or CIDRs.
+        // Prose lines (which contain spaces) remain notes.
+        let looks_like_pattern = !candidate.is_empty()
+            && !candidate.contains(char::is_whitespace)
+            && (candidate.starts_with("*.")
+                || candidate.contains('.')
+                || candidate.contains('/')
+                || candidate.contains(':'));
+        if looks_like_pattern {
+            if out_section {
+                scope.out_of_scope.push(candidate.to_string());
+            } else {
+                scope.in_scope.push(candidate.to_string());
             }
             continue;
         }

@@ -140,6 +140,38 @@ pub struct Artifact {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct Engagement {
+    pub id: String,
+    pub program_url: String,
+    pub state: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub id: String,
+    pub engagement_id: String,
+    pub statement: String,
+    pub playbook_id: String,
+    pub target: Option<String>,
+    pub priority: i64,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Clue {
+    pub id: String,
+    pub engagement_id: String,
+    pub task_id: Option<String>,
+    pub source_tool: String,
+    pub key: String,
+    pub value_json: String,
+    pub created_at: String,
+}
+
 /// Durable per-session execution accounting used by the runner.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BudgetUsage {
@@ -240,6 +272,10 @@ impl Store {
                session_id TEXT NOT NULL, target TEXT NOT NULL, created_at TEXT NOT NULL,
                PRIMARY KEY(session_id,target)
              );
+             CREATE TABLE IF NOT EXISTS engagement_controls(
+               engagement_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_engagement_controls_id ON engagement_controls(engagement_id);
              CREATE TABLE IF NOT EXISTS schema_version(
                version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
              );
@@ -277,6 +313,42 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_hypotheses_session ON hypotheses(session_id);
              CREATE INDEX IF NOT EXISTS idx_approved_targets_session ON approved_targets(session_id);
              CREATE INDEX IF NOT EXISTS idx_pending_calls_approval ON pending_tool_calls(approval_id);
+             CREATE TABLE IF NOT EXISTS engagements(
+               id TEXT PRIMARY KEY, program_url TEXT NOT NULL, state TEXT NOT NULL,
+               created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS brief_snapshots(
+               id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, raw_html TEXT,
+               extracted_json TEXT, scope_json TEXT, roe_json TEXT, created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS tasks(
+               id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, statement TEXT NOT NULL,
+               playbook_id TEXT NOT NULL DEFAULT '', target TEXT, priority INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS clues(
+               id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, task_id TEXT,
+               source_tool TEXT NOT NULL, \"key\" TEXT NOT NULL, value_json TEXT NOT NULL,
+               created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS evidence(
+               id TEXT PRIMARY KEY, finding_id TEXT NOT NULL, kind TEXT NOT NULL, path TEXT,
+               sha256 TEXT NOT NULL, request TEXT, response TEXT, created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS reports(
+               id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, format TEXT NOT NULL,
+               path TEXT NOT NULL, sha256 TEXT NOT NULL, created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS trace_events(
+               id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, run_id TEXT NOT NULL,
+               kind TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_brief_snapshots_engagement ON brief_snapshots(engagement_id);
+             CREATE INDEX IF NOT EXISTS idx_tasks_engagement ON tasks(engagement_id);
+             CREATE INDEX IF NOT EXISTS idx_clues_engagement ON clues(engagement_id);
+             CREATE INDEX IF NOT EXISTS idx_evidence_finding ON evidence(finding_id);
+             CREATE INDEX IF NOT EXISTS idx_reports_engagement ON reports(engagement_id);
+             CREATE INDEX IF NOT EXISTS idx_trace_events_engagement ON trace_events(engagement_id);
              INSERT OR IGNORE INTO schema_version(version, applied_at)
                VALUES(1, strftime('%Y-%m-%dT%H:%M:%SZ','now'));",
         )?;
@@ -1651,6 +1723,321 @@ impl Store {
         }
         Ok(out)
     }
+
+    pub fn create_engagement(&self, program_url: &str) -> Result<Engagement> {
+        let ts = now();
+        let e = Engagement {
+            id: Uuid::new_v4().to_string(),
+            program_url: program_url.to_string(),
+            state: "idle".to_string(),
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO engagements(id,program_url,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5)",
+            params![e.id, e.program_url, e.state, e.created_at, e.updated_at],
+        )?;
+        Ok(e)
+    }
+
+    pub fn get_engagement(&self, id: &str) -> Result<Option<Engagement>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,program_url,state,created_at,updated_at FROM engagements WHERE id=?1",
+        )?;
+        let row = stmt
+            .query_row(params![id], |r| {
+                Ok(Engagement {
+                    id: r.get(0)?,
+                    program_url: r.get(1)?,
+                    state: r.get(2)?,
+                    created_at: r.get(3)?,
+                    updated_at: r.get(4)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn list_engagements(&self, limit: usize) -> Result<Vec<Engagement>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,program_url,state,created_at,updated_at FROM engagements ORDER BY rowid DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(Engagement {
+                id: r.get(0)?,
+                program_url: r.get(1)?,
+                state: r.get(2)?,
+                created_at: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn set_engagement_state(&self, id: &str, state: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE engagements SET state=?2, updated_at=?3 WHERE id=?1",
+            params![id, state, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_brief(
+        &self,
+        engagement_id: &str,
+        raw_html: &str,
+        extracted_json: &str,
+        scope_json: &str,
+        roe_json: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO brief_snapshots(id,engagement_id,raw_html,extracted_json,scope_json,roe_json,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                Uuid::new_v4().to_string(),
+                engagement_id,
+                raw_html,
+                extracted_json,
+                scope_json,
+                roe_json,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn create_task(
+        &self,
+        engagement_id: &str,
+        statement: &str,
+        playbook_id: &str,
+        target: Option<&str>,
+        priority: i64,
+    ) -> Result<Task> {
+        let t = Task {
+            id: Uuid::new_v4().to_string(),
+            engagement_id: engagement_id.to_string(),
+            statement: statement.to_string(),
+            playbook_id: playbook_id.to_string(),
+            target: target.map(|s| s.to_string()),
+            priority,
+            status: "open".to_string(),
+            created_at: now(),
+        };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tasks(id,engagement_id,statement,playbook_id,target,priority,status,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                t.id,
+                t.engagement_id,
+                t.statement,
+                t.playbook_id,
+                t.target,
+                t.priority,
+                t.status,
+                t.created_at
+            ],
+        )?;
+        Ok(t)
+    }
+
+    pub fn list_tasks(&self, engagement_id: &str) -> Result<Vec<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,engagement_id,statement,playbook_id,target,priority,status,created_at
+             FROM tasks WHERE engagement_id=?1 ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![engagement_id], |r| {
+            Ok(Task {
+                id: r.get(0)?,
+                engagement_id: r.get(1)?,
+                statement: r.get(2)?,
+                playbook_id: r.get(3)?,
+                target: r.get(4)?,
+                priority: r.get(5)?,
+                status: r.get(6)?,
+                created_at: r.get(7)?,
+            })
+        })?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn update_task_status(&self, id: &str, status: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status=?2 WHERE id=?1",
+            params![id, status],
+        )?;
+        Ok(())
+    }
+
+    pub fn add_clue(
+        &self,
+        engagement_id: &str,
+        task_id: Option<&str>,
+        source_tool: &str,
+        key: &str,
+        value_json: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO clues(id,engagement_id,task_id,source_tool,\"key\",value_json,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                Uuid::new_v4().to_string(),
+                engagement_id,
+                task_id,
+                source_tool,
+                key,
+                value_json,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_clues(&self, engagement_id: &str) -> Result<Vec<Clue>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,engagement_id,task_id,source_tool,\"key\",value_json,created_at
+             FROM clues WHERE engagement_id=?1 ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![engagement_id], |r| {
+            Ok(Clue {
+                id: r.get(0)?,
+                engagement_id: r.get(1)?,
+                task_id: r.get(2)?,
+                source_tool: r.get(3)?,
+                key: r.get(4)?,
+                value_json: r.get(5)?,
+                created_at: r.get(6)?,
+            })
+        })?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn add_evidence(
+        &self,
+        finding_id: &str,
+        kind: &str,
+        path: Option<&str>,
+        sha256: &str,
+        request: Option<&str>,
+        response: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO evidence(id,finding_id,kind,path,sha256,request,response,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                Uuid::new_v4().to_string(),
+                finding_id,
+                kind,
+                path,
+                sha256,
+                request,
+                response,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_report(
+        &self,
+        engagement_id: &str,
+        format: &str,
+        path: &str,
+        sha256: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO reports(id,engagement_id,format,path,sha256,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                Uuid::new_v4().to_string(),
+                engagement_id,
+                format,
+                path,
+                sha256,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn append_trace(
+        &self,
+        engagement_id: &str,
+        run_id: &str,
+        kind: &str,
+        payload_json: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO trace_events(id,engagement_id,run_id,kind,payload_json,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                Uuid::new_v4().to_string(),
+                engagement_id,
+                run_id,
+                kind,
+                payload_json,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Persist a cross-process control state for an engagement.
+    pub fn upsert_engagement_control(&self, engagement_id: &str, state: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO engagement_controls(engagement_id,state,updated_at) VALUES(?1,?2,?3)
+             ON CONFLICT(engagement_id) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at",
+            params![engagement_id, state, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_engagement_control(&self, engagement_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT state FROM engagement_controls WHERE engagement_id=?1")?;
+        let row = stmt
+            .query_row(params![engagement_id], |r| r.get::<_, String>(0))
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn latest_report_path(&self, engagement_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT path FROM reports WHERE engagement_id=?1 ORDER BY rowid DESC LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row(params![engagement_id], |r| r.get::<_, String>(0))
+            .optional()?;
+        Ok(row)
+    }
 }
 
 const SENSITIVE_KEYS: &[&str] = &[
@@ -1934,7 +2321,10 @@ fn redact_pii_numbers(out: &mut String) {
         } else {
             is_phone_chunks(&chunks, first_digit)
         };
-        let should_redact = (is_card || is_ssn || is_phone) && !looks_like_date(&chunks, &digits);
+        let bounded = (start == 0 || !out.as_bytes()[start - 1].is_ascii_alphanumeric())
+            && (end >= out.len() || !out.as_bytes()[end].is_ascii_alphanumeric());
+        let should_redact =
+            (is_card || is_ssn || is_phone) && !looks_like_date(&chunks, &digits) && bounded;
 
         if should_redact {
             out.replace_range(start..end, "[REDACTED]");
@@ -2592,5 +2982,235 @@ mod tests {
 
         let plain = "port 8080 on 2026-11-19 at 10:30";
         assert_eq!(redact(plain), plain);
+
+        let hash = "sha256 95793ae14070830fc9da3c937c27dc9a0123456789abcdef1";
+        assert_eq!(redact(hash), hash);
+    }
+
+    #[test]
+    fn engagement_crud_and_state_transitions() {
+        let store = Store::open(":memory:").unwrap();
+        let e = store
+            .create_engagement("https://example.com/program")
+            .unwrap();
+        assert_eq!(e.program_url, "https://example.com/program");
+        assert_eq!(e.state, "idle");
+        assert_eq!(e.created_at, e.updated_at);
+
+        let got = store.get_engagement(&e.id).unwrap().unwrap();
+        assert_eq!(got.program_url, e.program_url);
+        assert!(store.get_engagement("missing").unwrap().is_none());
+
+        store.set_engagement_state(&e.id, "running").unwrap();
+        let running = store.get_engagement(&e.id).unwrap().unwrap();
+        assert_eq!(running.state, "running");
+        assert!(running.updated_at >= running.created_at);
+
+        store.set_engagement_state(&e.id, "completed").unwrap();
+        assert_eq!(
+            store.get_engagement(&e.id).unwrap().unwrap().state,
+            "completed"
+        );
+
+        let other = store.create_engagement("https://other.example").unwrap();
+        let listed = store.list_engagements(10).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|x| x.id == e.id));
+        assert!(listed.iter().any(|x| x.id == other.id));
+
+        let limited = store.list_engagements(1).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, other.id);
+    }
+
+    #[test]
+    fn tasks_and_clues_crud() {
+        let store = Store::open(":memory:").unwrap();
+        let e = store.create_engagement("https://example.com").unwrap();
+        let other = store.create_engagement("https://other.example").unwrap();
+
+        let t1 = store
+            .create_task(
+                &e.id,
+                "Test login",
+                "auth-basic",
+                Some("https://example.com/login"),
+                5,
+            )
+            .unwrap();
+        let t2 = store
+            .create_task(&e.id, "Test search", "xss", None, 0)
+            .unwrap();
+        assert_eq!(t1.engagement_id, e.id);
+        assert_eq!(t1.status, "open");
+        assert_eq!(t1.playbook_id, "auth-basic");
+        assert_eq!(t1.target.as_deref(), Some("https://example.com/login"));
+        assert_eq!(t1.priority, 5);
+        assert!(t2.target.is_none());
+        assert_eq!(t2.priority, 0);
+
+        store.create_task(&other.id, "Other", "p", None, 0).unwrap();
+        let tasks = store.list_tasks(&e.id).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|t| t.engagement_id == e.id));
+
+        store.update_task_status(&t1.id, "in_progress").unwrap();
+        let tasks = store.list_tasks(&e.id).unwrap();
+        assert_eq!(
+            tasks.iter().find(|t| t.id == t1.id).unwrap().status,
+            "in_progress"
+        );
+        assert_eq!(tasks.iter().find(|t| t.id == t2.id).unwrap().status, "open");
+
+        store
+            .add_clue(&e.id, Some(&t1.id), "nmap", "open_ports", r#"[80,443]"#)
+            .unwrap();
+        store
+            .add_clue(&e.id, None, "http", "title", r#""Example""#)
+            .unwrap();
+        store
+            .add_clue(&other.id, None, "http", "title", r#""Other""#)
+            .unwrap();
+        let clues = store.list_clues(&e.id).unwrap();
+        assert_eq!(clues.len(), 2);
+        assert!(clues.iter().all(|c| c.engagement_id == e.id));
+        let with_task = clues.iter().find(|c| c.task_id.is_some()).unwrap();
+        assert_eq!(with_task.task_id.as_deref(), Some(t1.id.as_str()));
+        assert_eq!(with_task.source_tool, "nmap");
+        assert_eq!(with_task.key, "open_ports");
+        assert_eq!(with_task.value_json, r#"[80,443]"#);
+        assert!(clues.iter().any(|c| c.task_id.is_none()));
+    }
+
+    #[test]
+    fn brief_evidence_report_and_trace_writes() {
+        let store = Store::open(":memory:").unwrap();
+        let e = store.create_engagement("https://example.com").unwrap();
+
+        store
+            .save_brief(
+                &e.id,
+                "<html>hello</html>",
+                r#"["title"]"#,
+                r#"{"in":["example.com"]}"#,
+                r#"{"rules":[]}"#,
+            )
+            .unwrap();
+        store
+            .add_evidence(
+                "finding-1",
+                "http",
+                Some("artifacts/1.txt"),
+                "abc123",
+                Some("GET /"),
+                Some("HTTP/1.1 200"),
+            )
+            .unwrap();
+        store
+            .add_evidence("finding-1", "screenshot", None, "deadbeef", None, None)
+            .unwrap();
+        store
+            .save_report(&e.id, "markdown", "reports/report.md", "sha-report")
+            .unwrap();
+        store
+            .append_trace(&e.id, "run-1", "tool.call", r#"{"tool":"nmap"}"#)
+            .unwrap();
+        store
+            .append_trace(&e.id, "run-1", "llm.step", r#"{"step":1}"#)
+            .unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        let brief_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM brief_snapshots WHERE engagement_id=?1",
+                params![&e.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(brief_count, 1);
+
+        let evidence_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM evidence WHERE finding_id=?1",
+                params!["finding-1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence_count, 2);
+
+        let report_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reports WHERE engagement_id=?1",
+                params![&e.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(report_count, 1);
+
+        let trace_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM trace_events WHERE engagement_id=?1",
+                params![&e.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(trace_count, 2);
+    }
+
+    #[test]
+    fn schema_creation_is_idempotent() {
+        let path = std::env::temp_dir().join(format!("minibug-store-schema-{}.db", Uuid::new_v4()));
+        let created;
+        {
+            let store = Store::open(&path).unwrap();
+            {
+                let conn = store.conn.lock().unwrap();
+                let mut stmt = conn
+                    .prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index')")
+                    .unwrap();
+                let names: Vec<String> = stmt
+                    .query_map([], |r| r.get(0))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+                for expected in [
+                    "engagements",
+                    "brief_snapshots",
+                    "tasks",
+                    "clues",
+                    "evidence",
+                    "reports",
+                    "trace_events",
+                    "idx_brief_snapshots_engagement",
+                    "idx_tasks_engagement",
+                    "idx_clues_engagement",
+                    "idx_evidence_finding",
+                    "idx_reports_engagement",
+                    "idx_trace_events_engagement",
+                ] {
+                    assert!(
+                        names.iter().any(|n| n.as_str() == expected),
+                        "missing schema object: {expected}"
+                    );
+                }
+            }
+            created = store.create_engagement("https://persist.example").unwrap();
+        }
+
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(
+                store
+                    .get_engagement(&created.id)
+                    .unwrap()
+                    .unwrap()
+                    .program_url,
+                "https://persist.example"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }
 }

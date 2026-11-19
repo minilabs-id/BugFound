@@ -168,6 +168,30 @@ enum Commands {
         #[arg(long)]
         session: String,
     },
+    /// Run a full autonomous bug-bounty engagement from a program URL
+    Engage {
+        #[arg(long)]
+        url: String,
+        #[arg(long, default_value = ".")]
+        cwd: String,
+        #[arg(long)]
+        db: Option<String>,
+    },
+    /// Inspect/control a running engagement
+    Engagement {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        db: Option<String>,
+        #[arg(long)]
+        status: bool,
+        #[arg(long)]
+        pause: bool,
+        #[arg(long)]
+        resume: bool,
+        #[arg(long)]
+        abort: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -475,6 +499,25 @@ fn print_approval_summary(store: &Store, session: &str) {
         }
         Err(e) => eprintln!("warning: cannot list approvals: {e}"),
     }
+}
+
+fn print_engagement_status(db: &std::path::Path, id: &str) -> Result<()> {
+    let status = minibug_engagement::status_at(db, id).context("query engagement status")?;
+    println!("engagement={} state={}", redact(id), redact(&status.state));
+    println!(
+        "tasks_total={} tasks_done={} findings={} coverage={}",
+        status.tasks_total, status.tasks_done, status.findings, status.coverage
+    );
+    println!(
+        "report_path={}",
+        redact(
+            &status
+                .report_path
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "-".into())
+        )
+    );
+    Ok(())
 }
 
 #[tokio::main]
@@ -830,6 +873,141 @@ path = ".minibug/minibug.db"
             println!("event_chain={}", if valid { "valid" } else { "TAMPERED" });
             if !valid {
                 std::process::exit(1);
+            }
+        }
+        Commands::Engage { url, cwd, db } => {
+            let db_path = db.unwrap_or_else(|| cfg.storage.path.clone());
+            let (tx, rx) = std::sync::mpsc::channel::<minibug_engagement::EngagementEvent>();
+
+            // Keep the id emitted by the Started event so Ctrl+C can abort the
+            // running engagement from an independent signal-watching thread.
+            let engagement_id = Arc::new(std::sync::Mutex::new(None::<String>));
+            let id_for_signal = Arc::clone(&engagement_id);
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build signal runtime");
+                runtime.block_on(async move {
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        let guard = id_for_signal.lock().unwrap();
+                        if let Some(id) = guard.as_ref() {
+                            match minibug_engagement::abort(id) {
+                                Ok(()) => {}
+                                Err(e) => eprintln!("warning: failed to abort engagement: {e}"),
+                            }
+                        }
+                    }
+                });
+            });
+
+            let worker_url = url.clone();
+            let worker_cwd = cwd.clone();
+            let worker_db = db_path.clone();
+            let worker = std::thread::spawn(move || {
+                minibug_engagement::engage(
+                    &worker_url,
+                    Path::new(&worker_cwd),
+                    Path::new(&worker_db),
+                    tx,
+                )
+            });
+
+            let mut exit_code = loop {
+                match rx.recv() {
+                    Ok(minibug_engagement::EngagementEvent::Started { engagement_id: id }) => {
+                        println!("engagement started: id={}", redact(&id));
+                        *engagement_id.lock().unwrap() = Some(id);
+                    }
+                    Ok(minibug_engagement::EngagementEvent::BriefIngested { .. }) => {
+                        println!("brief ingested");
+                    }
+                    Ok(minibug_engagement::EngagementEvent::PlanUpdated { tasks }) => {
+                        println!("plan updated: {} tasks", tasks.len());
+                        for task in tasks {
+                            println!("  - {}", redact(&task));
+                        }
+                    }
+                    Ok(minibug_engagement::EngagementEvent::Action {
+                        tool,
+                        target,
+                        ok,
+                        detail,
+                    }) => println!(
+                        "action: tool={} target={} ok={} detail={}",
+                        redact(&tool),
+                        redact(target.as_deref().unwrap_or("-")),
+                        ok,
+                        redact(&detail).replace('\n', " ")
+                    ),
+                    Ok(minibug_engagement::EngagementEvent::Finding {
+                        id,
+                        title,
+                        severity,
+                    }) => println!(
+                        "finding: [{}] {} id={}",
+                        redact(&severity),
+                        redact(&title),
+                        redact(&id)
+                    ),
+                    Ok(minibug_engagement::EngagementEvent::ReportReady { path }) => {
+                        println!("report ready: {}", redact(&path.display().to_string()));
+                    }
+                    Ok(minibug_engagement::EngagementEvent::Error { message }) => {
+                        eprintln!("engagement error: {}", redact(&message));
+                        break 1;
+                    }
+                    Ok(minibug_engagement::EngagementEvent::Finished { summary }) => {
+                        println!("engagement finished: {}", redact(&summary));
+                        break 0;
+                    }
+                    Err(e) => {
+                        eprintln!("engagement event channel closed: {e}");
+                        break 1;
+                    }
+                }
+            };
+
+            match worker.join() {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    eprintln!("engagement error: {e:#}");
+                    if exit_code == 0 {
+                        exit_code = 1;
+                    }
+                }
+                Err(_) => {
+                    eprintln!("engagement worker panicked");
+                    exit_code = 1;
+                }
+            }
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
+        Commands::Engagement {
+            id,
+            db,
+            status,
+            pause,
+            resume,
+            abort,
+        } => {
+            let db_path = std::path::PathBuf::from(db.unwrap_or_else(|| cfg.storage.path.clone()));
+            if pause {
+                minibug_engagement::pause_at(&db_path, &id).context("pause engagement")?;
+                println!("engagement {} paused", redact(&id));
+            }
+            if resume {
+                minibug_engagement::resume_at(&db_path, &id).context("resume engagement")?;
+                println!("engagement {} resumed", redact(&id));
+            }
+            if abort {
+                minibug_engagement::abort_at(&db_path, &id).context("abort engagement")?;
+                println!("engagement {} aborted", redact(&id));
+            }
+            if status || !(pause || resume || abort) {
+                print_engagement_status(&db_path, &id)?;
             }
         }
     }

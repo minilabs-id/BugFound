@@ -47,12 +47,23 @@ Phase 0–2 dan sebagian Phase 3 sudah dieksekusi. Ringkasan perubahan:
 | PoC/PII/hash/planning | done | `validate_poc`, PII redaction, SHA-256 event chain + `verify-log`, `plan` CLI |
 | Token/cost | done | token_usage table, `max_estimated_tokens`, cost rates, `tokens` CLI |
 
-Verifikasi terakhir: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test --workspace` (**88 tes**), `cargo build --release --workspace` — hijau.
-| P0 release hygiene | done* | Git repo di branch `dev`, commit `ae9049c`, tag `v0.1.0-mvp`, `Cargo.lock` di-commit, CI+Dockerfile+deny.toml+runbook; `cargo deny check` dijalankan di CI (binary tidak terpasang lokal) |
+| P0 release hygiene | done* | Git repo di branch `dev`, commit `ae9049c`, tag `v0.1.0-mvp`, `Cargo.lock` di-commit, CI+Dockerfile+deny.toml+runbook; `cargo deny check` dijalankan di CI |
+
+### Eksekusi final (plan riset 2026-11-19)
+
+| Phase | Status | Bukti |
+| --- | --- | --- |
+| P0 Core parity OpenCode | done | 9 modul: event bus, inbox, execution coordinator, step, compaction v2, error taxonomy, skill loader, subagent jobs, usage |
+| P1 Engagement ingestion & ROE | done | `BriefReader`, `EngagementProfile`, ROE fail-closed, 4 tes integrasi |
+| P2 Tool harness lengkap | done | 14 tool baru (http_fuzz, http_probe, subdomain_enum, port_scan, content_discovery, vuln_scan, browser, payload_forge, jwt_decode, hash_util, knowledge_lookup, report_writer, task_put, clue_put) |
+| P3 Planner/Executor + playbooks | done | 9 playbook WSTG, TaskStore/ClueStore, pause/resume/abort lintas-proses, subagent jobs |
+| P4 Verifier & report | done | CVSS v3.1 + CWE, deterministik verifier, report Markdown standar |
+| P5 UI & CLI | done | `engage`/`engagement` CLI + tab Engagement desktop (mission control) |
+| P6 Evaluasi & hardening | partial | `eval/` harness + docs threat model; benchmark nyata masih perlu dijalankan operator |
 
 Verifikasi terakhir: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test --workspace` (**54 tes**), `cargo build --release --workspace` — semua hijau.
+`cargo test --workspace` (**128 tes**), `cargo build --release --workspace` — semua hijau.
+Smoke test: HTTP program lokal → `engage` → 9/9 playbook → laporan `.md` dengan scope/CVSS/CWE → `engagement --status` lintas-proses.
 
 ---
 

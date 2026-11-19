@@ -17,6 +17,7 @@ toml.workspace = true
 eframe.workspace = true
 egui.workspace = true
 minibug-core = { path = "../minibug-core" }
+minibug-engagement = { path = "../minibug-engagement" }
 minibug-llm = { path = "../minibug-llm" }
 minibug-policy = { path = "../minibug-policy" }
 minibug-store = { path = "../minibug-store" }

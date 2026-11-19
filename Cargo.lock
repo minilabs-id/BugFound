@@ -2148,6 +2148,7 @@ dependencies = [
  "anyhow",
  "clap",
  "minibug-core",
+ "minibug-engagement",
  "minibug-llm",
  "minibug-policy",
  "minibug-store",
@@ -2186,6 +2187,7 @@ dependencies = [
  "eframe",
  "egui",
  "minibug-core",
+ "minibug-engagement",
  "minibug-llm",
  "minibug-policy",
  "minibug-store",
@@ -2194,6 +2196,30 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "minibug-engagement"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "minibug-core",
+ "minibug-llm",
+ "minibug-policy",
+ "minibug-store",
+ "minibug-tools",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -3103,6 +3129,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "regex-automata"
 version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3225,7 +3263,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

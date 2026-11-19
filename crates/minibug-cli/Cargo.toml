@@ -14,6 +14,7 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 toml.workspace = true
 minibug-core = { path = "../minibug-core" }
+minibug-engagement = { path = "../minibug-engagement" }
 minibug-llm = { path = "../minibug-llm" }
 minibug-policy = { path = "../minibug-policy" }
 minibug-store = { path = "../minibug-store" }

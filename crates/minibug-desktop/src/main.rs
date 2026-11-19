@@ -3,9 +3,10 @@ mod worker;
 
 use config::AppConfig;
 use eframe::egui;
+use minibug_engagement::{EngagementEvent, EngagementStatus};
 use minibug_policy::Mode;
 use minibug_store::{redact, Store};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use worker::{Job, JobEvent};
@@ -18,6 +19,7 @@ enum Tab {
     Config,
     Tools,
     Logs,
+    Engagement,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -35,6 +37,13 @@ enum DetailTab {
 enum ModeChoice {
     Ask,
     FullAuto,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EngageAction {
+    Pause,
+    Resume,
+    Abort,
 }
 
 impl From<ModeChoice> for Mode {
@@ -77,6 +86,15 @@ struct DesktopApp {
     scope_in_text: String,
     scope_out_text: String,
     tool_list: Vec<(String, String)>,
+    engage_url: String,
+    engage_cwd: String,
+    engagement_id: Option<String>,
+    engage_events: Vec<EngagementEvent>,
+    engage_status: Option<EngagementStatus>,
+    engage_report: String,
+    engage_msg: String,
+    engage_rx: Option<Receiver<EngagementEvent>>,
+    engage_worker: Option<JoinHandle<()>>,
     tx: Sender<JobEvent>,
     rx: Receiver<JobEvent>,
     worker: Option<JoinHandle<()>>,
@@ -120,6 +138,15 @@ impl DesktopApp {
             scope_in_text: String::new(),
             scope_out_text: String::new(),
             tool_list: Vec::new(),
+            engage_url: String::new(),
+            engage_cwd: ".".into(),
+            engagement_id: None,
+            engage_events: Vec::new(),
+            engage_status: None,
+            engage_report: String::new(),
+            engage_msg: String::new(),
+            engage_rx: None,
+            engage_worker: None,
             tx,
             rx,
             worker: None,
@@ -253,6 +280,100 @@ impl DesktopApp {
     }
 }
 
+impl DesktopApp {
+    fn start_engagement(&mut self) {
+        if self.engage_worker.is_some() {
+            self.engage_msg = "an engagement is already running".into();
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let url = self.engage_url.trim().to_string();
+        let cwd = self.engage_cwd.trim().to_string();
+        let storage = self.config.storage.path.clone();
+        self.engage_events.clear();
+        self.engage_status = None;
+        self.engagement_id = None;
+        self.engage_report.clear();
+        self.engage_msg.clear();
+        self.engage_rx = Some(rx);
+        self.engage_worker = Some(std::thread::spawn(move || {
+            let result =
+                minibug_engagement::engage(&url, Path::new(&cwd), Path::new(&storage), tx.clone());
+            if let Err(e) = result {
+                let _ = tx.send(EngagementEvent::Error {
+                    message: format!("{e:#}"),
+                });
+            }
+        }));
+    }
+
+    fn poll_engagement(&mut self) {
+        let mut terminal = false;
+        if let Some(rx) = &self.engage_rx {
+            while let Ok(event) = rx.try_recv() {
+                if let EngagementEvent::Started { engagement_id } = &event {
+                    self.engagement_id = Some(engagement_id.clone());
+                }
+                if matches!(
+                    &event,
+                    EngagementEvent::Finished { .. } | EngagementEvent::Error { .. }
+                ) {
+                    terminal = true;
+                }
+                self.engage_events.push(event);
+            }
+        }
+        let thread_done = self
+            .engage_worker
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished());
+        if terminal || thread_done {
+            self.engage_worker = None;
+            self.engage_rx = None;
+        }
+    }
+
+    fn engage_action(&mut self, action: EngageAction) {
+        let Some(id) = self.engagement_id.clone() else {
+            self.engage_msg = "no engagement id yet (start an engagement first)".into();
+            return;
+        };
+        let result = match action {
+            EngageAction::Pause => minibug_engagement::pause(&id),
+            EngageAction::Resume => minibug_engagement::resume(&id),
+            EngageAction::Abort => minibug_engagement::abort(&id),
+        };
+        self.engage_msg = match result {
+            Ok(()) => format!("{action:?} sent"),
+            Err(e) => format!("{action:?} error: {e:#}"),
+        };
+    }
+
+    fn refresh_engagement_status(&mut self) {
+        let Some(id) = self.engagement_id.clone() else {
+            self.engage_msg = "no engagement id yet (start an engagement first)".into();
+            return;
+        };
+        match minibug_engagement::status(&id) {
+            Ok(status) => {
+                self.engage_status = Some(status);
+                self.engage_msg.clear();
+            }
+            Err(e) => self.engage_msg = format!("status error: {e:#}"),
+        }
+    }
+
+    fn open_report(&mut self, path: &Path) {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                self.engage_report = redact(&text);
+                self.engage_msg = format!("report opened: {}", path.display());
+            }
+            Err(e) => self.engage_msg = format!("report read error: {e}"),
+        }
+    }
+}
+
 fn lines(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
@@ -264,7 +385,8 @@ fn lines(text: &str) -> Vec<String> {
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
-        if self.worker.is_some() {
+        self.poll_engagement();
+        if self.worker.is_some() || self.engage_worker.is_some() {
             ctx.request_repaint();
         }
 
@@ -279,6 +401,7 @@ impl eframe::App for DesktopApp {
                     (Tab::Config, "Config"),
                     (Tab::Tools, "Tools"),
                     (Tab::Logs, "Logs"),
+                    (Tab::Engagement, "Engagement"),
                 ] {
                     if ui.selectable_label(self.tab == tab, label).clicked() {
                         self.tab = tab;
@@ -300,6 +423,7 @@ impl eframe::App for DesktopApp {
             Tab::Config => self.ui_config(ui),
             Tab::Tools => self.ui_tools(ui),
             Tab::Logs => self.ui_logs(ui),
+            Tab::Engagement => self.ui_engagement(ui),
         });
     }
 }
@@ -652,6 +776,159 @@ impl DesktopApp {
                 ui.label("(no events; select a session)");
             }
         });
+    }
+
+    fn ui_engagement(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Engagement mission control");
+        ui.horizontal(|ui| {
+            ui.label("Brief URL:");
+            ui.text_edit_singleline(&mut self.engage_url);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Workspace:");
+            ui.text_edit_singleline(&mut self.engage_cwd);
+        });
+        let running = self.engage_worker.is_some();
+        let has_id = self.engagement_id.is_some();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!running, egui::Button::new("Start Engagement"))
+                .clicked()
+            {
+                self.start_engagement();
+            }
+            if ui.add_enabled(has_id, egui::Button::new("Pause")).clicked() {
+                self.engage_action(EngageAction::Pause);
+            }
+            if ui
+                .add_enabled(has_id, egui::Button::new("Resume"))
+                .clicked()
+            {
+                self.engage_action(EngageAction::Resume);
+            }
+            if ui.add_enabled(has_id, egui::Button::new("Abort")).clicked() {
+                self.engage_action(EngageAction::Abort);
+            }
+            if ui.button("Refresh").clicked() {
+                self.refresh_engagement_status();
+            }
+        });
+        ui.label(if running {
+            "engagement running"
+        } else {
+            "engagement idle"
+        });
+        if let Some(id) = &self.engagement_id {
+            ui.label(format!("engagement id: {}", redact(id)));
+        }
+        if !self.engage_msg.is_empty() {
+            ui.colored_label(egui::Color32::YELLOW, redact(&self.engage_msg));
+        }
+
+        ui.separator();
+        ui.group(|ui| {
+            ui.heading("Status");
+            if let Some(status) = &self.engage_status {
+                ui.label(format!("state: {}", redact(&status.state)));
+                ui.label(format!(
+                    "tasks: {}/{}",
+                    status.tasks_done, status.tasks_total
+                ));
+                ui.label(format!("findings: {}", status.findings));
+                ui.label(format!("coverage: {}", status.coverage));
+                let report_path = status
+                    .report_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "-".into());
+                ui.label(format!("report_path: {}", redact(&report_path)));
+            } else {
+                ui.label("(no status yet; click Refresh)");
+            }
+        });
+
+        ui.separator();
+        ui.heading("Events");
+        let mut open_path: Option<PathBuf> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for event in &self.engage_events {
+                match event {
+                    EngagementEvent::Started { engagement_id } => {
+                        ui.label(format!("started: {}", redact(engagement_id)));
+                    }
+                    EngagementEvent::BriefIngested { profile } => {
+                        ui.label(format!(
+                            "brief ingested: in_scope={} out_of_scope={}",
+                            profile.scope.in_scope.len(),
+                            profile.scope.out_of_scope.len()
+                        ));
+                    }
+                    EngagementEvent::PlanUpdated { tasks } => {
+                        ui.label(format!("plan updated ({} tasks):", tasks.len()));
+                        for task in tasks {
+                            ui.label(format!("  - {}", redact(task)));
+                        }
+                    }
+                    EngagementEvent::Action {
+                        tool,
+                        target,
+                        ok,
+                        detail,
+                    } => {
+                        ui.label(format!(
+                            "action: tool={} target={} ok={} detail={}",
+                            redact(tool),
+                            redact(target.as_deref().unwrap_or("-")),
+                            ok,
+                            redact(detail)
+                        ));
+                    }
+                    EngagementEvent::Finding {
+                        id,
+                        title,
+                        severity,
+                    } => {
+                        ui.label(format!(
+                            "finding: id={} severity={} title={}",
+                            redact(id),
+                            redact(severity),
+                            redact(title)
+                        ));
+                    }
+                    EngagementEvent::ReportReady { path } => {
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "report ready: {}",
+                                redact(&path.display().to_string())
+                            ));
+                            if ui.button("Open").clicked() {
+                                open_path = Some(path.clone());
+                            }
+                        });
+                    }
+                    EngagementEvent::Error { message } => {
+                        ui.colored_label(egui::Color32::RED, format!("error: {}", redact(message)));
+                    }
+                    EngagementEvent::Finished { summary } => {
+                        ui.colored_label(
+                            egui::Color32::GREEN,
+                            format!("finished: {}", redact(summary)),
+                        );
+                    }
+                }
+                ui.separator();
+            }
+            if self.engage_events.is_empty() {
+                ui.label("(no engagement events yet)");
+            }
+        });
+        if let Some(path) = open_path {
+            self.open_report(&path);
+        }
+
+        ui.separator();
+        ui.heading("Report");
+        ui.text_edit_multiline(&mut self.engage_report);
     }
 }
 

@@ -41,6 +41,41 @@ execution, durable sessions, evidence capture, and redacted reports.
   event hash chain, PII redaction, and snapshot resume. External recon adapters
   are auto-detected, opt-in and gated; a pipeline tool chains their outputs.
 
+## Autonomous engagement flow
+
+MiniBug can run a full engagement from a single program URL. It fetches the public
+program page, extracts scope and Rules of Engagement (ROE), queues tasks, explores
+in-scope assets, validates findings with a deterministic verifier, and drafts a
+standard report — all **locally**.
+
+```sh
+minibug engage --url <program-url> --cwd ./engagement
+```
+
+The same flow is available in the desktop **Engagement** tab (paste the program URL,
+pick `ask` or `full_auto`, and start). Engagement events, clues, tasks, evidence, and
+the report are persisted in the local SQLite store and can be replayed from the trace
+log.
+
+Non-negotiable guardrails:
+
+- **Local report only, no auto-submit.** The report is written under `--cwd` for
+  operator review. MiniBug never submits findings to a platform, email, or third
+  party; there is no submission path.
+- **ROE fail-closed.** If the program page cannot be fetched or scope/ROE cannot be
+  established, the engagement refuses to act. Any target not explicitly in scope is
+  refused, and scope is re-evaluated before every network action (including after
+  resume).
+- **Pause / abort at any time.** `minibug engage pause --engagement <id>` stops at the
+  next safe boundary and is resumable with `... resume --engagement <id>`;
+  `... abort --engagement <id>` is terminal. Both stop new tool calls immediately.
+- **Autonomy is still policy-bounded.** Budgets, scope, allowlists, tool risk labels,
+  and approvals remain active in `full_auto`; guardrails are not disabled.
+
+See `docs/engagement.md` (user guide), `docs/report-format.md` (canonical report
+template, CVSS/CWE), `docs/evaluation.md` and `eval/` (benchmarks), and
+`docs/threat-model.md` (guardrails).
+
 ## Desktop (Windows)
 
 A native Windows desktop build is available. It uses the same core, store and
@@ -51,8 +86,9 @@ start-desktop.bat
 ```
 
 The window reads and writes `minibug.toml` in its working directory. Tabs:
-Sessions (messages/events/findings/assets/artifacts/coverage/report), New Run,
-Approvals (approve/deny with TTL shown), Config (all settings + scope), Tools
+**Engagement** (program URL, trace events, tasks, clues, findings, pause/resume/abort,
+report export), Sessions (messages/events/findings/assets/artifacts/coverage/report),
+New Run, Approvals (approve/deny with TTL shown), Config (all settings + scope), Tools
 (adapter availability) and Logs. Runs and approvals execute on a background
 worker thread, so the UI stays responsive.
 
@@ -60,6 +96,11 @@ The CLI remains available for scripting and automation:
 
 ```sh
 minibug init --force                       # write minibug.toml
+minibug engage --url <program-url> --cwd ./engagement  # autonomous engagement
+minibug engage pause --engagement <id>     # pause / resume / abort controls
+minibug engage resume --engagement <id>
+minibug engage abort --engagement <id>
+minibug engagement --id <id> --status      # inspect/control an engagement
 minibug run --goal "enumerate in-scope hosts" --cwd ./engagement
 minibug sessions
 minibug approve --session <id>             # or: minibug deny --session <id>

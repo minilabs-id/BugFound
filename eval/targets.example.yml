@@ -1,0 +1,29 @@
+# Example local benchmark inventory. Copy to eval/targets.yml and edit.
+# Only loopback/isolated-private URLs belong here. Never add a live program URL.
+version: 1
+targets:
+  - id: juice-shop
+    name: OWASP Juice Shop
+    url: http://127.0.0.1:3000
+    cwd: eval/work/juice-shop
+    expected_vulns: "sqli,xss,idor,broken-auth,ssrf"
+  - id: dvwa
+    name: DVWA (Damn Vulnerable Web App)
+    url: http://127.0.0.1:4280
+    cwd: eval/work/dvwa
+    expected_vulns: "sqli,xss,csrf,lfi,command-injection"
+  - id: vulhub-nginx-parser
+    name: Vulhub — nginx path traversal / parser
+    url: http://127.0.0.1:8080
+    cwd: eval/work/vulhub-nginx
+    expected_vulns: "path-traversal,misconfiguration"
+  - id: htb-like-vm
+    name: HTB-like internal VM
+    url: http://10.10.10.5
+    cwd: eval/work/htb-vm
+    expected_vulns: "rce,privilege-escalation,exposed-service"
+  - id: xbow-task-001
+    name: XBOW-style single-service task 001
+    url: http://127.0.0.1:9001
+    cwd: eval/work/xbow-001
+    expected_vulns: "deserialization,rce"

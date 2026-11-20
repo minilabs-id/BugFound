@@ -3129,6 +3129,8 @@ pub struct ReportFinding {
     pub cvss: Option<f32>,
     pub vector: Option<String>,
     pub cwe: Option<String>,
+    pub cwe_rationale: Option<String>,
+    pub cvss_note: Option<String>,
     pub asset: Option<String>,
     pub description: String,
     pub reproduction: Option<String>,
@@ -3226,6 +3228,12 @@ pub fn render_canonical_report(input: &ReportInput) -> String {
             "- **CWE:** {}\n",
             finding.cwe.as_deref().unwrap_or("N/A")
         ));
+        if let Some(rationale) = finding.cwe_rationale.as_deref() {
+            out.push_str(&format!("- **CWE rationale:** {rationale}\n"));
+        }
+        if let Some(note) = finding.cvss_note.as_deref() {
+            out.push_str(&format!("- **CVSS note:** {note}\n"));
+        }
         out.push_str(&format!(
             "- **Asset:** {}\n",
             finding.asset.as_deref().unwrap_or("N/A")
@@ -3368,6 +3376,8 @@ fn render_report(input: &Value) -> (String, Vec<String>) {
             cvss: raw_cvss.parse::<f32>().ok(),
             vector: (!vector.is_empty()).then(|| vector.to_string()),
             cwe: str_field(finding, &["cwe"], "").to_string().into(),
+            cwe_rationale: None,
+            cvss_note: None,
             asset: (!asset.is_empty()).then(|| asset.to_string()),
             description: str_field(finding, &["description", "desc"], "").to_string(),
             reproduction: Some(reproduction),
@@ -4639,6 +4649,8 @@ mod tests {
                 cvss: Some(7.4),
                 vector: Some("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N".to_string()),
                 cwe: Some("CWE-79".to_string()),
+                cwe_rationale: None,
+                cvss_note: None,
                 asset: Some("https://example.com/search".to_string()),
                 description: "Reflected input reaches the DOM.".to_string(),
                 reproduction: Some("1. Visit /search?q=<script>alert(1)</script>".to_string()),

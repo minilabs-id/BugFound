@@ -116,13 +116,27 @@ cancellation, parent tool-call id on child results, `Report`/`General` roles.
 Exit evidence: 248 tests green; clippy `-D warnings` clean; ADR-001 boundary
 clean.
 
-### R5 — Domain depth (10–14 days)
-- Program intelligence: typed assets, scope versions, VRT/safe-harbor/status, source-linked rules.
-- Verification: ternary closure, counterevidence, paired controls, multi-oracle.
-- Strict CWE/CVSS with rationale and confidence.
-- Platform-specific report templates; no auto-submit.
+### R5a — Strict taxonomy & rationale (COMPLETE, 2026-11-20)
+- ✅ Strict CVSS v3.1 parser: canonical prefix, key order, metric count,
+  duplicates and allowed values are validated; v4 and numeric strings are
+  rejected instead of silently scored. `cvss_base` signature unchanged.
+- ✅ Deterministic CWE rule table with root-cause-first ordering, word-boundary
+  matching, and rule/basis/rationale emitted into the report. IDOR/BOLA still
+  maps to CWE-639; unclassified findings are explicitly marked for review.
+- ✅ Report renderer emits `CWE rationale` and a `CVSS note` when a vector is
+  unscorable; `docs/report-format.md` updated. Model severity never becomes a
+  score by itself.
 
-Exit: lab finding with counterevidence + paired control + strict CVSS vector validated.
+### R5b — Remaining domain depth (DEFERRED)
+- Ternary closure (`confirmed | ruled_out | open_proof_gap`), counterevidence,
+  paired controls, multi-oracle dispatch and `Finding` schema extension —
+  touches the finding DDL and verifier; separate review needed.
+- Platform-specific report appendix, program intelligence (typed assets/scope
+  provenance) — deferred: scope enforcement is a stop-condition boundary and
+  platform semantics are not pinned offline.
+
+Exit (when complete): lab finding with counterevidence + paired control +
+strict CVSS vector validated.
 
 ### R6 — Proof & optimization (ongoing)
 - Golden dataset with target/endpoint binding, negatives, reset, tiers A–D.

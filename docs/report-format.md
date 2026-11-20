@@ -55,7 +55,9 @@ gated or not used. Reference the playbooks/hypotheses where relevant.>
 - Severity: <Critical | High | Medium | Low | None>
 - CVSS v3.1 Base Score: <0.0–10.0>
 - CVSS v3.1 Vector: `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`
-- CWE: <CWE-XXX — Name>
+- CWE: <CWE-XXX - Name>
+- CWE rationale: rule=<deterministic rule> basis=<root_cause|label|impact|unclassified> <explanation>
+- CVSS note: <present only when the vector is unscorable; model severity is then a candidate, not a score>
 - OWASP: <A0X — Category>
 - Affected asset: <host / endpoint / parameter>
 - Status: <candidate | verified | operator-confirmed>

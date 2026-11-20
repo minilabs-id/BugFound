@@ -1976,57 +1976,97 @@ pub fn wstg_playbooks() -> Vec<(&'static str, &'static str)> {
 // Verifier and report writer
 // ---------------------------------------------------------------------------
 
-/// FIRST CVSS v3.1 base score for a vector such as
-/// `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`. Returns `0.0` for malformed
-/// or incomplete vectors.
-pub fn cvss_base(vector: &str) -> f32 {
-    let mut metrics: HashMap<&str, &str> = HashMap::new();
-    for part in vector.trim().split('/') {
-        if let Some((key, value)) = part.split_once(':') {
-            metrics.insert(key, value);
-        }
-    }
-    let Some(av) = metric(&metrics, "AV") else {
-        return 0.0;
-    };
-    let Some(ac) = metric(&metrics, "AC") else {
-        return 0.0;
-    };
-    let Some(pr) = metric(&metrics, "PR") else {
-        return 0.0;
-    };
-    let Some(ui) = metric(&metrics, "UI") else {
-        return 0.0;
-    };
-    let Some(s) = metric(&metrics, "S") else {
-        return 0.0;
-    };
-    let Some(c) = metric(&metrics, "C") else {
-        return 0.0;
-    };
-    let Some(i) = metric(&metrics, "I") else {
-        return 0.0;
-    };
-    let Some(a) = metric(&metrics, "A") else {
-        return 0.0;
-    };
+/// Why a CVSS vector was rejected. Used by the report to avoid silently
+/// letting a model-supplied score stand in for an unscorable vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CvssError {
+    MissingPrefix,
+    UnsupportedVersion,
+    WrongOrder,
+    DuplicateOrUnknownKey,
+    BadValue,
+    MissingMetric,
+    ExtraMetric,
+}
 
-    let av = match av {
+#[derive(Debug, Clone, Copy)]
+pub struct ParsedV31 {
+    av: f64,
+    ac: f64,
+    pr: f64,
+    ui: f64,
+    scope_changed: bool,
+    c: f64,
+    i: f64,
+    a: f64,
+}
+
+fn impact_metric(value: &str) -> Option<f64> {
+    match value {
+        "H" => Some(0.56),
+        "L" => Some(0.22),
+        "N" => Some(0.0),
+        _ => None,
+    }
+}
+
+/// Parse a canonical CVSS v3.1 base vector. The prefix, key order, metric
+/// count and values are all validated; duplicates and trailing segments are
+/// rejected rather than silently overwritten.
+pub fn parse_v31_base(vector: &str) -> std::result::Result<ParsedV31, CvssError> {
+    const KEYS: [&str; 8] = ["AV", "AC", "PR", "UI", "S", "C", "I", "A"];
+    let parts: Vec<&str> = vector.trim().split('/').collect();
+    match parts.first().copied() {
+        Some("CVSS:3.1") => {}
+        Some(other) if other.starts_with("CVSS:") => return Err(CvssError::UnsupportedVersion),
+        _ => return Err(CvssError::MissingPrefix),
+    }
+    if parts.len() < 9 {
+        return Err(CvssError::MissingMetric);
+    }
+    if parts.len() > 9 {
+        return Err(CvssError::ExtraMetric);
+    }
+    let mut values = [""; 8];
+    let mut seen = [false; 8];
+    for (index, part) in parts[1..].iter().enumerate() {
+        let Some((key, value)) = part.split_once(':') else {
+            return Err(CvssError::BadValue);
+        };
+        let Some(slot) = KEYS.iter().position(|expected| *expected == key) else {
+            return Err(CvssError::DuplicateOrUnknownKey);
+        };
+        if seen[slot] || slot != index {
+            return Err(CvssError::WrongOrder);
+        }
+        seen[slot] = true;
+        values[slot] = value;
+    }
+    let av = match values[0] {
         "N" => 0.85,
         "A" => 0.62,
         "L" => 0.55,
         "P" => 0.2,
-        _ => return 0.0,
+        _ => return Err(CvssError::BadValue),
     };
-    let ac = match ac {
+    let ac = match values[1] {
         "L" => 0.77,
         "H" => 0.44,
-        _ => return 0.0,
+        _ => return Err(CvssError::BadValue),
     };
-    let scope_changed = match s {
+    let pr = match values[2] {
+        "N" | "L" | "H" => values[2],
+        _ => return Err(CvssError::BadValue),
+    };
+    let ui = match values[3] {
+        "N" => 0.85,
+        "R" => 0.62,
+        _ => return Err(CvssError::BadValue),
+    };
+    let scope_changed = match values[4] {
         "U" => false,
         "C" => true,
-        _ => return 0.0,
+        _ => return Err(CvssError::BadValue),
     };
     let pr = match (scope_changed, pr) {
         (false, "N") => 0.85,
@@ -2035,26 +2075,35 @@ pub fn cvss_base(vector: &str) -> f32 {
         (true, "N") => 0.85,
         (true, "L") => 0.68,
         (true, "H") => 0.5,
-        _ => return 0.0,
+        _ => return Err(CvssError::BadValue),
     };
-    let ui = match ui {
-        "N" => 0.85,
-        "R" => 0.62,
-        _ => return 0.0,
-    };
-    let confidentiality = impact_metric(c);
-    let integrity = impact_metric(i);
-    let availability = impact_metric(a);
-    if confidentiality.is_none() || integrity.is_none() || availability.is_none() {
-        return 0.0;
-    }
-    let (confidentiality, integrity, availability) = (
-        confidentiality.unwrap(),
-        integrity.unwrap(),
-        availability.unwrap(),
-    );
+    let c = impact_metric(values[5]).ok_or(CvssError::BadValue)?;
+    let i = impact_metric(values[6]).ok_or(CvssError::BadValue)?;
+    let a = impact_metric(values[7]).ok_or(CvssError::BadValue)?;
+    Ok(ParsedV31 {
+        av,
+        ac,
+        pr,
+        ui,
+        scope_changed,
+        c,
+        i,
+        a,
+    })
+}
 
-    let iss = 1.0 - (1.0 - confidentiality) * (1.0 - integrity) * (1.0 - availability);
+fn score_v31(parsed: ParsedV31) -> f32 {
+    let ParsedV31 {
+        av,
+        ac,
+        pr,
+        ui,
+        scope_changed,
+        c,
+        i,
+        a,
+    } = parsed;
+    let iss = 1.0 - (1.0 - c) * (1.0 - i) * (1.0 - a);
     let impact = if scope_changed {
         7.52 * (iss - 0.029) - 3.25 * (iss - 0.02).powf(15.0)
     } else {
@@ -2072,17 +2121,10 @@ pub fn cvss_base(vector: &str) -> f32 {
     cvss_roundup(base.min(10.0)) as f32
 }
 
-fn metric<'a>(metrics: &'a HashMap<&str, &str>, key: &str) -> Option<&'a str> {
-    metrics.get(key).copied()
-}
-
-fn impact_metric(value: &str) -> Option<f64> {
-    match value {
-        "H" => Some(0.56),
-        "L" => Some(0.22),
-        "N" => Some(0.0),
-        _ => None,
-    }
+/// FIRST CVSS v3.1 base score. Returns `0.0` for malformed, reordered,
+/// duplicated or unsupported vectors; use [`parse_v31_base`] to learn why.
+pub fn cvss_base(vector: &str) -> f32 {
+    parse_v31_base(vector).map(score_v31).unwrap_or(0.0)
 }
 
 /// FIRST roundup: smallest number with one decimal place that is >= input.
@@ -2108,46 +2150,99 @@ fn severity_from_score(score: f32) -> &'static str {
     }
 }
 
-fn map_cwe(title: &str, vuln_type: Option<&str>) -> String {
-    let haystack = format!("{title} {}", vuln_type.unwrap_or_default()).to_ascii_lowercase();
-    const TABLE: &[(&str, &str)] = &[
-        ("sql injection", "CWE-89"),
-        ("sqli", "CWE-89"),
-        ("cross-site scripting", "CWE-79"),
-        ("xss", "CWE-79"),
-        ("cross-site request forgery", "CWE-352"),
-        ("csrf", "CWE-352"),
-        ("server-side request forgery", "CWE-918"),
-        ("ssrf", "CWE-918"),
-        ("path traversal", "CWE-22"),
-        ("directory traversal", "CWE-22"),
-        ("command injection", "CWE-78"),
-        ("remote code execution", "CWE-78"),
-        ("rce", "CWE-78"),
-        ("deserial", "CWE-502"),
-        ("xml external entity", "CWE-611"),
-        ("xxe", "CWE-611"),
-        ("open redirect", "CWE-601"),
-        ("file upload", "CWE-434"),
-        ("session", "CWE-384"),
-        ("authentication", "CWE-287"),
-        ("idor", "CWE-639"),
-        ("authorization", "CWE-284"),
-        ("access control", "CWE-284"),
-        ("information disclosure", "CWE-200"),
-        ("leak", "CWE-200"),
-        ("exposure", "CWE-200"),
-        ("clickjack", "CWE-451"),
-        ("race condition", "CWE-362"),
-        ("rate limit", "CWE-770"),
-        ("brute force", "CWE-307"),
-    ];
-    for (needle, cwe) in TABLE {
-        if haystack.contains(needle) {
-            return (*cwe).to_string();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CweBasis {
+    RootCause,
+    Label,
+    Impact,
+    Unclassified,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CweVerdict {
+    pub cwe: &'static str,
+    pub rule: &'static str,
+    pub basis: CweBasis,
+    pub rationale: &'static str,
+}
+
+/// (needle tokens, CWE, rule id, basis, rationale) ordered by specificity.
+/// The IDOR/BOLA rule must precede generic authorization rules.
+const CWE_RULES: &[(&[&str], &str, &str, CweBasis, &str)] = &[
+    (
+        &["idor", "bola", "insecure direct object reference", "object-level authorization", "cross-user object"],
+        "CWE-639",
+        "object-level-authorization",
+        CweBasis::RootCause,
+        "object reference controlled by the requester without per-object authorization; the root cause is missing authorization, not the observed disclosure.",
+    ),
+    (&["sql injection", "sqli"], "CWE-89", "sql-injection", CweBasis::RootCause, "untrusted input reaches a SQL query without parameterization."),
+    (&["cross-site scripting", "xss"], "CWE-79", "xss", CweBasis::RootCause, "untrusted input is rendered into a browser context without contextual escaping."),
+    (&["cross-site request forgery", "csrf"], "CWE-352", "csrf", CweBasis::RootCause, "state-changing request lacks an unpredictable per-session token."),
+    (&["server-side request forgery", "ssrf"], "CWE-918", "ssrf", CweBasis::RootCause, "server fetches an attacker-controlled URL without destination validation."),
+    (&["path traversal", "directory traversal"], "CWE-22", "path-traversal", CweBasis::RootCause, "path construction allows traversal outside the intended directory."),
+    (&["command injection", "os injection", "remote code execution", "rce"], "CWE-78", "os-command", CweBasis::RootCause, "untrusted input is passed to an operating-system command."),
+    (&["deserial"], "CWE-502", "deserialization", CweBasis::RootCause, "untrusted serialized data is deserialized without type validation."),
+    (&["xml external entity", "xxe"], "CWE-611", "xxe", CweBasis::RootCause, "XML parser resolves external entities from untrusted documents."),
+    (&["open redirect"], "CWE-601", "open-redirect", CweBasis::RootCause, "target URL is taken from untrusted input without an allowlist."),
+    (&["file upload"], "CWE-434", "file-upload", CweBasis::RootCause, "uploaded file type or path is not restricted at the server."),
+    (&["race condition"], "CWE-362", "race", CweBasis::RootCause, "concurrent access to shared state is not synchronized."),
+    (&["rate limit", "resource exhaustion"], "CWE-770", "resource-limit", CweBasis::RootCause, "resource consumption is not bounded per caller."),
+    (&["brute force"], "CWE-307", "brute-force", CweBasis::RootCause, "repeated authentication attempts are not throttled."),
+    (&["clickjack"], "CWE-451", "clickjacking", CweBasis::RootCause, "UI redress is not prevented by framing policy."),
+    (&["authorization", "access control"], "CWE-284", "authorization-label", CweBasis::Label, "class-level authorization label only; the specific root cause is not established."),
+    (&["session"], "CWE-384", "session-label", CweBasis::Label, "session-related label only; root cause needs review."),
+    (&["authentication"], "CWE-287", "authentication-label", CweBasis::Label, "authentication-related label only; root cause needs review."),
+    (&["information disclosure", "leak", "exposure"], "CWE-200", "impact-only", CweBasis::Impact, "impact wording only; this is not a root cause and needs review."),
+];
+
+fn tokenize(text: &str) -> Vec<String> {
+    text.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn contains_needle(tokens: &[String], needle: &str) -> bool {
+    let needle_tokens = tokenize(needle);
+    if needle_tokens.is_empty() || needle_tokens.len() > tokens.len() {
+        return false;
+    }
+    tokens
+        .windows(needle_tokens.len())
+        .any(|window| window == needle_tokens.as_slice())
+}
+
+/// Deterministic, root-cause-first CWE classification. No model output is an
+/// authority here; the result is reviewable through rule, basis and rationale.
+pub fn classify_cwe(title: &str, vuln_type: Option<&str>, description: Option<&str>) -> CweVerdict {
+    let raw = format!(
+        "{} {} {}",
+        title,
+        vuln_type.unwrap_or_default(),
+        description.unwrap_or_default()
+    );
+    let tokens = tokenize(&raw);
+    for (needles, cwe, rule, basis, rationale) in CWE_RULES {
+        if needles
+            .iter()
+            .any(|needle| contains_needle(&tokens, needle))
+        {
+            return CweVerdict {
+                cwe,
+                rule,
+                basis: *basis,
+                rationale,
+            };
         }
     }
-    "CWE-284".to_string()
+    CweVerdict {
+        cwe: "CWE-284",
+        rule: "unclassified",
+        basis: CweBasis::Unclassified,
+        rationale: "no root-cause rule matched; unclassified and needs review.",
+    }
 }
 
 /// The trusted canary for a capture: use the value minted by the tool, or fall
@@ -2331,12 +2426,23 @@ fn build_canonical_report(
         .iter()
         .map(|finding| {
             let vector = finding.cvss.clone().unwrap_or_default();
-            let score = cvss_base(&vector);
+            let parsed = parse_v31_base(&vector);
+            let score = parsed.map(score_v31).unwrap_or(0.0);
+            let cvss_note = parsed.err().map(|error| {
+                format!(
+                    "CVSS not assessable ({error:?}); model severity retained as candidate only"
+                )
+            });
             let severity = if score > 0.0 {
                 severity_from_score(score).to_string()
             } else {
                 finding.severity.clone()
             };
+            let verdict = classify_cwe(
+                &finding.title,
+                finding.vuln_type.as_deref(),
+                Some(&finding.description),
+            );
             let evidence_hash = evidence_hashes
                 .get(&finding.id)
                 .cloned()
@@ -2347,12 +2453,12 @@ fn build_canonical_report(
                 severity,
                 cvss: (score > 0.0).then_some(score),
                 vector: (!vector.is_empty()).then(|| redact(&vector)),
-                cwe: Some(
-                    finding
-                        .cwe
-                        .clone()
-                        .unwrap_or_else(|| map_cwe(&finding.title, finding.vuln_type.as_deref())),
-                ),
+                cwe: Some(verdict.cwe.to_string()),
+                cwe_rationale: Some(format!(
+                    "rule={} basis={:?} {}",
+                    verdict.rule, verdict.basis, verdict.rationale
+                )),
+                cvss_note,
                 asset: finding.asset.as_deref().map(redact),
                 description: redact(&finding.description),
                 reproduction: finding.reproduction.as_deref().map(redact),
@@ -3273,5 +3379,95 @@ No DoS testing. Do not modify data. No disclosure.
         let promoted = verify_findings(&store, session, &RoePolicy::default(), &mut trace).unwrap();
         assert_eq!(promoted, 0, "2xx alone must not validate a finding");
         assert!(store.verified_findings(session).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod r5_tests {
+    use super::*;
+
+    #[test]
+    fn strict_cvss_reference_vectors_score_identically() {
+        let cases = [
+            ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", 9.8),
+            ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", 7.5),
+            ("CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N", 1.8),
+            ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H", 10.0),
+        ];
+        for (vector, expected) in cases {
+            assert_eq!(cvss_base(vector), expected, "{vector}");
+        }
+        assert_eq!(
+            cvss_base("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N"),
+            0.0
+        );
+        assert!(parse_v31_base("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N").is_ok());
+    }
+
+    #[test]
+    fn strict_cvss_rejects_malformed_vectors() {
+        let cases = [
+            ("", CvssError::MissingPrefix),
+            (
+                "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                CvssError::MissingPrefix,
+            ),
+            ("CVSS:3.1/AV:N/AC:L", CvssError::MissingMetric),
+            (
+                "CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                CvssError::UnsupportedVersion,
+            ),
+            (
+                "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+                CvssError::UnsupportedVersion,
+            ),
+            (
+                "CVSS:3.1/AC:L/AV:N/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                CvssError::WrongOrder,
+            ),
+            (
+                "CVSS:3.1/AV:N/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                CvssError::ExtraMetric,
+            ),
+            (
+                "CVSS:3.1/AV:F/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                CvssError::BadValue,
+            ),
+            (
+                "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H/",
+                CvssError::ExtraMetric,
+            ),
+            ("9.8", CvssError::MissingPrefix),
+        ];
+        for (vector, expected) in cases {
+            assert_eq!(parse_v31_base(vector).err(), Some(expected), "{vector}");
+            assert_eq!(cvss_base(vector), 0.0, "{vector}");
+        }
+    }
+
+    #[test]
+    fn cwe_classification_prefers_root_cause_and_is_word_boundaried() {
+        let idor = classify_cwe("IDOR in /api/user/123", Some("idor"), None);
+        assert_eq!(idor.cwe, "CWE-639");
+        assert_eq!(idor.basis, CweBasis::RootCause);
+        assert_eq!(
+            classify_cwe("IDOR / broken access control", None, None).cwe,
+            "CWE-639"
+        );
+        assert_eq!(
+            classify_cwe("SQL injection in login", None, None).cwe,
+            "CWE-89"
+        );
+        assert_eq!(
+            classify_cwe("authorization header ignored", None, None).basis,
+            CweBasis::Label
+        );
+        assert_eq!(
+            classify_cwe("sessionization logic", None, None).cwe,
+            "CWE-284"
+        );
+        let unknown = classify_cwe("nothing particular", None, None);
+        assert_eq!(unknown.cwe, "CWE-284");
+        assert_eq!(unknown.basis, CweBasis::Unclassified);
     }
 }

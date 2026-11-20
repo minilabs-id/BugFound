@@ -2140,6 +2140,34 @@ pub fn try_default_registry(cwd: impl AsRef<Path>) -> Result<ToolRegistry> {
 /// Registry constructor with explicit tool policy. External recon adapters are
 /// only present when `enable_external_tools` is set, and `dnsx` then belongs to
 /// the adapter rather than the built-in DNS alias.
+/// How strictly tool arguments are checked against their advertised schema.
+/// Default `Off` keeps existing callers byte-identical; `Warn` only emits an
+/// audit event; `Enforce` blocks before any guard state or budget is consumed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaValidationMode {
+    #[default]
+    Off,
+    Warn,
+    Enforce,
+}
+
+/// Validate arguments against `ToolSpec.input_schema`. External `$ref`
+/// resolution is disabled by the dependency's default-feature choice.
+pub fn validate_tool_args(spec: &ToolSpec, args: &Value) -> Result<(), String> {
+    let validator = jsonschema::validator_for(&spec.input_schema)
+        .map_err(|error| format!("invalid tool schema: {error}"))?;
+    let errors: Vec<String> = validator
+        .iter_errors(args)
+        .map(|error| error.instance_path.to_string())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join(", "))
+    }
+}
+
 pub const SESSION_FINISH_TOOL: &str = "session.finish";
 
 /// Explicit terminal tool. The kernel intercepts it; `run` is never called on
@@ -5813,5 +5841,38 @@ mod platform_tests {
         assert!(!h1.contains("Prior-art"));
         assert!(bc.contains("Prior-art"));
         assert!(!bc.contains("severity ceiling"));
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    #[test]
+    fn validate_tool_args_checks_required_fields() {
+        let spec = ToolSpec {
+            name: "strict".to_string(),
+            description: String::new(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+            risk: "safe".to_string(),
+        };
+        assert!(validate_tool_args(&spec, &json!({"path": "x"})).is_ok());
+        assert!(validate_tool_args(&spec, &json!({})).is_err());
+        assert!(validate_tool_args(&spec, &json!({"path": 1})).is_err());
+    }
+
+    #[test]
+    fn validate_tool_args_rejects_malformed_schema() {
+        let spec = ToolSpec {
+            name: "broken".to_string(),
+            description: String::new(),
+            input_schema: json!({"type": "not-a-type"}),
+            risk: "safe".to_string(),
+        };
+        assert!(validate_tool_args(&spec, &json!({})).is_err());
     }
 }

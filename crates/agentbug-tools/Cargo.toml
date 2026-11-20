@@ -16,3 +16,4 @@ reqwest.workspace = true
 url.workspace = true
 sha2.workspace = true
 agentbug-policy = { path = "../agentbug-policy" }
+jsonschema.workspace = true

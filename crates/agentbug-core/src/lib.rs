@@ -354,6 +354,9 @@ pub struct AgentConfig {
     /// 0 disables the stall guard.
     #[serde(default)]
     pub stall_limit: usize,
+    /// Validate tool arguments against the advertised JSON Schema.
+    #[serde(default)]
+    pub schema_validation: agentbug_tools::SchemaValidationMode,
 }
 fn default_max_steps() -> usize {
     20
@@ -378,6 +381,7 @@ impl Default for AgentConfig {
             cost_per_1k_input: 0.0,
             cost_per_1k_output: 0.0,
             stall_limit: 0,
+            schema_validation: agentbug_tools::SchemaValidationMode::Off,
         }
     }
 }
@@ -815,6 +819,30 @@ impl Runner {
         target: Option<&str>,
     ) -> Option<String> {
         tracing::debug!(session=%session_id, owner=%owner, tool=%spec.name, "pre-execute guards");
+        if self.agent.schema_validation != agentbug_tools::SchemaValidationMode::Off {
+            let check = agentbug_tools::validate_tool_args(spec, args);
+            match self.agent.schema_validation {
+                agentbug_tools::SchemaValidationMode::Warn => {
+                    if let Err(paths) = check {
+                        self.log_event(
+                            session_id,
+                            "warn",
+                            "tool.schema_invalid",
+                            &format!("tool={} paths={}", spec.name, paths),
+                        );
+                    }
+                }
+                agentbug_tools::SchemaValidationMode::Enforce => {
+                    if let Err(paths) = check {
+                        return Some(format!(
+                            "{GUARD_DENY}schema_validation_failed tool={} paths={paths}",
+                            spec.name
+                        ));
+                    }
+                }
+                agentbug_tools::SchemaValidationMode::Off => {}
+            }
+        }
 
         if self.goal_lock_violation(session_id) {
             self.log_event(

@@ -39,3 +39,4 @@ eframe = "0.31"
 egui = "0.31"
 base64 = "0.22"
 regex = "1"
+jsonschema = { version = "0.26", default-features = false }

@@ -2158,3 +2158,98 @@ async fn duplicate_dangerous_tool_keeps_hard_block() {
         .join("\n");
     assert!(text.contains("duplicate tool call ignored"), "{text}");
 }
+
+struct StrictTool {
+    ran: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Tool for StrictTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "strict".to_string(),
+            description: String::new(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"needle": {"type": "string"}},
+                "required": ["needle"]
+            }),
+            risk: "safe".to_string(),
+        }
+    }
+
+    async fn run(&self, _input: Value) -> Result<ToolResult> {
+        self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(ToolResult {
+            ok: true,
+            output: "ran".to_string(),
+            structured: None,
+        })
+    }
+}
+
+async fn run_schema_mode(
+    mode: agentbug_tools::SchemaValidationMode,
+) -> (Store, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let store = Store::open(":memory:").unwrap();
+    let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let llm = Arc::new(MockLlm::new(
+        "m",
+        vec![
+            ChatResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "s1".to_string(),
+                    name: "strict".to_string(),
+                    arguments: json!({}),
+                }],
+                model: "m".to_string(),
+            },
+            ChatResponse {
+                content: Some("done".to_string()),
+                tool_calls: vec![],
+                model: "m".to_string(),
+            },
+        ],
+    ));
+    let mut tools = ToolRegistry::new();
+    tools.register_with_host_risk(Arc::new(StrictTool { ran: ran.clone() }), "safe");
+    let runner = Runner::new(
+        store.clone(),
+        llm,
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            max_steps: 4,
+            schema_validation: mode,
+            ..Default::default()
+        },
+    );
+    runner.run_goal("schema").await.unwrap();
+    (store, ran)
+}
+
+#[tokio::test]
+async fn schema_enforce_blocks_before_tool_run() {
+    let (store, ran) = run_schema_mode(agentbug_tools::SchemaValidationMode::Enforce).await;
+    assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    let session = &store.list_sessions(10).unwrap()[0].id;
+    let text = store
+        .list_messages(session)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("schema_validation_failed"), "{text}");
+}
+
+#[tokio::test]
+async fn schema_warn_records_event_and_still_runs() {
+    let (store, ran) = run_schema_mode(agentbug_tools::SchemaValidationMode::Warn).await;
+    assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+    let session = &store.list_sessions(10).unwrap()[0].id;
+    let events = store.list_events(session, 50).unwrap();
+    assert!(events.iter().any(|e| e.kind == "tool.schema_invalid"));
+}

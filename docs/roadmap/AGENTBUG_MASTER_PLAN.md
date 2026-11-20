@@ -200,10 +200,17 @@ Other oracle classes remain `open_proof_gap` (no implementation exists).
 - Deferred: typed assets, eligibility flags, freshness/TTL gating, platform
   VRT/safe-harbor semantics (sources stale/unpinned/license-restricted).
 
-#### R7c / R8 — Later
-- R7c: JSON Schema validation (offline dependency decision), `Scope` doorbell,
-  one-shot arg repair.
-- R8: measured results from real local engagements N>=3 + baseline lane.
+#### R7c — Tool argument validation (PARTIAL)
+- ✅ Added `jsonschema` dependency (operator-approved) with external `$ref`
+  resolution disabled; `validate_tool_args` checks tool args at the guard chain.
+- ✅ `SchemaValidationMode` `Off` (default) / `Warn` (audit event) / `Enforce`
+  (block before any guard state or budget is consumed). Tests cover all paths.
+- Deferred: `Scope` doorbell coalescing (no production consumer yet) and
+  one-shot arg repair (needs typed tool errors; must not break one LLM call
+  per step).
+
+#### R8 — Later
+- Measured results from real local engagements N>=3 + baseline lane.
 
 ### R6b — Measured results (NOT STARTED)
 - Golden dataset tiers A-D with reset recipes and negative controls from real

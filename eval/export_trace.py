@@ -120,7 +120,10 @@ def event_from_row(row):
         event["prompt_tokens"], event["completion_tokens"] = normalize_tokens(payload)
 
     if kind == "verifier":
-        event["finding_id"] = payload.get("finding_id") or event.get("id")
+        # The engagement verifier emits `candidate`; older replays may use
+        # `finding_id`. Keep both additive mappings so score.py sees the verdict.
+        event["candidate"] = payload.get("candidate") or payload.get("finding_id") or ""
+        event["finding_id"] = payload.get("finding_id") or payload.get("candidate") or event.get("id")
         verdict = _verdict(payload)
         event["verified"] = verdict if verdict is not None else False
 
@@ -133,6 +136,11 @@ def event_from_row(row):
 
     if kind == "report" and not event.get("sha256"):
         event["sha256"] = payload.get("sha256", "")
+
+    # Additive provenance keys; ignored by older scorers, available to R6 metrics.
+    for key in ("type", "cwe", "oracle_type", "target_id", "tier", "lane", "verdict"):
+        if key in payload and key not in event:
+            event[key] = payload[key]
     return event
 
 

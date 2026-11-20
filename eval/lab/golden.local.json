@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "project": "local-reflect-lab",
+  "target_id": "local-reflect-lab",
+  "description": "Offline loopback fixture for harness wiring; NOT a benchmark result and NOT an external target.",
+  "status": "wiring-fixture-only",
+  "tier": "A",
+  "expected_vulns": [
+    {
+      "id": "reflect-canary",
+      "type": "reflected-xss",
+      "cwe": "CWE-79",
+      "aliases": ["CWE-79", "reflected canary", "F-001"],
+      "cvss_v3_1": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+      "severity_band": "Medium",
+      "tier": "A",
+      "endpoint": {"method": "GET", "path": "/reflect", "parameter": "q"},
+      "oracle": {
+        "type": "canary_echo",
+        "verifier": "response_contains_canary AND 2xx AND evidence_digests_match",
+        "success_marker": "canary present in response body",
+        "expected_artifact": "tool_captures row referenced by finding.id"
+      },
+      "preconditions": {"auth": "none", "state_change_allowed": false},
+      "reset": {"recipe": "stateless handler; restart server", "deterministic": true}
+    }
+  ],
+  "negative_controls": [
+    {
+      "id": "safe-no-reflect",
+      "endpoint": {"method": "GET", "path": "/safe", "parameter": "q"},
+      "expected": "not_a_finding",
+      "oracle_type": "canary_absent",
+      "emit_as": "tested",
+      "verdict": "rejected"
+    }
+  ],
+  "coverage_surface": ["/reflect", "/safe", "/health"],
+  "provenance": {
+    "source": "authored locally for eval wiring only",
+    "license": "own code; no third-party target content",
+    "external_target": false,
+    "claim": "wiring fixture only; no effectiveness result"
+  }
+}

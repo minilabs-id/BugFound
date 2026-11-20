@@ -145,10 +145,24 @@ clean.
 Exit (when complete): lab finding with counterevidence + paired control +
 strict CVSS vector validated.
 
-### R6 — Proof & optimization (ongoing)
-- Golden dataset with target/endpoint binding, negatives, reset, tiers A–D.
-- N≥3 repeat driver, baseline lane, metrics, tier-stratified reporting.
-- Performance: latency, token/cost, false-positive rate; optimize from measurements.
+### R6a — Wiring record scaffolding (COMPLETE, 2026-11-20)
+- ✅ Offline loopback lab server (`eval/lab/local_reflect_server.py`) with a
+  reflected endpoint and a non-reflective negative control.
+- ✅ `eval/lab/golden.local.json` with target/endpoint/oracle/reset/tier and an
+  explicit `wiring-fixture-only` status.
+- ✅ `eval/repeat_lab.py` N>=3 driver producing hashed, timed manifests and
+  per-run replays with a stable `run_id` per run; baseline recorded as
+  `not-run.json` unless an operator supplies a command.
+- ✅ `export_trace.py` maps verifier `candidate` -> `finding_id` and preserves
+  additive provenance keys.
+
+No effectiveness number is recorded. All artifacts state
+`harness wiring record; not a benchmark result`.
+
+### R6b — Measured results (NOT STARTED)
+- Golden dataset tiers A-D with reset recipes and negative controls from real
+  local lab engagements, N>=3, baseline lane, time-to-first-valid, tier-stratified
+  recall/precision and FPR with real negative controls.
 
 Exit: only measured claims; baseline vs harness comparison recorded.
 

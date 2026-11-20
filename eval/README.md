@@ -5,6 +5,21 @@ Internal benchmarking **scaffolding** for the autonomous engagement flow. See
 requirements. **No benchmark result is asserted here** — an operator must run real
 engagements, keep the artifacts, and record the outcome.
 
+## Offline wiring record (not a benchmark)
+
+`python eval/repeat_lab.py --repeat 3` starts a loopback-only lab fixture
+(`eval/lab/local_reflect_server.py`), probes its reflected and non-reflected
+endpoints three times, and writes a hashed, timed `run-manifest.json` plus one
+replay per run under the gitignored `eval/work/lab/`. Use `--record` to copy the
+wiring record into `eval/results/local-reflect-lab/`; a baseline lane is
+recorded as `not-run.json` unless an operator supplies `--baseline-cmd`.
+
+These artifacts prove the harness can capture and hash repeat observations.
+They contain **no agent effectiveness measurement**: no recall, precision, FPR,
+latency claim, or baseline comparison may be quoted from them. `export_trace.py`
+also maps the verifier's `candidate` key to `finding_id` and preserves additive
+provenance keys for future metrics.
+
 ## Layout
 
 ```

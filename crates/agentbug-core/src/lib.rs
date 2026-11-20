@@ -992,6 +992,22 @@ impl Runner {
             None,
             Some(&spec.name),
         )?;
+        // A refused attempt is still coverage: record it so a ROE-restricted
+        // engagement is honest about what it tried instead of reporting zero.
+        let requirement_id = format!("tool:{}", spec.name);
+        let rationale = truncate_event(reason, 400);
+        let _ = self
+            .store
+            .record_coverage_decision(agentbug_store::CoverageDecision {
+                session_id,
+                target: &spec.name,
+                method: "",
+                path: "",
+                requirement_id: &requirement_id,
+                status: "blocked",
+                rationale: &rationale,
+                evidence_ref: tool_call_id.unwrap_or(""),
+            });
         self.log_event(session_id, "warn", kind, &message);
         Ok(())
     }

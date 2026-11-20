@@ -260,3 +260,19 @@ Research docs already written by parallel agents; synthesis docs 12–16 by pare
 ### R8b — Measured results (NOT STARTED)
 Await operator-recorded local engagements (N>=3) and a declared baseline lane.
 No effectiveness number may be asserted until those artifacts exist.
+
+
+### R9 — Honest coverage and completion (IN PROGRESS)
+- ✅ Requirement-keyed coverage ledger: `coverage` rows now carry
+  `requirement_id`, `status` (covered|blocked|skipped|not-applicable),
+  `rationale` and `evidence_ref`; `CoverageDecision` input struct.
+- ✅ A tool call refused by the policy gate is recorded as `blocked` coverage,
+  so a ROE-restricted engagement is no longer indistinguishable from one that
+  tested nothing.
+- ✅ Playbook completion requires evidence: a task whose runner returns `Ok`
+  but produced no coverage and no artifacts is marked `needs-review`, not
+  `done`; an `engagement.outcome` trace records `incomplete` when tasks or
+  coverage are missing.
+- ✅ Report Coverage section now prints a Result column with reason.
+- Next: hypothesis terminal states and passive→active feedback (build step 2
+  of `docs/research/17_ideal_workflow.md`).

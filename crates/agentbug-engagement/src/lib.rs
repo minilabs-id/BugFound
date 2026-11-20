@@ -1059,9 +1059,40 @@ async fn run_engagement(
 
         match run_result {
             Ok(_) => {
-                store.update_task_status(&task.id, "done")?;
+                // "Done" must mean evidence, not merely that the runner
+                // returned. A playbook with zero coverage and zero evidence
+                // is incomplete and must be surfaced as such.
+                let evidence_count = store.list_findings(id).map(|rows| rows.len()).unwrap_or(0)
+                    + store.list_artifacts(id).map(|rows| rows.len()).unwrap_or(0);
+                if task_coverage == 0 && evidence_count == 0 {
+                    store.update_task_status(&task.id, "needs-review")?;
+                    let _ = store.append_trace(
+                        id,
+                        id,
+                        "playbook.incomplete",
+                        &json!({
+                            "playbook_id": task.playbook_id,
+                            "reason": "runner completed without coverage or evidence"
+                        })
+                        .to_string(),
+                    );
+                    emit(
+                        tx,
+                        Some(replay),
+                        EngagementEvent::Error {
+                            message: format!(
+                                "playbook {} completed without coverage or evidence; marked needs-review",
+                                task.playbook_id
+                            ),
+                        },
+                    );
+                } else {
+                    store.update_task_status(&task.id, "done")?;
+                }
                 update_control(id, |control| {
-                    control.tasks_done += 1;
+                    if task_coverage > 0 || evidence_count > 0 {
+                        control.tasks_done += 1;
+                    }
                     control.coverage += task_coverage;
                 });
             }
@@ -1163,21 +1194,45 @@ async fn run_engagement(
             path: report_path.clone(),
         },
     );
+    let coverage = status.coverage;
+    let outcome = if aborted {
+        "aborted"
+    } else if status.tasks_done < status.tasks_total || coverage == 0 {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    let _ = store.append_trace(
+        id,
+        id,
+        "engagement.outcome",
+        &json!({
+            "outcome": outcome,
+            "tasks_done": status.tasks_done,
+            "tasks_total": status.tasks_total,
+            "coverage": coverage,
+            "verified": verified_count,
+            "reason": if outcome == "incomplete" {
+                "one or more playbooks produced no coverage or evidence"
+            } else { "all playbooks evidenced" }
+        })
+        .to_string(),
+    );
     emit(
         tx,
         Some(replay),
         EngagementEvent::Finished {
             summary: format!(
-                "Engagement {} ({}) {} with {}/{} playbooks complete, {} verified findings \
+                "Engagement {} ({}) {} with {}/{} playbooks evidenced, {} verified findings \
                  ({} candidates excluded), coverage {}, report {} (sha256 {})",
                 id,
                 profile.engagement,
-                if aborted { "aborted" } else { "completed" },
+                outcome,
                 status.tasks_done,
                 status.tasks_total,
                 verified_count,
                 candidate_count,
-                status.coverage,
+                coverage,
                 report_path.display(),
                 sha256
             ),
@@ -2627,7 +2682,15 @@ fn build_canonical_report(
         .list_coverage(id)
         .unwrap_or_default()
         .into_iter()
-        .map(|row| (redact(&row.target), redact(&row.method), redact(&row.path)))
+        .map(|row| {
+            (
+                redact(&row.target),
+                redact(&row.method),
+                redact(&row.path),
+                redact(&row.status),
+                redact(&row.rationale),
+            )
+        })
         .collect();
     let timeline = store
         .list_all_events(500)

@@ -111,6 +111,14 @@ pub struct Coverage {
     pub method: String,
     pub path: String,
     pub created_at: String,
+    /// Stable requirement/test id this row accounts for (e.g. WSTG-ATHZ-04).
+    pub requirement_id: String,
+    /// covered | blocked | skipped | not-applicable
+    pub status: String,
+    /// Mandatory rationale for non-covered rows.
+    pub rationale: String,
+    /// Evidence artifact / capture hash reference.
+    pub evidence_ref: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +284,19 @@ fn sha256_evidence_bytes(request: &[u8], response: &[u8], artifact: Option<&[u8]
     format!("{:x}", Sha256::digest(input))
 }
 
+/// Requirement-keyed coverage decision input.
+#[derive(Debug, Clone, Default)]
+pub struct CoverageDecision<'a> {
+    pub session_id: &'a str,
+    pub target: &'a str,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub requirement_id: &'a str,
+    pub status: &'a str,
+    pub rationale: &'a str,
+    pub evidence_ref: &'a str,
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -321,7 +342,10 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS coverage(
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, target TEXT NOT NULL, method TEXT NOT NULL DEFAULT '',
-               path TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, UNIQUE(session_id,target,method,path)
+               path TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+               requirement_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'covered',
+               rationale TEXT NOT NULL DEFAULT '', evidence_ref TEXT NOT NULL DEFAULT '',
+               UNIQUE(session_id,target,method,path,requirement_id)
              );
              CREATE TABLE IF NOT EXISTS hypotheses(
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, statement TEXT NOT NULL,
@@ -1950,6 +1974,43 @@ impl Store {
         Ok(())
     }
 
+    /// Requirement-keyed coverage decision. Attempted-and-denied is a valid
+    /// `blocked` row, so a ROE-restricted engagement still has honest coverage.
+    pub fn record_coverage_decision(&self, decision: CoverageDecision<'_>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO coverage(id,session_id,target,method,path,created_at,
+             requirement_id,status,rationale,evidence_ref)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             ON CONFLICT(session_id,target,method,path,requirement_id) DO UPDATE SET
+               status=excluded.status, rationale=excluded.rationale,
+               evidence_ref=excluded.evidence_ref",
+            params![
+                Uuid::new_v4().to_string(),
+                decision.session_id,
+                decision.target,
+                decision.method,
+                decision.path,
+                now(),
+                decision.requirement_id,
+                decision.status,
+                decision.rationale,
+                decision.evidence_ref
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn covered_requirement_count(&self, session_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coverage WHERE session_id=?1 AND status='covered'",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     pub fn coverage_count(&self, session_id: &str) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row(
@@ -1963,7 +2024,8 @@ impl Store {
     pub fn list_coverage(&self, session_id: &str) -> Result<Vec<Coverage>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,session_id,target,method,path,created_at FROM coverage WHERE session_id=?1 ORDER BY rowid ASC",
+            "SELECT id,session_id,target,method,path,created_at,requirement_id,status,rationale,evidence_ref
+             FROM coverage WHERE session_id=?1 ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
             Ok(Coverage {
@@ -1973,6 +2035,12 @@ impl Store {
                 method: r.get(3)?,
                 path: r.get(4)?,
                 created_at: r.get(5)?,
+                requirement_id: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                status: r
+                    .get::<_, Option<String>>(7)?
+                    .unwrap_or_else(|| "covered".to_string()),
+                rationale: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                evidence_ref: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
             })
         })?;
         let mut out = vec![];
@@ -5517,4 +5585,42 @@ fn rule_provenance_round_trips_and_does_not_change_scope_decisions() {
     assert_eq!(loaded[0].rule_value, "example.com");
     assert_eq!(loaded[0].verbatim_quote_hash, sha256_hex("- example.com"));
     assert_eq!(loaded[0].content_hash, sha256_hex("brief"));
+}
+
+#[test]
+fn blocked_coverage_is_recorded_as_requirement_keyed_row() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("goal").unwrap();
+    store
+        .record_coverage_decision(CoverageDecision {
+            session_id: &session.id,
+            target: "app.clockify.me",
+            method: "GET",
+            path: "/api/users/1",
+            requirement_id: "WSTG-ATHZ-04",
+            status: "blocked",
+            rationale: "matches out-of-scope wildcard",
+            evidence_ref: "call-1",
+        })
+        .unwrap();
+    let rows = store.list_coverage(&session.id).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "blocked");
+    assert_eq!(rows[0].requirement_id, "WSTG-ATHZ-04");
+    assert_eq!(store.coverage_count(&session.id).unwrap(), 1);
+    assert_eq!(store.covered_requirement_count(&session.id).unwrap(), 0);
+    store
+        .record_coverage_decision(CoverageDecision {
+            session_id: &session.id,
+            target: "app.clockify.me",
+            method: "GET",
+            path: "/api/users/1",
+            requirement_id: "WSTG-ATHZ-04",
+            status: "covered",
+            rationale: "",
+            evidence_ref: "capture-1",
+        })
+        .unwrap();
+    assert_eq!(store.list_coverage(&session.id).unwrap().len(), 1);
+    assert_eq!(store.covered_requirement_count(&session.id).unwrap(), 1);
 }

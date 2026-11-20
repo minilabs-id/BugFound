@@ -3245,7 +3245,7 @@ pub struct ReportInput {
     pub scope_out: Vec<String>,
     pub rules: Vec<String>,
     pub findings: Vec<ReportFinding>,
-    pub coverage: Vec<(String, String, String)>,
+    pub coverage: Vec<(String, String, String, String, String)>,
     pub timeline: Vec<(String, String, String)>,
     pub report_id: String,
     pub platform: Platform,
@@ -3360,9 +3360,17 @@ pub fn render_canonical_report(input: &ReportInput) -> String {
     if input.coverage.is_empty() {
         out.push_str("- No coverage rows were supplied.\n");
     } else {
-        for (target, method, path) in &input.coverage {
+        for (target, method, path, status, rationale) in &input.coverage {
             let method = if method.is_empty() { "ANY" } else { method };
-            out.push_str(&format!("- `{method} {target}{path}`\n"));
+            let status = if status.is_empty() { "covered" } else { status };
+            out.push_str(&format!(
+                "- `{method} {target}{path}` — **{status}**{}",
+                if rationale.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({rationale})")
+                }
+            ));
         }
     }
     out.push('\n');
@@ -3541,7 +3549,7 @@ fn render_report(input: &Value) -> (String, Vec<String>) {
         });
     }
 
-    let coverage: Vec<(String, String, String)> = input
+    let coverage: Vec<(String, String, String, String, String)> = input
         .get("coverage")
         .and_then(Value::as_array)
         .map(|items| {
@@ -3549,13 +3557,21 @@ fn render_report(input: &Value) -> (String, Vec<String>) {
                 .iter()
                 .filter_map(|item| {
                     if let Some(single) = item.as_str() {
-                        return Some((single.to_string(), String::new(), String::new()));
+                        return Some((
+                            single.to_string(),
+                            String::new(),
+                            String::new(),
+                            String::new(),
+                            String::new(),
+                        ));
                     }
                     let parts = item.as_array()?;
                     Some((
                         as_text(parts.first()),
                         as_text(parts.get(1)),
                         as_text(parts.get(2)),
+                        as_text(parts.get(3)),
+                        as_text(parts.get(4)),
                     ))
                 })
                 .collect()
@@ -3563,7 +3579,15 @@ fn render_report(input: &Value) -> (String, Vec<String>) {
         .unwrap_or_else(|| {
             derived_coverage
                 .into_iter()
-                .map(|asset| (asset, String::new(), String::new()))
+                .map(|asset| {
+                    (
+                        asset,
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    )
+                })
                 .collect()
         });
 
@@ -4816,6 +4840,8 @@ mod tests {
             coverage: vec![(
                 "https://example.com/search".to_string(),
                 "GET".to_string(),
+                String::new(),
+                "covered".to_string(),
                 String::new(),
             )],
             timeline: vec![(

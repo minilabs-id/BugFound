@@ -3120,8 +3120,42 @@ impl Tool for KnowledgeLookupTool {
     }
 }
 
+/// Platform hint derived only from an operator-supplied program URL.
+/// No network request and no model input; Generic when unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Platform {
+    HackerOne,
+    Bugcrowd,
+    #[default]
+    Generic,
+}
+
+impl Platform {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HackerOne => "HackerOne",
+            Self::Bugcrowd => "Bugcrowd",
+            Self::Generic => "Generic",
+        }
+    }
+}
+
+pub fn platform_from_program_url(raw: &str) -> Platform {
+    let host = url::Url::parse(raw)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default();
+    if host == "hackerone.com" || host.ends_with(".hackerone.com") {
+        Platform::HackerOne
+    } else if host == "bugcrowd.com" || host.ends_with(".bugcrowd.com") {
+        Platform::Bugcrowd
+    } else {
+        Platform::Generic
+    }
+}
+
 /// One verified finding as consumed by the canonical report renderer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ReportFinding {
     pub id: String,
     pub title: String,
@@ -3138,11 +3172,12 @@ pub struct ReportFinding {
     pub remediation: Option<String>,
     pub evidence_hash: Option<String>,
     pub verified: bool,
+    pub platform: Platform,
 }
 
 /// Everything the canonical renderer needs. Coverage and timeline tuples are
 /// `(target, method, path)` and `(timestamp, kind, detail)` respectively.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ReportInput {
     pub program: String,
     pub engagement: String,
@@ -3153,6 +3188,7 @@ pub struct ReportInput {
     pub coverage: Vec<(String, String, String)>,
     pub timeline: Vec<(String, String, String)>,
     pub report_id: String,
+    pub platform: Platform,
 }
 
 /// The single canonical Markdown report renderer. Every report-producing path
@@ -3293,6 +3329,60 @@ pub fn render_canonical_report(input: &ReportInput) -> String {
     out.push_str("\n### B. References\n\n");
     out.push_str("- OWASP Web Security Testing Guide (WSTG)\n");
     out.push_str("- MITRE CWE / Common Vulnerability Scoring System (CVSS)\n");
+    out.push_str("\n### C. Platform Field Checklist\n\n");
+    out.push_str(
+        "Platform hint derived from the program URL; confirm against the current brief. \
+         AgentBug-authored review aid, not a platform submission form. The operator submits manually.\n\n",
+    );
+    out.push_str(&format!("Platform: {}\n\n", input.platform.label()));
+    match input.platform {
+        Platform::HackerOne => {
+            out.push_str("- [ ] Affected in-scope asset selected from the program scope list\n");
+            out.push_str("- [ ] Weakness category required by that asset chosen and consistent with the finding\n");
+            out.push_str("- [ ] Asset confirmed report-eligible; reward eligibility checked where relevant\n");
+            out.push_str(
+                "- [ ] Asset-specific instructions and severity ceiling reflected in this draft\n",
+            );
+            out.push_str(
+                "- [ ] Deterministic reproduction and minimal evidence-derived PoC included\n",
+            );
+            out.push_str(
+                "- [ ] Concrete impact and actionable remediation with a re-test step included\n",
+            );
+            out.push_str(
+                "- [ ] Disclosure setting reviewed; no secret or third-party data exposed\n",
+            );
+        }
+        Platform::Bugcrowd => {
+            out.push_str("- [ ] Finding mapped to the program vulnerability-class taxonomy and target group\n");
+            out.push_str("- [ ] Class/target exclusion rules checked against this finding\n");
+            out.push_str("- [ ] Target group confirmed currently report-eligible; reward status checked where relevant\n");
+            out.push_str(
+                "- [ ] Prior-art / known-issue list checked before treating the issue as novel\n",
+            );
+            out.push_str("- [ ] Concise title, target location, reproduction and minimal evidence-derived PoC included\n");
+            out.push_str("- [ ] Demonstrated impact and actionable remediation with a re-test step included\n");
+            out.push_str(
+                "- [ ] Evidence manifest attached and any operator attestation left for sign-off\n",
+            );
+        }
+        Platform::Generic => {
+            out.push_str(
+                "- [ ] Affected host confirmed on the in-scope list and not on the excluded list\n",
+            );
+            out.push_str(
+                "- [ ] Any extra fields required by the program brief copied into this draft\n",
+            );
+            out.push_str("- [ ] Brief constraints (rate limits, prohibited techniques, disclosure) confirmed honored\n");
+            out.push_str(
+                "- [ ] Deterministic reproduction and minimal evidence-derived PoC included\n",
+            );
+            out.push_str(
+                "- [ ] Concrete impact and actionable remediation with a re-test step included\n",
+            );
+            out.push_str("- [ ] Draft contains no secrets or third-party personal data and is ready for operator review\n");
+        }
+    }
     out
 }
 
@@ -3387,6 +3477,7 @@ fn render_report(input: &Value) -> (String, Vec<String>) {
                 .into(),
             evidence_hash: Some(hash),
             verified,
+            ..Default::default()
         });
     }
 
@@ -3444,6 +3535,7 @@ fn render_report(input: &Value) -> (String, Vec<String>) {
             )]
         });
 
+    let platform = platform_from_program_url(&program);
     let canonical = ReportInput {
         program,
         engagement,
@@ -3454,6 +3546,7 @@ fn render_report(input: &Value) -> (String, Vec<String>) {
         coverage,
         timeline,
         report_id,
+        platform,
     };
     (render_canonical_report(&canonical), evidence_hashes)
 }
@@ -4658,6 +4751,7 @@ mod tests {
                 remediation: Some("Encode output".to_string()),
                 evidence_hash: Some("a".repeat(64)),
                 verified: true,
+                ..Default::default()
             }],
             coverage: vec![(
                 "https://example.com/search".to_string(),
@@ -4670,6 +4764,7 @@ mod tests {
                 "XSS confirmed".to_string(),
             )],
             report_id: "report-1".to_string(),
+            ..Default::default()
         };
         let markdown = render_canonical_report(&input);
         for section in [
@@ -5613,5 +5708,78 @@ mod host_risk_tests {
         registry.register_with_host_risk(Arc::new(Forged), "network-write");
         assert_eq!(registry.host_risk("forged"), "network-write");
         assert_eq!(registry.specs()[0].risk, "safe");
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    #[test]
+    fn platform_detection_uses_host_without_network() {
+        assert_eq!(
+            platform_from_program_url("https://hackerone.com/acme"),
+            Platform::HackerOne
+        );
+        assert_eq!(
+            platform_from_program_url("https://www.hackerone.com/x"),
+            Platform::HackerOne
+        );
+        assert_eq!(
+            platform_from_program_url("https://bugcrowd.com/acme"),
+            Platform::Bugcrowd
+        );
+        assert_eq!(
+            platform_from_program_url("https://portal.bugcrowd.com/x"),
+            Platform::Bugcrowd
+        );
+        assert_eq!(
+            platform_from_program_url("https://HACKERONE.COM:443/x"),
+            Platform::HackerOne
+        );
+        assert_eq!(
+            platform_from_program_url("https://hackerone.com.evil.example/x"),
+            Platform::Generic
+        );
+        assert_eq!(platform_from_program_url("not a url"), Platform::Generic);
+    }
+
+    #[test]
+    fn platform_appendix_is_rendered_without_changing_eval_headings() {
+        for platform in [Platform::HackerOne, Platform::Bugcrowd, Platform::Generic] {
+            let input = ReportInput {
+                program: "program".to_string(),
+                engagement: "engagement".to_string(),
+                report_id: "r1".to_string(),
+                platform,
+                ..Default::default()
+            };
+            let markdown = render_canonical_report(&input);
+            assert!(markdown.contains("### C. Platform Field Checklist"));
+            assert!(markdown.contains(&format!("Platform: {}", platform.label())));
+            for heading in [
+                "## Executive Summary",
+                "## Scope & ROE",
+                "## Methodology",
+                "## Findings",
+                "## Coverage",
+                "## Timeline",
+                "## Appendices",
+            ] {
+                assert!(markdown.contains(heading), "missing {heading}");
+            }
+        }
+        let h1 = render_canonical_report(&ReportInput {
+            platform: Platform::HackerOne,
+            ..Default::default()
+        });
+        let bc = render_canonical_report(&ReportInput {
+            platform: Platform::Bugcrowd,
+            ..Default::default()
+        });
+        assert!(h1.contains("report-eligible"));
+        assert!(!h1.contains("Prior-art"));
+        assert!(bc.contains("Prior-art"));
+        assert!(!bc.contains("severity ceiling"));
     }
 }

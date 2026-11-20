@@ -2402,7 +2402,9 @@ fn build_canonical_report(
     evidence_hashes: &HashMap<String, String>,
     roe: &RoePolicy,
 ) -> String {
-    use agentbug_tools::{render_canonical_report, ReportFinding, ReportInput};
+    use agentbug_tools::{
+        platform_from_program_url, render_canonical_report, ReportFinding, ReportInput,
+    };
 
     let mut rules = profile.rules.clone();
     rules.extend(profile.reporting_rules.clone());
@@ -2422,6 +2424,7 @@ fn build_canonical_report(
         rules.push("No external disclosure".to_string());
     }
 
+    let platform = platform_from_program_url(&profile.program_url);
     let findings = verified
         .iter()
         .map(|finding| {
@@ -2466,6 +2469,7 @@ fn build_canonical_report(
                 remediation: finding.remediation.as_deref().map(redact),
                 evidence_hash,
                 verified: true,
+                platform,
             }
         })
         .collect();
@@ -2492,6 +2496,7 @@ fn build_canonical_report(
     let _ = status;
     render_canonical_report(&ReportInput {
         program: redact(&profile.program_url),
+        platform,
         engagement: redact(&profile.engagement),
         scope_in: profile
             .scope

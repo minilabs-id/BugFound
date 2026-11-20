@@ -58,6 +58,10 @@ gated or not used. Reference the playbooks/hypotheses where relevant.>
 - CWE: <CWE-XXX - Name>
 - CWE rationale: rule=<deterministic rule> basis=<root_cause|label|impact|unclassified> <explanation>
 - CVSS note: <present only when the vector is unscorable; model severity is then a candidate, not a score>
+
+The canonical renderer also emits `### C. Platform Field Checklist`, a local review aid
+whose platform hint is derived from the program URL. It contains no submission mechanism
+and never replaces verification against the current program brief.
 - OWASP: <A0X — Category>
 - Affected asset: <host / endpoint / parameter>
 - Status: <candidate | verified | operator-confirmed>

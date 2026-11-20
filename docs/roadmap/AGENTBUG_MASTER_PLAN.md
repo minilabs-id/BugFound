@@ -131,9 +131,16 @@ clean.
 - Ternary closure (`confirmed | ruled_out | open_proof_gap`), counterevidence,
   paired controls, multi-oracle dispatch and `Finding` schema extension —
   touches the finding DDL and verifier; separate review needed.
-- Platform-specific report appendix, program intelligence (typed assets/scope
-  provenance) — deferred: scope enforcement is a stop-condition boundary and
-  platform semantics are not pinned offline.
+- ✅ Platform-specific report appendix: `Platform` + `platform_from_program_url`,
+  Appendix C field checklist (HackerOne/Bugcrowd/Generic), self-authored, no
+  auto-submit, eval headings unchanged.
+- Program intelligence (typed assets/scope provenance) — deferred: scope
+  enforcement is a stop-condition boundary and platform semantics are not
+  pinned offline.
+- Verifier ternary closure (`confirmed | ruled_out | open_proof_gap`),
+  counterevidence and paired controls — deferred: needs a `Finding` DDL
+  migration and a second independent control exchange; the current
+  `tool_captures` table permits only one authoritative capture per finding.
 
 Exit (when complete): lab finding with counterevidence + paired control +
 strict CVSS vector validated.

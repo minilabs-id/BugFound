@@ -3,10 +3,10 @@ use agentbug_core::{
     build_policy, build_policy_config, extract_policy_target, normalized_args_signature,
     record_provider_usage, request_stop, AgentConfig, Runner,
 };
-use agentbug_llm::{ChatMessage, ChatResponse, Llm, ToolCall, ToolSpec as LlmToolSpec};
+use agentbug_llm::{ChatMessage, ChatResponse, Llm, ToolCall, ToolSpec};
 use agentbug_policy::Mode;
 use agentbug_store::Store;
-use agentbug_tools::{Tool, ToolRegistry, ToolResult, ToolSpec};
+use agentbug_tools::{Tool, ToolRegistry, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -37,7 +37,7 @@ impl Llm for MockLlm {
         &self,
         _model: &str,
         _messages: &[ChatMessage],
-        _tools: &[LlmToolSpec],
+        _tools: &[ToolSpec],
     ) -> Result<ChatResponse> {
         let mut q = self.responses.lock().unwrap();
         Ok(q.pop_front().unwrap_or(ChatResponse {
@@ -385,7 +385,7 @@ async fn llm_error_fails_session_and_logs_event() {
             &self,
             _model: &str,
             _messages: &[ChatMessage],
-            _tools: &[LlmToolSpec],
+            _tools: &[ToolSpec],
         ) -> Result<ChatResponse> {
             Err(anyhow::anyhow!("simulated llm outage"))
         }
@@ -1685,7 +1685,7 @@ async fn request_stop_aborts_before_tool_spawn() {
             &self,
             _model: &str,
             _messages: &[ChatMessage],
-            _tools: &[LlmToolSpec],
+            _tools: &[ToolSpec],
         ) -> Result<ChatResponse> {
             // The flag is raised after the step-boundary check but before the
             // tool is spawned; the pre-tool check must still stop the run.

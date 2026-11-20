@@ -45,16 +45,20 @@ in `README.md` resolves to a call site in the evidence matrix at
   (`completed | interrupted | failed | waiting_approval | blocked`, plus
   `brief_only` for the read-only ingestion path).
 
-### Modules that are NOT production-wired
+### Core coordination modules — wired in core, not an engagement feature
 
-`agentbug-core` retains `inbox`, `execution`, `event`, `step`, `compaction` and
-`error` modules (re-exported at the crate root). `subagent`, `skill` and `usage`
-were removed during hardening. The retained modules are unit-tested in isolation
-but have **no production call site from `agentbug-engagement`**. They are therefore
-not advertised as agent features: there is no steer queue, no wake coalescing, no
-skill loader and no subagent job execution in the shipping engagement flow. If a
-hardening item wires one of them, add a feature → call site → test row in
-`PRODUCTION_PLAN.md` §2 first.
+`agentbug-core` retains and re-exports `inbox`, `execution`, `event`, `step`,
+`compaction` and `error`. `subagent`, `skill` and `usage` were removed during
+hardening. Unlike those, `inbox`/`execution`/`event` **do have core production
+call sites**: `Runner::drain_inbox` at each step boundary, `Runner::log_event` to
+`EventBus::publish_json`, and `ExecutionCoordinator` for resume/interrupt/
+stop-ack. There is no call site in `agentbug-engagement`; these are not
+multi-agent orchestration. Capabilities that exist only in unit tests and are
+**not** wired: `Inbox::wake`/`take_wake`, `ExecutionCoordinator::wake`/
+`take_wake`/`await_idle`, and `EventBus::subscribe`/`drain`/`replay_since`.
+Therefore there is no durable steer/queue priority inbox and no wake-coalescing
+doorbell in the shipping flow. `step.rs` is additive/unwired. If a workstream
+wires one of these, add a feature, call site and test row in `PRODUCTION_PLAN.md`.
 
 ## Policy modes
 

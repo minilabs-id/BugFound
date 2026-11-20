@@ -186,8 +186,14 @@ environment). The shell allowlist is defense in depth; it is not a substitute
 for OS-level isolation. Context compaction is implemented via `CompactionV2`
 (the conversation is summarized as it approaches the configured model token
 limit); `subagent`, `skill` and `usage` modules were removed during hardening,
-and the retained `inbox`/`execution` modules are core-only with no engagement call
-site. Steer and wake-coalescing are not implemented and not advertised. External
+and the retained `inbox`/`execution`/`event` modules are wired into the core
+`Runner` (`drain_inbox`, `ExecutionCoordinator`, `EventBus::publish_json`) but have
+no `agentbug-engagement` call site; they are not multi-agent features. Steer/queue
+priority delivery and wake-coalescing re-drain are **not** implemented: every
+pending item is drained at each step boundary and `wake`/`take_wake` are exercised
+only by unit tests. Durable guarantees that are implemented are leases, guarded
+transitions, atomic approvals, persistent budgets and the event hash chain.
+External
 recon adapters are available but clustering is still open (see
 `docs/PRODUCTION_PLAN.md`).
 

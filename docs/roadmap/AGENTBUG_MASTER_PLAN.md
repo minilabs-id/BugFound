@@ -49,13 +49,32 @@ Exit evidence: `git grep` for domain vocabulary in `core/src` is clean;
 store table split, scope policy move (recorded in ADR-001). Next: R3 after fresh
 evaluation/research.
 
-### R3 — Core maturity (7–10 days)
-- Typed `LlmErrorKind`, provider usage in response, capability descriptors.
-- Gate/decider unification; sliding-window repeat detection; schema arg repair; terminal tool.
-- Durable inbox control, coalescing doorbell, boot stale settlement, outbox/fence.
-- Unified ToolSpec + JSON Schema validation.
+### R3a — Core maturity, provider & descriptor seams (COMPLETE, 2026-11-20)
+- ✅ Typed `LlmErrorKind` / `LlmError` / `Recovery` in `agentbug-llm/src/error.rs`;
+  status/body mapping and legacy-message compatibility.
+- ✅ Usage carried in `ChatResponseWithUsage` via `chat_full`; the shared
+  `Arc<Mutex<Option<TokenUsage>>>` side channel is gone. Core logs additive
+  `kind=` on `llm.chat_failed` and keeps identical error text/category.
+- ✅ Unified `ToolSpec`: canonical tools-side descriptor re-exported by
+  `agentbug-llm`, deprecated `LlmToolSpec` alias, lossy conversions deleted.
+- ✅ Doc-vs-code drift corrected in README/architecture/PRODUCTION_PLAN/threat-model.
 
-Exit: multi-step task with provider failure + cancel + resume passes integration tests.
+Exit evidence: 222 tests green, fmt/clippy `-D warnings` green.
+
+### R3b — Remaining core maturity (DEFERRED, needs fresh evaluation)
+Not built yet, with reasons recorded:
+1. Capability descriptors + model routing/fallback — designed in R3 research;
+   adapters need local HTTP fixture tests before core calls them.
+2. Sliding-window repeat detection + schema arg repair + terminal tool —
+   require tool-call lifecycle state; better done once with the `tool_calls`
+   table rather than an in-process duplicate.
+3. Durable `session_inbox` + `Scope` doorbell + boot stale settlement — needs a
+   SQLite schema migration and step-boundary semantics; separate review.
+4. JSON Schema argument validation — requires a new dependency and an
+   observe-only rollout (`Off`/`Warn`/`Enforce`) to avoid breaking loose schemas.
+
+Exit (when done): multi-step task with provider failure + cancel + resume passes
+integration tests. Do not start R4 until R3b is completed or explicitly re-scoped.
 
 ### R4 — Multi-agent & memory (10–14 days)
 - Role profiles with tool allowlists; General + ProgramIntel + Recon + Research + Testing + Verification + Report.

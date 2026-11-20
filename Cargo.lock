@@ -216,6 +216,7 @@ dependencies = [
 name = "agentbug-llm"
 version = "0.1.0"
 dependencies = [
+ "agentbug-tools",
  "anyhow",
  "async-trait",
  "futures",

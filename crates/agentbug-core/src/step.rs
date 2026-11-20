@@ -1,7 +1,7 @@
 //! Helpers for building one agent step. These are additive; `Runner` keeps its
 //! own inline implementation so existing behaviour is unchanged.
 
-use agentbug_llm::{ChatMessage, ToolSpec as LlmToolSpec};
+use agentbug_llm::ChatMessage;
 use agentbug_store::Store;
 use agentbug_tools::ToolRegistry;
 use anyhow::Result;
@@ -50,17 +50,9 @@ pub fn reload_history(store: &Store, session_id: &str) -> Result<Vec<ChatMessage
         .collect())
 }
 
-/// Convert a tool registry into the tool specs sent to the LLM.
-pub fn build_tool_specs(registry: &ToolRegistry) -> Vec<LlmToolSpec> {
-    registry
-        .specs()
-        .into_iter()
-        .map(|spec| LlmToolSpec {
-            name: spec.name,
-            description: spec.description,
-            parameters: spec.input_schema,
-        })
-        .collect()
+/// Tool specs are now one canonical type shared by registries and providers.
+pub fn build_tool_specs(registry: &ToolRegistry) -> Vec<agentbug_tools::ToolSpec> {
+    registry.specs()
 }
 
 #[cfg(test)]

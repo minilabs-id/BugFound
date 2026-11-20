@@ -85,11 +85,14 @@ Pass remaining-gap menambah kontrol berikut; detail implementasi ada di
 Kontrol alur engagement (pause/resume/abort) bergantung pada guardrail durability:
 claim/lease dan transisi state ter-guarded (F-04, F-07), budget persisten (F-03),
 dan approval atomik (F-04). abort bersifat terminal dan tidak membuka jalur
-eksekusi baru. Modul `core` seperti inbox dan execution coordinator **tidak**
-diklaim sebagai fitur engagement: tidak ada call site produksinya di
-`agentbug-engagement`. Modul subagent, skill loader dan usage tracker sudah dihapus
-saat hardening. Steer dan wake-coalescing tidak diimplementasikan/diklaim
-(lihat `PRODUCTION_PLAN.md` §2, catatan "Explicitly not advertised").
+eksekusi baru. Modul `core` seperti inbox, execution dan event memiliki call site di
+`agentbug-core::Runner` (`drain_inbox`, `log_event`, `ExecutionCoordinator`), bukan
+di `agentbug-engagement`; bukanlah fitur orkestrasi multi-agent. Modul `subagent`,
+`skill loader` dan `usage tracker` sudah dihapus saat hardening. **Steer/queue
+priority dan doorbell wake-coalescing belum diimplementasikan**: `Delivery::Steer`
+tidak dibedakan oleh `drain_inbox`, dan `wake`/`take_wake` hanya diuji unit. Klaim
+durabilitas yang benar adalah lease + guarded transition, approval atomik
+(`park_with_approval`), budget persisten, dan event hash chain — bukan inbox durabel.
 
 ## Catatan pemetaan
 

@@ -31,8 +31,32 @@ const FUZZ_METHODS: &[&str] = &["GET", "HEAD", "POST"];
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
+    /// JSON Schema for arguments. `parameters` is accepted as a serde alias so
+    /// provider-shaped payloads deserialize into the same canonical descriptor.
+    #[serde(alias = "parameters")]
     pub input_schema: Value,
+    /// Tool-supplied hint. Never used as a security decision; the host assigns
+    /// capabilities at registration.
     pub risk: String, // read|write|destructive|network
+}
+
+impl ToolSpec {
+    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema: parameters,
+            risk: "safe".to_string(),
+        }
+    }
+
+    pub fn parameters(&self) -> &Value {
+        &self.input_schema
+    }
+
+    pub fn into_parameters(self) -> Value {
+        self.input_schema
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

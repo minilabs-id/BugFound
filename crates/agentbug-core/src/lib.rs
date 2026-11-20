@@ -1,5 +1,5 @@
 use agentbug_kernel_traits::{digest_goal_and_context, Domain, KernelDomain};
-use agentbug_llm::{ChatMessage, Llm, ToolSpec as LlmToolSpec};
+use agentbug_llm::{ChatMessage, Llm};
 use agentbug_policy::{ActionRequest, Decision, Mode, PolicyConfig, PolicyEngine};
 use agentbug_store::{redact, Approval, Store};
 use agentbug_tools::ToolRegistry;
@@ -1568,34 +1568,37 @@ impl Runner {
                 }
             }
 
-            let tool_specs: Vec<LlmToolSpec> = self
-                .tools
-                .specs()
-                .into_iter()
-                .map(|t| LlmToolSpec {
-                    name: t.name,
-                    description: t.description,
-                    parameters: t.input_schema,
-                })
-                .collect();
+            let tool_specs = self.tools.specs();
 
-            let (resp, provider_usage) =
-                match self.llm.chat_with_usage(model, &msgs, &tool_specs).await {
-                    Ok(value) => value,
-                    Err(e) => {
-                        // Classify before surfacing the error so callers get a
-                        // stable category (retryable/blocked/fatal/...) while the
-                        // original message is preserved in the durable event.
-                        let classified = error::AgentError::classify(&e.to_string());
-                        self.log_event(
-                            session_id,
-                            "error",
-                            "llm.chat_failed",
-                            &format!("step={step} category={} error={}", classified.category(), e),
-                        );
-                        return Err(anyhow!(classified.to_string()));
-                    }
-                };
+            let full = match self.llm.chat_full(model, &msgs, &tool_specs).await {
+                Ok(value) => value,
+                Err(e) => {
+                    // Typed kind is additive; the legacy message and category
+                    // stay byte-identical for existing events and callers.
+                    let kind = e
+                        .downcast_ref::<agentbug_llm::LlmError>()
+                        .map(|l| l.kind.as_str().to_string())
+                        .unwrap_or_else(|| {
+                            agentbug_llm::LlmErrorKind::from_message(&e.to_string())
+                                .as_str()
+                                .to_string()
+                        });
+                    let classified = error::AgentError::classify(&e.to_string());
+                    self.log_event(
+                        session_id,
+                        "error",
+                        "llm.chat_failed",
+                        &format!(
+                            "step={step} category={} kind={kind} error={}",
+                            classified.category(),
+                            e
+                        ),
+                    );
+                    return Err(anyhow!(classified.to_string()));
+                }
+            };
+            let resp = full.response;
+            let provider_usage = full.usage;
 
             let (recorded_prompt, recorded_completion) = match provider_usage {
                 Some(usage) => (usage.prompt_tokens, usage.completion_tokens),

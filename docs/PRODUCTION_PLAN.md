@@ -70,13 +70,14 @@ module; they are not a count of passing tests.
 | 20 | Evaluation harness (no results) | `eval/score.py`, `eval/export_trace.py`, `eval/run_benchmark.ps1`, `eval/e2e_test.ps1`, `eval/golden.example.json` | `python -m py_compile eval/score.py eval/export_trace.py`; PowerShell syntax check; `e2e_test.ps1` asserts report sections + `score.py --strict` (wiring only) |
 
 **Explicitly not advertised** (H-03 acceptance): `SubagentJobs`, `SkillLoader` and
-`UsageTracker` were removed from `agentbug-core` during hardening. The remaining
-core modules (`inbox`, `execution`, `event`, `step`, `compaction`, `error`) are
-re-exported but have no production call site from `agentbug-engagement`; there is
-no steer queue, wake coalescing, skill loader or subagent job in the shipping flow.
-They are therefore not presented as features here or in `README.md` /
-`docs/architecture.md`. If a workstream wires one, add a matrix row with the new
-call site and test before advertising it.
+`UsageTracker` were removed from `agentbug-core` during hardening. The core
+coordination modules (`inbox`, `execution`, `event`, `step`, `compaction`, `error`)
+have **core-only** call sites (`Runner::drain_inbox`, `log_event` to `EventBus`,
+and `ExecutionCoordinator` resume/interrupt/stop-ack), not engagement call sites.
+There is no durable steer/queue priority inbox and no re-draining wake doorbell:
+`Delivery::Steer` is not honoured by `drain_inbox`, and `wake`/`take_wake` are
+unit-test-only. Add a matrix row with the new call site and test before advertising
+any of these as features.
 
 ---
 

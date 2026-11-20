@@ -3,8 +3,11 @@ use async_trait::async_trait;
 use reqwest::header::RETRY_AFTER;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub mod error;
+
+pub use error::{LlmError, LlmErrorKind, Recovery};
 
 /// Token counts reported by the provider (when the response includes `usage`).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -66,12 +69,13 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolSpec {
-    pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value,
-}
+/// Canonical tool descriptor, re-exported from `agentbug-tools` so provider
+/// adapters and tool registries share one lossless type.
+pub use agentbug_tools::ToolSpec;
+
+/// Compatibility alias for the old provider-side name.
+#[deprecated(note = "use agentbug_llm::ToolSpec / agentbug_tools::ToolSpec")]
+pub type LlmToolSpec = ToolSpec;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -87,6 +91,23 @@ pub struct ChatResponse {
     pub model: String,
 }
 
+/// Response plus provider-reported usage. Usage is carried in the response
+/// instead of a shared side channel, so concurrent calls cannot steal each
+/// other's token counts.
+#[derive(Debug, Clone)]
+pub struct ChatResponseWithUsage {
+    pub response: ChatResponse,
+    pub usage: Option<TokenUsage>,
+}
+
+impl std::ops::Deref for ChatResponseWithUsage {
+    type Target = ChatResponse;
+
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
+
 #[async_trait]
 pub trait Llm: Send + Sync {
     async fn resolve_model(&self) -> Result<String>;
@@ -97,17 +118,29 @@ pub trait Llm: Send + Sync {
         tools: &[ToolSpec],
     ) -> Result<ChatResponse>;
 
-    /// Like `chat`, but also returns provider-reported token usage when the
-    /// response includes a `usage` object. Mock implementations fall back to
-    /// `None` and callers use their token estimator instead.
+    /// Preferred entry point: response and usage travel together. The default
+    /// implementation keeps every existing `Llm` implementation source-compatible.
+    async fn chat_full(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> Result<ChatResponseWithUsage> {
+        Ok(ChatResponseWithUsage {
+            response: self.chat(model, messages, tools).await?,
+            usage: None,
+        })
+    }
+
+    /// Compatibility shim. Prefer `chat_full` in new code.
     async fn chat_with_usage(
         &self,
         model: &str,
         messages: &[ChatMessage],
         tools: &[ToolSpec],
     ) -> Result<(ChatResponse, Option<TokenUsage>)> {
-        let response = self.chat(model, messages, tools).await?;
-        Ok((response, None))
+        let full = self.chat_full(model, messages, tools).await?;
+        Ok((full.response, full.usage))
     }
 }
 
@@ -115,7 +148,6 @@ pub trait Llm: Send + Sync {
 pub struct LlmClient {
     cfg: LlmConfig,
     http: Client,
-    last_usage: Arc<Mutex<Option<TokenUsage>>>,
 }
 
 impl LlmClient {
@@ -131,11 +163,7 @@ impl LlmClient {
         let http = Client::builder()
             .timeout(Duration::from_millis(cfg.timeout_ms.max(1000)))
             .build()?;
-        Ok(Self {
-            cfg,
-            http,
-            last_usage: Arc::new(Mutex::new(None)),
-        })
+        Ok(Self { cfg, http })
     }
 
     fn api_base(&self) -> String {
@@ -239,17 +267,16 @@ impl Llm for LlmClient {
             .ok_or_else(|| anyhow!("no model discovered; set [llm].default_model"))
     }
 
-    async fn chat(
+    async fn chat_full(
         &self,
         model: &str,
         messages: &[ChatMessage],
         tools: &[ToolSpec],
-    ) -> Result<ChatResponse> {
+    ) -> Result<ChatResponseWithUsage> {
         let url = format!("{}/chat/completions", self.api_base());
         let mut msgs: Vec<serde_json::Value> = Vec::new();
         for m in messages {
             let mut obj = serde_json::json!({"role": m.role});
-            // For tool messages, content must be present (can be empty string)
             if !m.content.is_empty() || m.role == "tool" {
                 obj["content"] = serde_json::json!(m.content);
             } else {
@@ -289,7 +316,7 @@ impl Llm for LlmClient {
                 .map(|t| {
                     serde_json::json!({
                         "type": "function",
-                        "function": {"name": t.name, "description": t.description, "parameters": t.parameters}
+                        "function": {"name": t.name, "description": t.description, "parameters": t.input_schema}
                     })
                 })
                 .collect();
@@ -319,39 +346,72 @@ impl Llm for LlmClient {
                                 .and_then(|value| value.as_u64())
                                 .unwrap_or(0),
                         });
-                        *self.last_usage.lock().unwrap() = usage;
-                        return parse_chat_response(&v, model);
+                        let response = parse_chat_response(&v, model)?;
+                        return Ok(ChatResponseWithUsage { response, usage });
                     }
-                    let status = r.status();
+                    let status = r.status().as_u16();
                     let retry_after = r
                         .headers()
                         .get(RETRY_AFTER)
                         .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
+                        .and_then(parse_retry_after)
+                        .map(|d| d.min(Duration::from_secs(10)));
                     let text = r.text().await.unwrap_or_default();
-                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-                    {
+                    let kind = LlmErrorKind::from_status(status, &text);
+                    if kind.retryable() {
                         if attempt == 2 {
-                            last_err = Some(anyhow!("chat failed {status}: {text}"));
-                            break;
+                            return Err(LlmError {
+                                kind,
+                                message: format!("chat failed {status}: {text}"),
+                                status: Some(status),
+                                retry_after,
+                                model: Some(model.to_string()),
+                            }
+                            .into());
                         }
                         let fallback = Duration::from_millis(500 * (1u64 << attempt));
-                        let delay = retry_after
-                            .as_deref()
-                            .and_then(parse_retry_after)
-                            .unwrap_or(fallback)
-                            .min(Duration::from_secs(10));
-                        last_err = Some(anyhow!(
-                            "chat failed {status}: {text} (retrying in {}s)",
-                            delay.as_secs()
-                        ));
+                        let delay = retry_after.unwrap_or(fallback);
+                        last_err = Some(
+                            LlmError {
+                                kind,
+                                message: format!(
+                                    "chat failed {status}: {text} (retrying in {}s)",
+                                    delay.as_secs()
+                                ),
+                                status: Some(status),
+                                retry_after,
+                                model: Some(model.to_string()),
+                            }
+                            .into(),
+                        );
                         tokio::time::sleep(delay).await;
                         continue;
                     }
-                    return Err(anyhow!("chat failed {status}: {text}"));
+                    return Err(LlmError {
+                        kind,
+                        message: format!("chat failed {status}: {text}"),
+                        status: Some(status),
+                        retry_after,
+                        model: Some(model.to_string()),
+                    }
+                    .into());
                 }
                 Err(e) => {
-                    last_err = Some(anyhow!("POST {url} failed: {e}"));
+                    let kind = if e.is_timeout() {
+                        LlmErrorKind::Timeout
+                    } else {
+                        LlmErrorKind::Transport
+                    };
+                    last_err = Some(
+                        LlmError {
+                            kind,
+                            message: format!("POST {url} failed: {e}"),
+                            status: e.status().map(|s| s.as_u16()),
+                            retry_after: None,
+                            model: Some(model.to_string()),
+                        }
+                        .into(),
+                    );
                     if attempt < 2 {
                         tokio::time::sleep(Duration::from_millis(500 * (1u64 << attempt))).await;
                         continue;
@@ -363,16 +423,13 @@ impl Llm for LlmClient {
         Err(last_err.unwrap_or_else(|| anyhow!("chat failed")))
     }
 
-    async fn chat_with_usage(
+    async fn chat(
         &self,
         model: &str,
         messages: &[ChatMessage],
         tools: &[ToolSpec],
-    ) -> Result<(ChatResponse, Option<TokenUsage>)> {
-        *self.last_usage.lock().unwrap() = None;
-        let response = self.chat(model, messages, tools).await?;
-        let usage = self.last_usage.lock().unwrap().take();
-        Ok((response, usage))
+    ) -> Result<ChatResponse> {
+        Ok(self.chat_full(model, messages, tools).await?.response)
     }
 }
 
@@ -613,5 +670,37 @@ mod tests {
         assert!(validate_base_url("ftp://example.com").is_err());
         assert!(validate_base_url("not a url").is_err());
         assert!(validate_base_url("http://").is_err());
+    }
+
+    struct ChatOnly;
+
+    #[async_trait]
+    impl Llm for ChatOnly {
+        async fn resolve_model(&self) -> Result<String> {
+            Ok("m".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _model: &str,
+            _messages: &[ChatMessage],
+            _tools: &[ToolSpec],
+        ) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                content: Some("hi".to_string()),
+                tool_calls: Vec::new(),
+                model: "m".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_full_default_preserves_response_and_none_usage() {
+        let full = ChatOnly.chat_full("m", &[], &[]).await.unwrap();
+        assert_eq!(full.response.content.as_deref(), Some("hi"));
+        assert!(full.usage.is_none());
+        let (response, usage) = ChatOnly.chat_with_usage("m", &[], &[]).await.unwrap();
+        assert_eq!(response.content.as_deref(), Some("hi"));
+        assert!(usage.is_none());
     }
 }

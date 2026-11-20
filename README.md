@@ -164,6 +164,14 @@ python eval/export_trace.py eval/results/<id>/engagement.db eval/results/<id>/re
 python eval/score.py --dir eval/results/<id> --manifest eval/results/<id>/manifest.json --replay eval/results/<id>/replay.jsonl
 ```
 
+The verifier is a **reflection-class oracle**: `HttpRequestTool` injects an
+unguessable `X-AgentBug-Canary` header into the real outbound request, and a
+finding is promoted only when the target reflects that token in the stored
+tool-captured response (with a 2xx status). The token is scrubbed from the
+model-visible output; LLM-supplied request/response fields are never trusted.
+Blind, stateful and timing classes are not covered by this oracle yet
+(see `docs/adr/ADR-008-verification-oracle.md`).
+
 See `eval/README.md` and `eval/results/README.md` for inputs, metrics and safe
 usage. Deferred scope is listed in `docs/REMAINING_GAPS.md`.
 

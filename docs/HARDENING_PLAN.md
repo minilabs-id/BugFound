@@ -91,12 +91,14 @@ Kriteria penerimaan:
 Aksi:
 - Saat finding dibuat, simpan request/response **mentah** + nonce/canary ke `evidence`.
 - `validate_poc` wajib punya `finding_id`; verifier replay bytes tersimpan, bukan argumen LLM.
-- Oracle: status + marker dari ground-truth manifest / canary server, bukan `expected_status`/`marker` dari model.
+- Oracle: canary unguessable disuntikkan sebagai header `X-AgentBug-Canary` ke request nyata oleh `HttpRequestTool`, lalu verifier mensyaratkan token itu direfleksikan oleh target di `response_bytes` tool (status 2xx). Bukan `expected_status`/`marker` dari model. Token dibersihkan dari output yang terlihat model. Lihat `docs/adr/ADR-008-verification-oracle.md`.
 - Status finding: `candidate` → `verified`; hanya `verified` masuk laporan.
 
 Kriteria penerimaan:
 - Finding buatan dengan marker `<html` tidak lolos verifikasi.
-- Tes: `self_graded_finding_is_rejected`, `replay_uses_stored_bytes`.
+- Tes: `self_graded_finding_is_rejected`, `replay_uses_stored_bytes`,
+  `real_http_capture_promotes_finding` (server lokal nyata merefleksikan canary),
+  `non_reflecting_capture_is_rejected` (2xx tanpa refleksi tetap `candidate`).
 
 ### H-05 — A5: SHA-256 evidence nyata
 **File:** `crates/agentbug-store/src/lib.rs`, `crates/agentbug-engagement/src/lib.rs`.

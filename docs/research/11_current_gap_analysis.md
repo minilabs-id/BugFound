@@ -88,6 +88,15 @@ not a lack of small fixes.
 
 ## 2. CRITICAL: the verification oracle is unsatisfiable in production
 
+> **Resolved in R1.1 (2026-11-20).** `HttpRequestTool` now mints the canary
+> before request construction, injects it as `X-AgentBug-Canary` into the real
+> outbound request and its authoritative representation, scrubs it from the
+> model-visible output, and threads the single token through every capture.
+> New tests `real_http_capture_promotes_finding` and
+> `non_reflecting_capture_is_rejected` gate the fix against a real local HTTP
+> server. See `docs/adr/ADR-008-verification-oracle.md`. The analysis below is
+> retained as the historical finding that motivated R1.
+
 Severity: Critical. This is the single most important finding in this report.
 Evidence chain, all verified in code:
 

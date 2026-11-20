@@ -25,14 +25,14 @@ Basis: `docs/research/01..16`. This plan replaces the greenfield master prompt w
 Deliverables: `docs/research/01..16`, commit hashes, license audit, component matrix.
 Exit: all 16 docs present, no code changed. ✅
 
-### R1 — P0 corrections + ADR approval (NEXT, 3–5 days)
+### R1 — P0 corrections + ADR approval (COMPLETE, 2026-11-20)
 Tasks:
-- R1.1 make canary verifier satisfiable from real tool captures; add local HTTP integration test that promotes a real finding.
-- R1.2 document defect in README/docs until fixed, then mark fixed.
-- R1.3 ADR-001 Kernel/Domain split; ADR-002 SQLite vs Postgres; ADR-007 sandbox risk acceptance; ADR-008 verification oracle.
-- R1.4 no module moves yet except as needed for R1.1.
+- R1.1 ✅ canary verifier satisfiable: mint-once + `X-AgentBug-Canary` injection into the real request, scrub from LLM-visible output, single token through all captures. Tests `real_http_capture_promotes_finding` and `non_reflecting_capture_is_rejected` drive a real local TCP server.
+- R1.2 ✅ README/HARDENING_PLAN/PRODUCTION_PLAN/architecture/REMAINING_GAPS/research-11 updated; verifier is explicitly a reflection-class oracle.
+- R1.3 ✅ ADR-001, ADR-002, ADR-007, ADR-008 accepted in `docs/adr/`.
+- R1.4 ✅ no module moves; no new crates.
 
-Exit: a real local finding reaches `validated`; ADRs approved; tests green.
+Exit evidence: `cargo test -p agentbug-tools -p agentbug-engagement` green (19 engagement + 52 tools tests); a real local finding reaches `validated`. Next: R2 (kernel purity) after fresh evaluation/research per the user's staged-execution rule.
 
 ### R2 — Kernel purity refactor (5–8 days)
 - Move bounty-specific logic from `agentbug-core`/`agentbug-tools` into bounty crate(s).

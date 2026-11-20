@@ -27,7 +27,7 @@ scope; each must still be verified by the gate in `PRODUCTION_PLAN.md` §4.
 
 | ID | Area | What changed |
 | --- | --- | --- |
-| B1 | Store / tools / core | Authoritative tool capture: `attach_capture` / `get_capture` persist raw request and response bytes plus canary; the verifier reads stored bytes instead of LLM-supplied fields. |
+| B1 | Store / tools / core | Authoritative tool capture: `attach_capture` / `get_capture` persist raw request and response bytes plus canary; the verifier reads stored bytes instead of LLM-supplied fields. R1.1 fixed satisfiability: the canary is injected into the real request and reflected by the target (ADR-008). |
 | B2 | Core | Stop flags are physically cleared with `clear_session_flag` on resume, so pause/resume cannot re-abort a session. |
 | B3 | Store / core | `park_with_approval` makes approval + pending calls + parking one transaction; `resolve_approval` checks expiry. |
 | B4 | Tools | `ToolOptions.allowed_methods` is implemented and enforced by `HttpRequestTool` (WS-TOOLS). |

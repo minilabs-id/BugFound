@@ -82,7 +82,9 @@ hardening item wires one of them, add a feature → call site → test row in
 - **Planner** (`wstg_playbooks`, `prioritize_targets`): nine WSTG playbooks become
   durable tasks and hypotheses; coverage is recorded per target (`record_coverage`).
 - **Verifier & report**: the deterministic verifier replays tool-captured
-  request/response bytes plus a canary (`attach_capture` / `get_capture`);
+  request/response bytes, requiring reflection of the canary that
+  `HttpRequestTool` injected into the real outbound request
+  (`attach_capture` / `get_capture`; ADR-008);
   `validate_poc` is a helper tool, **not** an authoritative acceptance gate, and
   is filtered when the ROE forbids state changes. Findings carry evidence bytes
   and SHA-256 hashes; the canonical Markdown renderer emits Executive Summary,

@@ -9,8 +9,9 @@
 //! Hardening notes (H-01/H-02/H-04/H-06/H-10/H-11): the operator-supplied
 //! [`EngagementOptions`] control mode, budgets and risk opt-ins; the full brief
 //! text is parsed into a fail-closed [`RoePolicy`]; findings are verified by
-//! replaying stored evidence bytes with a deterministic canary oracle; and
-//! control functions take an explicit database path via the `*_at` variants.
+//! replaying stored evidence bytes with a deterministic canary reflection oracle
+//! (ADR-008); and control functions take an explicit database path via the
+//! `*_at` variants.
 
 use agentbug_core::{build_policy_config, AgentConfig, Runner};
 use agentbug_llm::{ChatMessage, ChatResponse, Llm, LlmClient, LlmConfig};
@@ -2512,6 +2513,7 @@ fn truncate(input: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentbug_tools::Tool;
 
     fn temp_db(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -3104,5 +3106,139 @@ No DoS testing. Do not modify data. No disclosure.
         assert!(keys.contains("boursobank.com"));
         assert!(!keys.contains("attacker.example"));
         assert!(!keys.contains("*.boursobank.com:8443"));
+    }
+
+    /// Regression gate for the P0 verifier defect: a real local HTTP capture
+    /// must be able to promote a finding through the production tool->core->
+    /// verifier path, with no hand-spliced ToolCapture.
+    #[test]
+    fn real_http_capture_promotes_finding() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let canary = request
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("x-agentbug-canary:")
+                        .map(|value| value.trim().to_string())
+                })
+                .unwrap_or_default();
+            let body = format!("<html>reflected {canary}</html>");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let options = agentbug_tools::ToolOptions {
+                trusted_local_targets: vec!["127.0.0.1".into()],
+                ..Default::default()
+            };
+            let tool = agentbug_tools::HttpRequestTool::with_options(options);
+            tool.run(serde_json::json!({
+                "url": format!("http://{addr}/reflect"),
+                "method": "GET"
+            }))
+            .await
+            .unwrap()
+        });
+        server.join().unwrap();
+
+        assert!(result.ok);
+        let (request, response, canary) =
+            agentbug_tools::capture_from_structured(result.structured.as_ref().unwrap())
+                .expect("tool result must contain a capture");
+        assert!(
+            response.contains(&canary),
+            "real response must reflect canary"
+        );
+        assert!(request.contains(&format!("X-AgentBug-Canary: {canary}")));
+        assert!(
+            !result.output.contains(&canary),
+            "canary must stay LLM-invisible"
+        );
+
+        let db = temp_db("real-capture");
+        let store = Store::open(&db).unwrap();
+        let session = "real-capture-session";
+        let args = serde_json::json!({
+            "title": "Reflected canary",
+            "severity": "low",
+            "description": "reflection proof"
+        });
+        agentbug_core::persist_bounty_tool_result(&store, session, "save_finding", &args, &result);
+        let findings = store.list_findings(session).unwrap();
+        assert_eq!(findings.len(), 1);
+        capture_evidence(&store, &findings[0]).unwrap();
+
+        let mut trace = TraceRun::new(session);
+        let promoted = verify_findings(&store, session, &RoePolicy::default(), &mut trace).unwrap();
+        assert_eq!(promoted, 1, "real capture must satisfy the verifier");
+        assert_eq!(store.verified_findings(session).unwrap().len(), 1);
+        let capture = store.get_capture(&findings[0].id).unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&capture.response_bytes).contains(&canary));
+    }
+
+    /// A real capture from a non-reflecting server must NOT promote a finding.
+    #[test]
+    fn non_reflecting_capture_is_rejected() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf).unwrap();
+            let body = "<html>no reflection here</html>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let options = agentbug_tools::ToolOptions {
+                trusted_local_targets: vec!["127.0.0.1".into()],
+                ..Default::default()
+            };
+            agentbug_tools::HttpRequestTool::with_options(options)
+                .run(serde_json::json!({"url": format!("http://{addr}/plain"), "method":"GET"}))
+                .await
+                .unwrap()
+        });
+        server.join().unwrap();
+
+        let db = temp_db("non-reflect");
+        let store = Store::open(&db).unwrap();
+        let session = "non-reflect-session";
+        let args = serde_json::json!({"title":"No reflection","severity":"low","description":"negative control"});
+        agentbug_core::persist_bounty_tool_result(&store, session, "save_finding", &args, &result);
+        let finding = &store.list_findings(session).unwrap()[0];
+        capture_evidence(&store, finding).unwrap();
+        let mut trace = TraceRun::new(session);
+        let promoted = verify_findings(&store, session, &RoePolicy::default(), &mut trace).unwrap();
+        assert_eq!(promoted, 0, "2xx alone must not validate a finding");
+        assert!(store.verified_findings(session).unwrap().is_empty());
     }
 }

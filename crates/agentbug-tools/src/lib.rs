@@ -950,8 +950,7 @@ fn canary_for(request: &str) -> String {
     format!("agentbug-canary-{}", hex_encode(&Sha256::digest(&input)))
 }
 
-fn build_capture(request: String, response: String) -> HttpCapture {
-    let canary = canary_for(&request);
+fn build_capture(request: String, response: String, canary: String) -> HttpCapture {
     HttpCapture {
         request,
         response,
@@ -974,7 +973,7 @@ impl Tool for HttpRequestTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "http_request".into(),
-            description: "Perform an HTTP request to an in-scope target for reconnaissance/validation. Returns status, selected headers, a truncated body, and a byte-authoritative capture (request/response/canary). Localhost/.local/metadata targets are blocked; engagement scope and allowed_methods are enforced in code. A configured proxy is a trusted egress boundary where DNS pinning does not apply, so scope and host validation still run before any request.".into(),
+            description: "Perform an HTTP request to an in-scope target for reconnaissance/validation. Returns status, selected headers, a truncated body, and a byte-authoritative capture (request/response/canary). An unguessable X-AgentBug-Canary header is injected into the real request and scrubbed from the model-visible output; the verifier requires the target to reflect it. Localhost/.local/metadata targets are blocked; engagement scope and allowed_methods are enforced in code. A configured proxy is a trusted egress boundary where DNS pinning does not apply, so scope and host validation still run before any request.".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -1079,19 +1078,31 @@ impl Tool for HttpRequestTool {
         }
         // Build the authoritative request bytes before the send so both the
         // success and error paths can pin the same evidence.
-        let request_repr = build_request_repr(
+        let mut request_repr = build_request_repr(
             &method,
             &parsed,
             &self.options,
             input.get("headers").and_then(|v| v.as_object()),
             input.get("body").and_then(|v| v.as_str()),
         );
+        // Mint once and actually transmit the canary. The verifier requires the
+        // target to reflect it, so a token that is only stored as evidence can
+        // never be satisfied by a real response. Keep it out of the LLM-visible
+        // output; it lives only in the outbound request and the capture.
+        let canary = canary_for(&request_repr);
+        request_repr = request_repr.replacen(
+            "\r\n\r\n",
+            &format!("\r\nX-AgentBug-Canary: {canary}\r\n\r\n"),
+            1,
+        );
+        req = req.header("X-AgentBug-Canary", &canary);
         obey_rate_limit(&self.options).await;
         let mut resp = match timeout(Duration::from_millis(timeout_ms), req.send()).await {
             Ok(Ok(resp)) => resp,
             Ok(Err(err)) => {
                 let message = redact(&err.to_string());
-                let capture = build_capture(request_repr, format!("(no response) {message}"));
+                let capture =
+                    build_capture(request_repr, format!("(no response) {message}"), canary);
                 let mut structured = json!({"ok": false, "error": message});
                 structured["capture"] = capture.as_value();
                 return Ok(ToolResult {
@@ -1101,7 +1112,8 @@ impl Tool for HttpRequestTool {
                 });
             }
             Err(_) => {
-                let capture = build_capture(request_repr, "(no response) http timeout".into());
+                let capture =
+                    build_capture(request_repr, "(no response) http timeout".into(), canary);
                 let mut structured = json!({"ok": false, "error": "http timeout"});
                 structured["capture"] = capture.as_value();
                 return Ok(ToolResult {
@@ -1130,6 +1142,7 @@ impl Tool for HttpRequestTool {
                     let capture = build_capture(
                         request_repr,
                         build_response_repr(status, &headers, &format!("(read error) {message}")),
+                        canary,
                     );
                     let mut structured = json!({"ok": false, "status": status, "error": message});
                     structured["capture"] = capture.as_value();
@@ -1143,20 +1156,32 @@ impl Tool for HttpRequestTool {
         let slice = &bytes[..bytes.len().min(MAX_HTTP_BODY_BYTES)];
         let body_text = redact(&String::from_utf8_lossy(slice));
         let ok = (200..400).contains(&status);
-        // The plaintext output intentionally excludes `capture` so the canary
-        // is only carried in structured (where core can store the real bytes).
+        // A reflecting target echoes the injected canary into headers/body.
+        // Keep the real bytes in `capture` for the verifier, but scrub the
+        // token from the LLM-visible output so the model never learns it.
+        let scrub = |value: &str| value.replace(&canary, "<redacted-canary>");
+        let out_headers: serde_json::Map<String, Value> = headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    Value::String(scrub(value.as_str().unwrap_or(""))),
+                )
+            })
+            .collect();
         let out = json!({
             "ok": ok,
             "url": parsed.to_string(),
             "status": status,
-            "headers": headers,
-            "body": body_text,
+            "headers": out_headers,
+            "body": scrub(&body_text),
             "body_truncated": truncated,
             "body_bytes": bytes.len()
         });
         let capture = build_capture(
             request_repr,
             build_response_repr(status, &headers, &body_text),
+            canary,
         );
         let mut structured = out.clone();
         structured["capture"] = capture.as_value();

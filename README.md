@@ -188,10 +188,11 @@ for OS-level isolation. Context compaction is implemented via `CompactionV2`
 limit); `subagent`, `skill` and `usage` modules were removed during hardening,
 and the retained `inbox`/`execution`/`event` modules are wired into the core
 `Runner` (`drain_inbox`, `ExecutionCoordinator`, `EventBus::publish_json`) but have
-no `agentbug-engagement` call site; they are not multi-agent features. Steer/queue
-priority delivery and wake-coalescing re-drain are **not** implemented: every
-pending item is drained at each step boundary and `wake`/`take_wake` are exercised
-only by unit tests. Durable guarantees that are implemented are leases, guarded
+no `agentbug-engagement` call site; they are not multi-agent features. Durable
+inbox items are drained with control > steer > queue priority, and a coalesced,
+scope-aware doorbell (`Runner::enqueue_prompt`) re-drains at the same step
+boundary; all pending items still drain together. Durable guarantees that are
+implemented are leases, guarded
 transitions, atomic approvals, persistent budgets and the event hash chain.
 External
 recon adapters are available but clustering is still open (see

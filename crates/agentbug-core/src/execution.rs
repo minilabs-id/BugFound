@@ -23,11 +23,35 @@ impl ExecutionState {
     }
 }
 
+/// Scope of a coalesced wake. `Input` subsumes `Steer` so a queued prompt
+/// arriving after a steer cannot be lost by narrowing the pending wake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeScope {
+    Steer,
+    Input,
+}
+
+impl WakeScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Steer => "steer",
+            Self::Input => "input",
+        }
+    }
+
+    fn widen(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Input, _) | (_, Self::Input) => Self::Input,
+            _ => Self::Steer,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RuntimeState {
     state: ExecutionState,
     cancel_requested: bool,
-    wake_pending: bool,
+    wake_pending: Option<WakeScope>,
     generation: u64,
 }
 
@@ -36,7 +60,7 @@ impl Default for RuntimeState {
         Self {
             state: ExecutionState::Idle,
             cancel_requested: false,
-            wake_pending: false,
+            wake_pending: None,
             generation: 0,
         }
     }
@@ -115,20 +139,32 @@ impl ExecutionCoordinator {
     /// Coalescing wake signal. Returns `true` only when a wake was not already
     /// pending for this session.
     pub fn wake(&self, session_id: &str) -> bool {
+        self.wake_scoped(session_id, WakeScope::Steer)
+    }
+
+    /// Coalescing, scope-aware wake. Returns `true` only when no wake was
+    /// pending; a later broader wake widens the pending scope.
+    pub fn wake_scoped(&self, session_id: &str, scope: WakeScope) -> bool {
         let mut inner = self.inner.lock().unwrap();
         let state = inner.entry(session_id.to_string()).or_default();
-        let fresh = !state.wake_pending;
-        state.wake_pending = true;
+        let fresh = state.wake_pending.is_none();
+        state.wake_pending = Some(match state.wake_pending {
+            Some(current) => current.widen(scope),
+            None => scope,
+        });
         self.notify.notify_waiters();
         fresh
     }
 
     pub fn take_wake(&self, session_id: &str) -> bool {
+        self.take_wake_scoped(session_id).is_some()
+    }
+
+    pub fn take_wake_scoped(&self, session_id: &str) -> Option<WakeScope> {
         let mut inner = self.inner.lock().unwrap();
         inner
             .get_mut(session_id)
-            .map(|state| std::mem::take(&mut state.wake_pending))
-            .unwrap_or(false)
+            .and_then(|state| state.wake_pending.take())
     }
 
     /// Request cancellation. The session becomes inactive immediately so
@@ -272,4 +308,22 @@ mod tests {
         coordinator.await_idle("never-started").await;
         assert_eq!(coordinator.state("never-started"), ExecutionState::Idle);
     }
+}
+
+#[test]
+fn scoped_wake_coalesces_and_widens() {
+    let coordinator = ExecutionCoordinator::new();
+    assert!(coordinator.wake_scoped("s-scope", WakeScope::Steer));
+    assert!(!coordinator.wake_scoped("s-scope", WakeScope::Steer));
+    assert_eq!(
+        coordinator.take_wake_scoped("s-scope"),
+        Some(WakeScope::Steer)
+    );
+    assert!(coordinator.wake_scoped("s-scope", WakeScope::Steer));
+    assert!(!coordinator.wake_scoped("s-scope", WakeScope::Input));
+    assert_eq!(
+        coordinator.take_wake_scoped("s-scope"),
+        Some(WakeScope::Input)
+    );
+    assert!(coordinator.take_wake_scoped("s-scope").is_none());
 }

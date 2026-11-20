@@ -88,10 +88,11 @@ dan approval atomik (F-04). abort bersifat terminal dan tidak membuka jalur
 eksekusi baru. Modul `core` seperti inbox, execution dan event memiliki call site di
 `agentbug-core::Runner` (`drain_inbox`, `log_event`, `ExecutionCoordinator`), bukan
 di `agentbug-engagement`; bukanlah fitur orkestrasi multi-agent. Modul `subagent`,
-`skill loader` dan `usage tracker` sudah dihapus saat hardening. **Steer/queue
-priority dan doorbell wake-coalescing belum diimplementasikan**: `Delivery::Steer`
-tidak dibedakan oleh `drain_inbox`, dan `wake`/`take_wake` hanya diuji unit. Klaim
-durabilitas yang benar adalah lease + guarded transition, approval atomik
+`skill loader` dan `usage tracker` sudah dihapus saat hardening. **Prioritas inbox dan doorbell wake-coalescing sudah terpasang**:
+`promote_inbox` mengurutkan control > steer > queue, dan `wake_scoped`/
+`take_wake_scoped` dikonsumsi Runner lewat `enqueue_prompt`. Semua item tetap
+didrain bersama di tiap step boundary. Klaim durabilitas yang benar adalah
+lease + guarded transition, approval atomik
 (`park_with_approval`), budget persisten, dan event hash chain — bukan inbox durabel.
 
 ## Catatan pemetaan

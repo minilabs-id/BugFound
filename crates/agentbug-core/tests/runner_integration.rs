@@ -2253,3 +2253,29 @@ async fn schema_warn_records_event_and_still_runs() {
     let events = store.list_events(session, 50).unwrap();
     assert!(events.iter().any(|e| e.kind == "tool.schema_invalid"));
 }
+
+#[tokio::test]
+async fn enqueue_prompt_admits_durable_item_and_rings_doorbell() {
+    let store = Store::open(":memory:").unwrap();
+    let llm = Arc::new(MockLlm::new("m", vec![]));
+    let runner = Runner::new(
+        store.clone(),
+        llm,
+        ToolRegistry::new(),
+        build_policy(Mode::Ask),
+        AgentConfig::default(),
+    );
+    let session = store.create_session("goal").unwrap();
+    let id = runner
+        .enqueue_prompt(&session.id, "follow-up", true)
+        .unwrap();
+    let items = store.list_pending_inbox(&session.id).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, id);
+    assert_eq!(items[0].kind, "steer");
+    assert!(items[0].payload_json.contains("follow-up"));
+    assert_eq!(
+        agentbug_core::execution::ExecutionCoordinator::global().take_wake_scoped(&session.id),
+        Some(agentbug_core::execution::WakeScope::Steer)
+    );
+}

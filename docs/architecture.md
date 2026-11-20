@@ -54,11 +54,11 @@ call sites**: `Runner::drain_inbox` at each step boundary, `Runner::log_event` t
 `EventBus::publish_json`, and `ExecutionCoordinator` for resume/interrupt/
 stop-ack. There is no call site in `agentbug-engagement`; these are not
 multi-agent orchestration. Capabilities that exist only in unit tests and are
-**not** wired: `Inbox::wake`/`take_wake`, `ExecutionCoordinator::wake`/
-`take_wake`/`await_idle`, and `EventBus::subscribe`/`drain`/`replay_since`.
-Therefore there is no durable steer/queue priority inbox and no wake-coalescing
-doorbell in the shipping flow. `step.rs` is additive/unwired. If a workstream
-wires one of these, add a feature, call site and test row in `PRODUCTION_PLAN.md`.
+wired: `ExecutionCoordinator::wake_scoped`/`take_wake_scoped` (consumed by the
+Runner at each step boundary via `Runner::enqueue_prompt`) and durable inbox
+priority promotion. Still unwired: `EventBus::subscribe`/`drain`/`replay_since`
+and `await_idle`. `step.rs` is additive/unwired. If a workstream wires one of
+these, add a feature, call site and test row in `PRODUCTION_PLAN.md`.
 
 ## Policy modes
 

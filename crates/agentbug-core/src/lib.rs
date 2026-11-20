@@ -519,6 +519,28 @@ impl Runner {
         );
     }
 
+    /// Admit a durable prompt and ring the coalesced doorbell so a wake that
+    /// lands during a drain is observed at the same step boundary.
+    pub fn enqueue_prompt(&self, session_id: &str, text: &str, steer: bool) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let kind = if steer { "steer" } else { "user" };
+        let delivery = if steer { "steer" } else { "queue" };
+        self.store.enqueue_inbox(
+            &id,
+            session_id,
+            kind,
+            delivery,
+            &serde_json::json!({"text": text}).to_string(),
+        )?;
+        let scope = if steer {
+            execution::WakeScope::Steer
+        } else {
+            execution::WakeScope::Input
+        };
+        execution::ExecutionCoordinator::global().wake_scoped(session_id, scope);
+        Ok(id)
+    }
+
     /// Consume inbox items at a step boundary. Durable rows are authoritative;
     /// the in-process inbox stays as a compatibility source for existing callers.
     /// Control items carrying `cancel` request interruption; user/steer items
@@ -1815,10 +1837,28 @@ impl Runner {
             }
             // A control item delivered through the inbox is just another way
             // to request an interrupt; both are observed at this step boundary.
+            let coordinator = execution::ExecutionCoordinator::global();
             if self.drain_inbox(session_id) {
-                execution::ExecutionCoordinator::global().interrupt(session_id);
+                coordinator.interrupt(session_id);
             }
-            if execution::ExecutionCoordinator::global().is_cancelled(session_id) {
+            // Coalesced doorbell: a wake delivered during the drain triggers
+            // one more drain at this step boundary. Bounded so a chatty producer
+            // cannot starve the LLM step.
+            for _ in 0..8 {
+                let Some(scope) = coordinator.take_wake_scoped(session_id) else {
+                    break;
+                };
+                self.log_event(
+                    session_id,
+                    "debug",
+                    "inbox.doorbell",
+                    &format!("scope={}", scope.as_str()),
+                );
+                if self.drain_inbox(session_id) {
+                    coordinator.interrupt(session_id);
+                }
+            }
+            if coordinator.is_cancelled(session_id) {
                 self.finish(
                     session_id,
                     "interrupted",

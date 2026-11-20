@@ -205,9 +205,11 @@ Other oracle classes remain `open_proof_gap` (no implementation exists).
   resolution disabled; `validate_tool_args` checks tool args at the guard chain.
 - ✅ `SchemaValidationMode` `Off` (default) / `Warn` (audit event) / `Enforce`
   (block before any guard state or budget is consumed). Tests cover all paths.
-- Deferred: `Scope` doorbell coalescing (no production consumer yet) and
-  one-shot arg repair (needs typed tool errors; must not break one LLM call
-  per step).
+- ✅ `Scope`-aware coalesced doorbell: `WakeScope::{Steer, Input}` with widening,
+  consumed by `Runner` at each step boundary; `Runner::enqueue_prompt` admits a
+  durable inbox item and rings it. Docs updated (no longer claimed unwired).
+- Deferred: one-shot arg repair (needs typed tool errors; must not break one
+  LLM call per step).
 
 #### R8 — Later
 - Measured results from real local engagements N>=3 + baseline lane.

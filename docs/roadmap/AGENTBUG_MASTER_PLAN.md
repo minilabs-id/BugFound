@@ -4,7 +4,7 @@ Basis: `docs/research/01..16`. This plan replaces the greenfield master prompt w
 
 ## 0. Current baseline
 
-- Rust workspace `agentbug-*` at `D:\Github\Agent Bug Bounty`, 215 tests, fmt/clippy/build green.
+- Rust workspace `agentbug-*` at `D:\Github\Agent Bug Bounty`, 217 tests, fmt/clippy/build green.
 - 17 reference clones in `research/`, pinned commits recorded in research docs.
 - Strong existing primitives: Runner step loop, SQLite event chain, scope/ROE gate, atomic approvals, budgets, stop flags, SHA-256 captures, canonical report, desktop UI, eval scaffolding.
 - Critical defect found: canary verifier unsatisfiable in production (no real finding can be promoted).
@@ -34,12 +34,20 @@ Tasks:
 
 Exit evidence: `cargo test -p agentbug-tools -p agentbug-engagement` green (19 engagement + 52 tools tests); a real local finding reaches `validated`. Next: R2 (kernel purity) after fresh evaluation/research per the user's staged-execution rule.
 
-### R2 — Kernel purity refactor (5–8 days)
-- Move bounty-specific logic from `agentbug-core`/`agentbug-tools` into bounty crate(s).
-- Introduce generic `GoalLock`/`DomainPolicy` traits.
-- Keep public behavior and all tests unchanged.
+### R2 — Kernel purity refactor (COMPLETE, 2026-11-20)
+- ✅ Added `agentbug-kernel-traits` (`GoalLock`, `PromptContributor`,
+  `ToolResultSink`, `ProgressObserver`, `Domain`, `KernelDomain`).
+- ✅ `Runner` holds `Arc<dyn Domain>` via `with_domain(...)`; `new` unchanged.
+- ✅ `BountyDomain` in `agentbug-engagement` owns scope digest, prompt,
+  persistence and progress; `prioritize_targets` moved there.
+- ✅ `persist_tool_result` / `domain_progress_count` moved to `agentbug-store`.
+- ✅ CI boundary check added (`.github/workflows/ci.yml`).
 
-Exit: `agentbug-core` has no `finding|asset|bounty|WSTG` domain types; dependency graph documented.
+Exit evidence: `git grep` for domain vocabulary in `core/src` is clean;
+`cargo tree -p agentbug-core` has no domain crate; 217 tests green; clippy
+`-D warnings` green. Deferred to Stage 2: domain tools/knowledge/report renderer,
+store table split, scope policy move (recorded in ADR-001). Next: R3 after fresh
+evaluation/research.
 
 ### R3 — Core maturity (7–10 days)
 - Typed `LlmErrorKind`, provider usage in response, capability descriptors.

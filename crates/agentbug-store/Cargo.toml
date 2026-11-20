@@ -14,3 +14,4 @@ rusqlite.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 sha2.workspace = true
+agentbug-tools = { path = "../agentbug-tools" }

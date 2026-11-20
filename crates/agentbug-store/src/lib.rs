@@ -2634,6 +2634,218 @@ pub fn redact_text(input: &str) -> String {
     redact(input)
 }
 
+pub fn persist_tool_result(
+    store: &Store,
+    session_id: &str,
+    tool_name: &str,
+    args: &serde_json::Value,
+    result: &agentbug_tools::ToolResult,
+) {
+    if !result.ok {
+        return;
+    }
+    let effective_args = if args.is_object() {
+        args.clone()
+    } else if let Some(s) = result.structured.as_ref() {
+        if s.is_object() {
+            s.clone()
+        } else {
+            serde_json::json!({})
+        }
+    } else {
+        serde_json::json!({})
+    };
+    // Never persist raw secrets captured in tool arguments/evidence.
+    let redacted_args: serde_json::Value =
+        serde_json::from_str(&redact(&effective_args.to_string()))
+            .unwrap_or_else(|_| effective_args.clone());
+    let args = &redacted_args;
+    let n = tool_name.to_ascii_lowercase().replace('-', "_");
+    let is_finding = n.contains("finding");
+    let is_asset = n.contains("asset");
+    let is_artifact = n.contains("artifact");
+    if is_finding {
+        let title = args
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(untitled)");
+        let severity = args
+            .get("severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("info");
+        let asset = args.get("asset").and_then(|v| v.as_str());
+        let vuln_type = args.get("vuln_type").and_then(|v| v.as_str());
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let reproduction = args.get("reproduction").and_then(|v| v.as_str());
+        let impact = args.get("impact").and_then(|v| v.as_str());
+        let remediation = args.get("remediation").and_then(|v| v.as_str());
+        let evidence = args.get("evidence").and_then(|v| v.as_str());
+        let request = args.get("request").and_then(|v| v.as_str());
+        let response = args.get("response").and_then(|v| v.as_str());
+        let cvss = args.get("cvss").and_then(|v| v.as_str());
+        let cwe = args.get("cwe").and_then(|v| v.as_str());
+        match store.add_finding_with_evidence(
+            session_id,
+            title,
+            severity,
+            asset,
+            vuln_type,
+            description,
+            reproduction,
+            impact,
+            remediation,
+            evidence,
+            request,
+            response,
+            cvss,
+            cwe,
+        ) {
+            Ok(Some(finding)) => {
+                tracing::info!(session=%session_id, title=%title, "finding persisted");
+                // The authoritative bytes come from the tool's capture, never
+                // from the LLM-supplied request/response arguments above.
+                if let Some((request, response, canary)) = result
+                    .structured
+                    .as_ref()
+                    .and_then(agentbug_tools::capture_from_structured)
+                {
+                    if let Err(e) = store.attach_capture(
+                        &finding.id,
+                        request.as_bytes(),
+                        response.as_bytes(),
+                        &canary,
+                    ) {
+                        tracing::warn!(error=%e, session=%session_id, "failed to attach capture");
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::info!(session=%session_id, title=%title, "duplicate finding skipped")
+            }
+            Err(e) => tracing::warn!(error=%e, session=%session_id, "failed to persist finding"),
+        }
+    }
+    if is_asset {
+        let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("asset");
+        let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        let metadata = args.get("metadata").map(|v| v.to_string());
+        if let Err(e) = store.upsert_asset(session_id, kind, value, metadata.as_deref()) {
+            tracing::warn!(error=%e, session=%session_id, "failed to persist asset");
+        }
+    }
+    if is_artifact {
+        let kind = args
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("artifact");
+        let path = args.get("path").and_then(|v| v.as_str());
+        let content = args.get("content").and_then(|v| v.as_str());
+        let metadata = args.get("metadata").map(|v| v.to_string());
+        if let Err(e) = store.add_artifact(session_id, kind, path, content, metadata.as_deref()) {
+            tracing::warn!(error=%e, session=%session_id, "failed to persist artifact");
+        }
+    }
+    if n == "task_put" {
+        let engagement = args
+            .get("engagement_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(session_id);
+        let statement = args.get("statement").and_then(|v| v.as_str()).unwrap_or("");
+        if !statement.is_empty() {
+            let playbook_id = args
+                .get("playbook_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let target = args.get("target").and_then(|v| v.as_str());
+            let priority = args
+                .get("priority")
+                .or_else(|| args.get("severity"))
+                .and_then(|v| v.as_str())
+                .map(parse_priority)
+                .unwrap_or(0);
+            match store.create_task(engagement, statement, playbook_id, target, priority) {
+                Ok(task) => tracing::info!(session=%session_id, task=%task.id, "task persisted"),
+                Err(e) => tracing::warn!(error=%e, session=%session_id, "failed to persist task"),
+            }
+        }
+    }
+    if n == "clue_put" {
+        let engagement = args
+            .get("engagement_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(session_id);
+        let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        if !key.is_empty() {
+            let task_id = args.get("task_id").and_then(|v| v.as_str());
+            let source_tool = args
+                .get("source_tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("clue_put");
+            let value = args
+                .get("value")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let value_json = serde_json::to_string(&value).unwrap_or_else(|_| "null".into());
+            if let Err(e) = store.add_clue(engagement, task_id, source_tool, key, &value_json) {
+                tracing::warn!(error=%e, session=%session_id, "failed to persist clue");
+            }
+        }
+    }
+    if n.contains("validat") {
+        // Never promote a finding from a tool result: the tool's oracle can be
+        // supplied by the LLM itself. Only the engagement verifier, which
+        // replays stored bytes against an independent canary, may set
+        // `validated`. Keep the tool output as advisory evidence only.
+        tracing::info!(
+            session = %session_id,
+            "ignoring tool-reported validation; engagement verifier is authoritative"
+        );
+    }
+}
+
+/// Normalize a tool-reported priority into the durable integer priority used
+/// by `tasks`. Numeric strings pass through; common labels use a fixed rank.
+fn parse_priority(raw: &str) -> i64 {
+    if let Ok(n) = raw.parse::<i64>() {
+        return n;
+    }
+    match raw.to_ascii_lowercase().as_str() {
+        "critical" => 4,
+        "high" => 3,
+        "medium" | "med" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+/// Monotonic domain progress signal used by the kernel stall detector.
+/// Confirmed findings, assets and artifacts count; raw coverage rows do not.
+pub fn domain_progress_count(store: &Store, session_id: &str) -> usize {
+    let confirmed_findings = store
+        .list_findings(session_id)
+        .map(|findings| {
+            findings
+                .into_iter()
+                .filter(|finding| {
+                    let status = finding.status.to_ascii_lowercase();
+                    matches!(status.as_str(), "validated" | "confirmed" | "verified")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let assets = store.list_assets(session_id).map(|v| v.len()).unwrap_or(0);
+    let artifacts = store
+        .list_artifacts(session_id)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    confirmed_findings + assets + artifacts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

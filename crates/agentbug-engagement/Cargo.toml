@@ -19,6 +19,7 @@ base64.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 agentbug-core = { path = "../agentbug-core" }
+agentbug-kernel-traits = { path = "../agentbug-kernel-traits" }
 agentbug-llm = { path = "../agentbug-llm" }
 agentbug-policy = { path = "../agentbug-policy" }
 agentbug-store = { path = "../agentbug-store" }

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/agentbug-core",
+  "crates/agentbug-kernel-traits",
   "crates/agentbug-llm",
   "crates/agentbug-tools",
   "crates/agentbug-policy",

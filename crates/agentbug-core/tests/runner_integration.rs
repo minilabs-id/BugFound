@@ -1233,7 +1233,7 @@ async fn stall_guard_stops_repetitive_playbooks() {
         },
     );
     let out = runner.run_goal("stall").await.unwrap();
-    assert!(out.contains("No new findings"));
+    assert!(out.contains("No new evidence"));
     let session = store.list_sessions(10).unwrap().remove(0);
     assert_eq!(session.state, "completed");
     let events = store.list_events(&session.id, 100).unwrap();
@@ -1912,7 +1912,7 @@ async fn stall_guard_ignores_coverage_only_progress() {
     );
 
     let out = runner.run_goal("coverage only").await.unwrap();
-    assert!(out.contains("No new findings"));
+    assert!(out.contains("No new evidence"));
     let session = store.list_sessions(10).unwrap().remove(0);
     assert_eq!(session.state, "completed");
     // One step did record coverage, but coverage alone never resets the guard.

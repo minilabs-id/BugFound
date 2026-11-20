@@ -1,4 +1,5 @@
-use agentbug_core::{prioritize_targets, AgentConfig, Runner};
+use agentbug_core::{AgentConfig, Runner};
+use agentbug_engagement::prioritize_targets;
 use agentbug_llm::{Llm, LlmConfig};
 use agentbug_policy::{parse_scope_brief, Mode};
 use agentbug_store::{redact, Store};

@@ -140,6 +140,7 @@ dependencies = [
 name = "agentbug-core"
 version = "0.1.0"
 dependencies = [
+ "agentbug-kernel-traits",
  "agentbug-llm",
  "agentbug-policy",
  "agentbug-store",
@@ -150,7 +151,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "sha2",
  "tokio",
  "tracing",
  "url",
@@ -181,6 +181,7 @@ name = "agentbug-engagement"
 version = "0.1.0"
 dependencies = [
  "agentbug-core",
+ "agentbug-kernel-traits",
  "agentbug-llm",
  "agentbug-policy",
  "agentbug-store",
@@ -199,6 +200,16 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "agentbug-kernel-traits"
+version = "0.1.0"
+dependencies = [
+ "agentbug-store",
+ "agentbug-tools",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -233,6 +244,7 @@ dependencies = [
 name = "agentbug-store"
 version = "0.1.0"
 dependencies = [
+ "agentbug-tools",
  "anyhow",
  "chrono",
  "rusqlite",

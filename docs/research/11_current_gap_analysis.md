@@ -4,7 +4,7 @@ Date: 2026-11-20. Mode: READ-ONLY review of crates/agentbug-*, README.md,
 docs/PRODUCTION_PLAN.md, docs/HARDENING_PLAN.md, docs/REMAINING_GAPS.md,
 docs/TOOLS_CONTROL_HARDENING.md, docs/architecture.md, docs/research and eval/.
 No code was modified; no tests were executed. Test counts are declared test
-functions counted from source (215 workspace-wide), not a pass/fail claim.
+functions counted from source (215 at research time, 217 after R1/R2), not a pass/fail claim.
 Severity legend: Critical means the advertised mechanism cannot work in
 production; High means a core pillar of the vision is absent or inverted;
 Medium means partial or incorrect implementation, or material doc drift;
@@ -459,7 +459,7 @@ D3 (Critical, already reported): HARDENING_PLAN.md:88-100 H-04 claims a working
 independent verifier. Code works only for hand-built captures (Section 2).
 
 D4 (Low): PRODUCTION_PLAN.md:4-5 and REMAINING_GAPS.md:57-58 say 180+ tests;
-215 declared test functions were counted. Harmless, but the number must come
+215 declared test functions were counted at research time; 217 after R1/R2. Harmless, but the number must come
 from the gate, as the docs themselves say.
 
 D5 (Medium): core/src/step.rs:1-2 is presented as a retained module but is

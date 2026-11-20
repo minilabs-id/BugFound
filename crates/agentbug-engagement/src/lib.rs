@@ -13,6 +13,10 @@
 //! (ADR-008); and control functions take an explicit database path via the
 //! `*_at` variants.
 
+pub mod domain;
+
+pub use domain::{prioritize_targets, BountyDomain};
+
 use agentbug_core::{build_policy_config, AgentConfig, Runner};
 use agentbug_llm::{ChatMessage, ChatResponse, Llm, LlmClient, LlmConfig};
 use agentbug_policy::{BudgetConfig, Mode, PolicyConfig, ScopeConfig};
@@ -947,7 +951,9 @@ async fn run_engagement(
             },
             ..PolicyConfig::default()
         });
-        let runner = Runner::new(store.clone(), runner_llm.clone(), tools, policy, agent);
+        let scope_summary = policy.scope_summary();
+        let runner = Runner::new(store.clone(), runner_llm.clone(), tools, policy, agent)
+            .with_domain(Arc::new(BountyDomain { scope_summary }));
         let goal = format!(
             "engagement_id={id}\n{}\n\nScope reminder: {scope_reminder}\n\
              Use the available tools to gather evidence. Return findings and evidence in your final answer. \
@@ -3180,7 +3186,7 @@ No DoS testing. Do not modify data. No disclosure.
             "severity": "low",
             "description": "reflection proof"
         });
-        agentbug_core::persist_bounty_tool_result(&store, session, "save_finding", &args, &result);
+        agentbug_store::persist_tool_result(&store, session, "save_finding", &args, &result);
         let findings = store.list_findings(session).unwrap();
         assert_eq!(findings.len(), 1);
         capture_evidence(&store, &findings[0]).unwrap();
@@ -3233,7 +3239,7 @@ No DoS testing. Do not modify data. No disclosure.
         let store = Store::open(&db).unwrap();
         let session = "non-reflect-session";
         let args = serde_json::json!({"title":"No reflection","severity":"low","description":"negative control"});
-        agentbug_core::persist_bounty_tool_result(&store, session, "save_finding", &args, &result);
+        agentbug_store::persist_tool_result(&store, session, "save_finding", &args, &result);
         let finding = &store.list_findings(session).unwrap()[0];
         capture_evidence(&store, finding).unwrap();
         let mut trace = TraceRun::new(session);

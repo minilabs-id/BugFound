@@ -1,3 +1,4 @@
+use agentbug_kernel_traits::{digest_goal_and_context, Domain, KernelDomain};
 use agentbug_llm::{ChatMessage, Llm, ToolSpec as LlmToolSpec};
 use agentbug_policy::{ActionRequest, Decision, Mode, PolicyConfig, PolicyEngine};
 use agentbug_store::{redact, Approval, Store};
@@ -5,8 +6,7 @@ use agentbug_tools::ToolRegistry;
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -67,12 +67,8 @@ fn strip_guard_prefix(reason: &str) -> &str {
 /// Digest binding a run to its original goal and scope. Any drift is a
 /// security event: a tool output must not silently redefine the engagement.
 /// A domain-separated SHA-256 keeps the lock stable across processes/builds.
-pub fn goal_digest(goal: &str, scope_summary: Option<&str>) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(goal.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(scope_summary.unwrap_or("").as_bytes());
-    format!("{:x}", hasher.finalize())
+pub fn goal_digest(goal: &str, context: Option<&str>) -> String {
+    digest_goal_and_context(goal, context)
 }
 
 /// Heuristic detector for instruction-like text arriving through tool outputs.
@@ -158,46 +154,6 @@ pub fn record_provider_usage(
     if let Err(e) = store.record_token_usage(session, prompt, completion, cost) {
         warn!(error=%e, session=session, "failed to record provider usage");
     }
-}
-
-/// Coverage-driven target suggestions: expand wildcard scope entries, remove
-/// already covered targets, and rank candidates mentioned by hypotheses.
-pub fn prioritize_targets(
-    scope_in: &[String],
-    covered: &[String],
-    hypotheses: &[agentbug_store::Hypothesis],
-) -> Vec<String> {
-    let mut candidates = Vec::new();
-    for pattern in scope_in {
-        let pattern = pattern.trim().to_ascii_lowercase();
-        if let Some(suffix) = pattern.strip_prefix("*.") {
-            candidates.push(suffix.to_string());
-            for sub in ["www", "api", "dev", "staging", "mail", "admin"] {
-                candidates.push(format!("{sub}.{suffix}"));
-            }
-        } else if !pattern.is_empty() && !pattern.contains('/') {
-            candidates.push(pattern);
-        }
-    }
-    let covered: HashSet<String> = covered.iter().map(|c| c.to_ascii_lowercase()).collect();
-    let mut ranked: Vec<(usize, String)> = candidates
-        .into_iter()
-        .filter(|candidate| !covered.contains(candidate))
-        .map(|candidate| {
-            let score = hypotheses
-                .iter()
-                .filter(|hypothesis| {
-                    hypothesis
-                        .statement
-                        .to_ascii_lowercase()
-                        .contains(&candidate)
-                })
-                .count();
-            (score, candidate)
-        })
-        .collect();
-    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    ranked.into_iter().map(|(_, candidate)| candidate).collect()
 }
 
 fn truncate_event(s: &str, max: usize) -> String {
@@ -374,212 +330,15 @@ impl Default for AgentConfig {
     }
 }
 
-pub fn persist_bounty_tool_result(
-    store: &agentbug_store::Store,
-    session_id: &str,
-    tool_name: &str,
-    args: &serde_json::Value,
-    result: &agentbug_tools::ToolResult,
-) {
-    if !result.ok {
-        return;
-    }
-    let effective_args = if args.is_object() {
-        args.clone()
-    } else if let Some(s) = result.structured.as_ref() {
-        if s.is_object() {
-            s.clone()
-        } else {
-            serde_json::json!({})
-        }
-    } else {
-        serde_json::json!({})
-    };
-    // Never persist raw secrets captured in tool arguments/evidence.
-    let redacted_args: serde_json::Value =
-        serde_json::from_str(&redact(&effective_args.to_string()))
-            .unwrap_or_else(|_| effective_args.clone());
-    let args = &redacted_args;
-    let n = tool_name.to_ascii_lowercase().replace('-', "_");
-    let is_finding = n.contains("finding");
-    let is_asset = n.contains("asset");
-    let is_artifact = n.contains("artifact");
-    if is_finding {
-        let title = args
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("(untitled)");
-        let severity = args
-            .get("severity")
-            .and_then(|v| v.as_str())
-            .unwrap_or("info");
-        let asset = args.get("asset").and_then(|v| v.as_str());
-        let vuln_type = args.get("vuln_type").and_then(|v| v.as_str());
-        let description = args
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let reproduction = args.get("reproduction").and_then(|v| v.as_str());
-        let impact = args.get("impact").and_then(|v| v.as_str());
-        let remediation = args.get("remediation").and_then(|v| v.as_str());
-        let evidence = args.get("evidence").and_then(|v| v.as_str());
-        let request = args.get("request").and_then(|v| v.as_str());
-        let response = args.get("response").and_then(|v| v.as_str());
-        let cvss = args.get("cvss").and_then(|v| v.as_str());
-        let cwe = args.get("cwe").and_then(|v| v.as_str());
-        match store.add_finding_with_evidence(
-            session_id,
-            title,
-            severity,
-            asset,
-            vuln_type,
-            description,
-            reproduction,
-            impact,
-            remediation,
-            evidence,
-            request,
-            response,
-            cvss,
-            cwe,
-        ) {
-            Ok(Some(finding)) => {
-                tracing::info!(session=%session_id, title=%title, "finding persisted");
-                // The authoritative bytes come from the tool's capture, never
-                // from the LLM-supplied request/response arguments above.
-                if let Some((request, response, canary)) = result
-                    .structured
-                    .as_ref()
-                    .and_then(agentbug_tools::capture_from_structured)
-                {
-                    if let Err(e) = store.attach_capture(
-                        &finding.id,
-                        request.as_bytes(),
-                        response.as_bytes(),
-                        &canary,
-                    ) {
-                        tracing::warn!(error=%e, session=%session_id, "failed to attach capture");
-                    }
-                }
-            }
-            Ok(None) => {
-                tracing::info!(session=%session_id, title=%title, "duplicate finding skipped")
-            }
-            Err(e) => tracing::warn!(error=%e, session=%session_id, "failed to persist finding"),
-        }
-    }
-    if is_asset {
-        let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("asset");
-        let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("");
-        let metadata = args.get("metadata").map(|v| v.to_string());
-        if let Err(e) = store.upsert_asset(session_id, kind, value, metadata.as_deref()) {
-            tracing::warn!(error=%e, session=%session_id, "failed to persist asset");
-        }
-    }
-    if is_artifact {
-        let kind = args
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("artifact");
-        let path = args.get("path").and_then(|v| v.as_str());
-        let content = args.get("content").and_then(|v| v.as_str());
-        let metadata = args.get("metadata").map(|v| v.to_string());
-        if let Err(e) = store.add_artifact(session_id, kind, path, content, metadata.as_deref()) {
-            tracing::warn!(error=%e, session=%session_id, "failed to persist artifact");
-        }
-    }
-    if n == "task_put" {
-        let engagement = args
-            .get("engagement_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or(session_id);
-        let statement = args.get("statement").and_then(|v| v.as_str()).unwrap_or("");
-        if !statement.is_empty() {
-            let playbook_id = args
-                .get("playbook_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let target = args.get("target").and_then(|v| v.as_str());
-            let priority = args
-                .get("priority")
-                .or_else(|| args.get("severity"))
-                .and_then(|v| v.as_str())
-                .map(parse_priority)
-                .unwrap_or(0);
-            match store.create_task(engagement, statement, playbook_id, target, priority) {
-                Ok(task) => tracing::info!(session=%session_id, task=%task.id, "task persisted"),
-                Err(e) => tracing::warn!(error=%e, session=%session_id, "failed to persist task"),
-            }
-        }
-    }
-    if n == "clue_put" {
-        let engagement = args
-            .get("engagement_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or(session_id);
-        let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
-        if !key.is_empty() {
-            let task_id = args.get("task_id").and_then(|v| v.as_str());
-            let source_tool = args
-                .get("source_tool")
-                .and_then(|v| v.as_str())
-                .unwrap_or("clue_put");
-            let value = args
-                .get("value")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let value_json = serde_json::to_string(&value).unwrap_or_else(|_| "null".into());
-            if let Err(e) = store.add_clue(engagement, task_id, source_tool, key, &value_json) {
-                tracing::warn!(error=%e, session=%session_id, "failed to persist clue");
-            }
-        }
-    }
-    if n.contains("validat") {
-        // Never promote a finding from a tool result: the tool's oracle can be
-        // supplied by the LLM itself. Only the engagement verifier, which
-        // replays stored bytes against an independent canary, may set
-        // `validated`. Keep the tool output as advisory evidence only.
-        tracing::info!(
-            session = %session_id,
-            "ignoring tool-reported validation; engagement verifier is authoritative"
-        );
-    }
-}
-
-/// Normalize a tool-reported priority into the durable integer priority used
-/// by `tasks`. Numeric strings pass through; common labels use a fixed rank.
-fn parse_priority(raw: &str) -> i64 {
-    if let Ok(n) = raw.parse::<i64>() {
-        return n;
-    }
-    match raw.to_ascii_lowercase().as_str() {
-        "critical" => 4,
-        "high" => 3,
-        "medium" | "med" => 2,
-        "low" => 1,
-        _ => 0,
-    }
-}
-
-// Alias names for compatibility.
-pub fn persist_tool_result(
-    store: &agentbug_store::Store,
-    session_id: &str,
-    tool_name: &str,
-    args: &serde_json::Value,
-    result: &agentbug_tools::ToolResult,
-) {
-    persist_bounty_tool_result(store, session_id, tool_name, args, result);
-}
-
 pub struct Runner {
     pub store: Store,
     pub llm: Arc<dyn Llm + Send + Sync>,
     pub tools: ToolRegistry,
     pub policy: PolicyEngine,
     pub agent: AgentConfig,
+    /// Domain adapter injected by the composition root; defaults to the
+    /// storage-backed kernel behavior.
+    pub domain: Arc<dyn Domain>,
     pub owner_id: String,
     /// Mirrors the durable per-session counter; the store remains the source of truth.
     pub tool_calls_used: std::sync::atomic::AtomicUsize,
@@ -602,10 +361,17 @@ impl Runner {
             tools,
             policy,
             agent,
+            domain: Arc::new(KernelDomain),
             owner_id: format!("runner-{}", Uuid::new_v4()),
             tool_calls_used: std::sync::atomic::AtomicUsize::new(0),
             cooldowns: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Replace the domain adapter. `Runner::new` keeps its 5-argument signature.
+    pub fn with_domain(mut self, domain: Arc<dyn Domain>) -> Self {
+        self.domain = domain;
+        self
     }
 
     fn log_event(&self, session_id: &str, level: &str, kind: &str, message: &str) {
@@ -706,15 +472,6 @@ impl Runner {
         }
     }
 
-    pub fn persist_bounty_tool_result(
-        &self,
-        session_id: &str,
-        tool_name: &str,
-        args: &serde_json::Value,
-        result: &agentbug_tools::ToolResult,
-    ) {
-        persist_bounty_tool_result(&self.store, session_id, tool_name, args, result);
-    }
     pub fn effective_system_prompt(&self) -> Option<String> {
         self.agent
             .system_prompt
@@ -844,7 +601,7 @@ impl Runner {
             self.store.get_goal_lock(session_id),
         ) {
             (Ok(Some(session)), Ok(Some(lock))) => {
-                let expected = goal_digest(&session.goal, self.policy.scope_summary().as_deref());
+                let expected = self.domain.digest(&session.goal);
                 lock != expected
             }
             _ => true,
@@ -1015,36 +772,6 @@ impl Runner {
         {
             warn!(error=%e, session=%session_id, "failed to persist budget usage");
         }
-    }
-
-    /// Count of *confirmed* evidence used by the stall guard. Raw coverage
-    /// rows are deliberately excluded: probing many URLs is not progress. Only
-    /// validated/confirmed findings plus concrete assets and artifacts count.
-    fn evidence_count(&self, session_id: &str) -> usize {
-        let confirmed_findings = self
-            .store
-            .list_findings(session_id)
-            .map(|findings| {
-                findings
-                    .into_iter()
-                    .filter(|finding| {
-                        let status = finding.status.to_ascii_lowercase();
-                        matches!(status.as_str(), "validated" | "confirmed" | "verified")
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
-        let assets = self
-            .store
-            .list_assets(session_id)
-            .map(|v| v.len())
-            .unwrap_or(0);
-        let artifacts = self
-            .store
-            .list_artifacts(session_id)
-            .map(|v| v.len())
-            .unwrap_or(0);
-        confirmed_findings + assets + artifacts
     }
 
     fn target_cooldown(&self, session_id: &str, target: Option<&str>) -> Option<String> {
@@ -1234,7 +961,7 @@ impl Runner {
 
     pub async fn run_goal(&self, goal: &str) -> Result<String> {
         let session = self.store.create_session(goal)?;
-        let lock = goal_digest(goal, self.policy.scope_summary().as_deref());
+        let lock = self.domain.digest(goal);
         if let Err(e) = self.store.set_goal_lock(&session.id, &lock) {
             warn!(error=%e, session=%session.id, "failed to persist goal lock");
         }
@@ -1297,10 +1024,9 @@ impl Runner {
 
         let mut system_prompt =
             "You are AgentBug, a universal agent core. Use tools when helpful. Be concise, factual, and safety-aware.".to_string();
-        if let Some(summary) = self.policy.scope_summary() {
-            system_prompt.push_str(&format!(
-                " Engagement scope: {summary}. Never probe out-of-scope targets."
-            ));
+        if let Some(extra) = self.domain.additional_system_prompt() {
+            system_prompt.push(' ');
+            system_prompt.push_str(&extra);
         }
         if let Err(e) = self
             .store
@@ -1558,7 +1284,8 @@ impl Runner {
         match tool.run(args.clone()).await {
             Ok(result) => {
                 self.record_call(session_id, &spec);
-                self.persist_bounty_tool_result(session_id, &spec.name, &args, &result);
+                self.domain
+                    .on_tool_result(&self.store, session_id, &spec.name, &args, &result);
                 self.check_tool_output(session_id, &result.output);
                 self.store.add_message_full(
                     session_id,
@@ -1670,7 +1397,13 @@ impl Runner {
                         if let Some(target) = extract_policy_target(&args) {
                             let _ = self.store.record_approved_target(session_id, &target);
                         }
-                        self.persist_bounty_tool_result(session_id, &spec.name, &args, &result);
+                        self.domain.on_tool_result(
+                            &self.store,
+                            session_id,
+                            &spec.name,
+                            &args,
+                            &result,
+                        );
                         self.check_tool_output(session_id, &result.output);
                         self.store.add_message_full(
                             session_id,
@@ -1750,10 +1483,10 @@ impl Runner {
     async fn run_loop(&self, session_id: &str, model: &str) -> Result<String> {
         self.store.ensure_budget(session_id)?;
         let mut step = self.store.budget_usage(session_id)?.steps_used;
-        let mut last_evidence = self.evidence_count(session_id);
+        let mut last_evidence = self.domain.progress_count(&self.store, session_id);
         let mut stalled_steps = 0usize;
         while step < self.effective_max_steps() {
-            let evidence_now = self.evidence_count(session_id);
+            let evidence_now = self.domain.progress_count(&self.store, session_id);
             if evidence_now > last_evidence {
                 stalled_steps = 0;
             } else {
@@ -1762,7 +1495,7 @@ impl Runner {
             last_evidence = evidence_now;
             if self.agent.stall_limit > 0 && stalled_steps >= self.agent.stall_limit {
                 let text = format!(
-                    "No new findings (confirmed evidence), assets or artifacts after {} steps; concluding playbook.",
+                    "No new evidence after {} steps; concluding playbook.",
                     self.agent.stall_limit
                 );
                 self.log_event(session_id, "warn", "runner.stall_stop", &text);
@@ -1955,7 +1688,8 @@ impl Runner {
                                         let _ =
                                             self.store.record_approved_target(session_id, target);
                                     }
-                                    self.persist_bounty_tool_result(
+                                    self.domain.on_tool_result(
+                                        &self.store,
                                         session_id,
                                         &spec.name,
                                         &tc.arguments,
@@ -2263,51 +1997,12 @@ mod tests {
     }
 
     #[test]
-    fn planner_expands_scope_and_removes_covered_targets() {
-        let scope = vec!["*.example.com".to_string()];
-        let covered = vec!["www.example.com".to_string()];
-        let targets = prioritize_targets(&scope, &covered, &[]);
-        assert!(targets.contains(&"example.com".to_string()));
-        assert!(targets.contains(&"api.example.com".to_string()));
-        assert!(!targets.contains(&"www.example.com".to_string()));
-    }
-
-    #[test]
     fn short_histories_are_not_compacted() {
         let history = vec![
             message("user", "hello", None),
             message("assistant", "hi", None),
         ];
         assert_eq!(Runner::build_llm_messages(history).len(), 2);
-    }
-
-    #[test]
-    fn tool_reported_validation_never_promotes_finding() {
-        let store = agentbug_store::Store::open(":memory:").unwrap();
-        let finding = store
-            .add_finding(
-                "session",
-                "Candidate",
-                "high",
-                Some("https://example.com"),
-                None,
-                "description",
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-        let result = agentbug_tools::ToolResult {
-            ok: true,
-            output: "valid".into(),
-            structured: Some(serde_json::json!({ "valid": true })),
-        };
-        let args = serde_json::json!({ "finding_id": finding.id });
-        persist_bounty_tool_result(&store, "session", "validate_poc", &args, &result);
-        let findings = store.list_findings("session").unwrap();
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].status, "open");
     }
 
     #[test]
@@ -2349,76 +2044,6 @@ mod tests {
             "intrusive_probe",
             "intrusive"
         )));
-    }
-
-    #[test]
-    fn raw_capture_bytes_are_attached_to_finding() {
-        let store = agentbug_store::Store::open(":memory:").unwrap();
-        let args = serde_json::json!({
-            "title": "Reflected XSS",
-            "severity": "medium",
-            "asset": "https://example.com/q",
-            "request": "LLM supplied - must not be used",
-            "response": "LLM supplied - must not be used",
-        });
-        let raw_request = b"GET /q?x=<script> HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let raw_response = b"HTTP/1.1 200 OK\r\nX-Canary: CANARY-42\r\n\r\nreflected";
-        let result = agentbug_tools::ToolResult {
-            ok: true,
-            output: "captured".into(),
-            structured: Some(serde_json::json!({
-                "capture": {
-                    "request": String::from_utf8_lossy(raw_request),
-                    "response": String::from_utf8_lossy(raw_response),
-                    "canary": "CANARY-42",
-                }
-            })),
-        };
-        persist_bounty_tool_result(&store, "s", "save_finding", &args, &result);
-        let findings = store.list_findings("s").unwrap();
-        assert_eq!(findings.len(), 1);
-        let capture = store
-            .get_capture(&findings[0].id)
-            .unwrap()
-            .expect("capture must be persisted");
-        assert_eq!(capture.request_bytes.as_slice(), raw_request);
-        assert_eq!(capture.response_bytes.as_slice(), raw_response);
-        assert_eq!(capture.canary, "CANARY-42");
-    }
-
-    #[test]
-    fn task_put_and_clue_put_are_persisted() {
-        let store = agentbug_store::Store::open(":memory:").unwrap();
-        let ok = || agentbug_tools::ToolResult {
-            ok: true,
-            output: "ok".into(),
-            structured: None,
-        };
-        let task_args = serde_json::json!({
-            "statement": "check login",
-            "playbook_id": "pb-1",
-            "target": "example.com",
-            "priority": "high",
-        });
-        persist_bounty_tool_result(&store, "sess", "task_put", &task_args, &ok());
-        let tasks = store.list_tasks("sess").unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].statement, "check login");
-        assert_eq!(tasks[0].playbook_id, "pb-1");
-        assert_eq!(tasks[0].priority, 3);
-
-        let clue_args = serde_json::json!({
-            "key": "header",
-            "value": "X-Debug: 1",
-            "source_tool": "http_request",
-            "task_id": tasks[0].id,
-        });
-        persist_bounty_tool_result(&store, "sess", "clue_put", &clue_args, &ok());
-        let clues = store.list_clues("sess").unwrap();
-        assert_eq!(clues.len(), 1);
-        assert_eq!(clues[0].key, "header");
-        assert_eq!(clues[0].source_tool, "http_request");
-        assert_eq!(clues[0].task_id.as_deref(), Some(tasks[0].id.as_str()));
     }
 
     #[test]

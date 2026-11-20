@@ -1,6 +1,6 @@
 # ADR-001: Universal Kernel vs Bug Bounty Domain Separation
 
-- Status: Accepted (R1). Code changes scheduled for R2.
+- Status: Accepted (R1). Core seam implemented in R2; physical crate split deferred.
 - Date: 2026-11-20
 - Basis: `docs/research/01..16`, `docs/roadmap/AGENTBUG_MASTER_PLAN.md`
 
@@ -24,7 +24,7 @@ enforce a boundary that does not exist.
 ## Alternatives considered
 
 1. Big-bang rewrite into `agentbug-kernel` + `agentbug-domain` crates —
-   rejected: violates "refactor boundaries, not behavior" and risks 215 green
+   rejected: violates "refactor boundaries, not behavior" and risks 217 green
    tests.
 2. Feature-flag `domain` module inside core — rejected: leaves dependency
    inversion and CI enforcement unsolved.
@@ -53,7 +53,7 @@ on kernel abstractions. New workspace crates are a subsequent phase (R2).
 
 - Pro: reusable/testable kernel; domain changes stop rippling; CI-enforceable.
 - Con: Observer/Planner indirection in a currently simple runner; R2 regression
-  risk across 215 tests; temporary duplication during migration.
+  risk across 217 tests; temporary duplication during migration.
 
 ## Implementation consequences (R2, not R1)
 
@@ -74,6 +74,39 @@ on kernel abstractions. New workspace crates are a subsequent phase (R2).
   tables in `store/src/lib.rs:270-380`.
 - Invert dependency directions in `core/Cargo.toml:19-22` and
   `tools/Cargo.toml:18`; add CI dependency check.
+
+## R2 implementation result (2026-11-20)
+
+- Added `agentbug-kernel-traits` with `GoalLock`, `PromptContributor`,
+  `ToolResultSink`, `ProgressObserver`, the `Domain` bundle trait, and a
+  `KernelDomain` default adapter.
+- `Runner` holds `Arc<dyn Domain>` with a `with_domain(...)` builder;
+  `Runner::new` keeps its five-argument signature. All kernel call sites now go
+  through the ports.
+- `agentbug-engagement::domain::BountyDomain` supplies scope-bound digest,
+  scope prompt, tool-result persistence and progress counting.
+- `prioritize_targets` moved to `agentbug-engagement`; CLI imports it there.
+- `persist_tool_result` and `domain_progress_count` moved to `agentbug-store`,
+  which already owns the domain tables; the kernel only calls them through the
+  default adapter.
+- CI enforces the boundary: `agentbug-core/src` must not contain domain
+  vocabulary and `cargo tree -p agentbug-core` must not contain domain crates.
+- All 217 tests green; `cargo clippy --workspace --all-targets -- -D warnings`
+  green.
+
+### Deliberate deviations (recorded, not hidden)
+
+- `extract_policy_target` and its aliases stay in core: they are neutral JSON
+  key/shell token helpers with five hot kernel call sites and no domain types.
+- Domain tool implementations and WSTG/CWE knowledge stay in `agentbug-tools`
+  this phase; moving them would require promoting private helpers or creating a
+  tools -> engagement cycle. They are Stage 2.
+- The store still owns domain tables and the one SQLite connection; the
+  table-level split is Stage 2. Moving them would change DDL and config serde
+  compatibility with no kernel-purity gain.
+- Scope policy types (`ScopeConfig`, `parse_scope_brief`) stay in
+  `agentbug-policy` for now; the widest fan-out (CLI/desktop/engagement) is
+  Stage 2.
 
 ## What would invalidate this decision
 

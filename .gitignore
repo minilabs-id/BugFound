@@ -8,3 +8,6 @@
 /eval/work/
 __pycache__/
 *.pyc
+
+# Local research clones (third-party repos); not part of AgentBug source.
+/research/

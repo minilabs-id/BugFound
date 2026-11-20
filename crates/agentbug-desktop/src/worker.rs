@@ -90,6 +90,7 @@ fn build_runner(config: &AppConfig, cwd: &str, mode: Mode) -> Result<Runner> {
             .default_model
             .clone()
             .filter(|value| !value.trim().is_empty()),
+        fallback_models: Vec::new(),
         timeout_ms: config.llm.timeout_ms,
     };
     let client = agentbug_llm::LlmClient::new(llm_config)?;

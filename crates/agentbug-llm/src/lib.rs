@@ -22,6 +22,9 @@ pub struct LlmConfig {
     pub api_key: String,
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Ordered alternate model ids tried when the primary is retired or unknown.
+    #[serde(default)]
+    pub fallback_models: Vec<String>,
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
 }
@@ -36,6 +39,7 @@ impl Default for LlmConfig {
             base_url: "https://api.openai.com".into(),
             api_key: String::new(),
             default_model: None,
+            fallback_models: Vec::new(),
             timeout_ms: default_timeout(),
         }
     }
@@ -108,9 +112,43 @@ impl std::ops::Deref for ChatResponseWithUsage {
     }
 }
 
+/// Provider-advertised capabilities. All flags are conservative by default;
+/// a missing declaration never unlocks a feature.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCapabilities {
+    pub tool_calling: bool,
+    pub parallel_tool_calls: bool,
+    pub streaming: bool,
+    pub native_compaction: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelDescriptor {
+    pub id: String,
+    pub capabilities: ModelCapabilities,
+    pub context_window: Option<u64>,
+}
+
 #[async_trait]
 pub trait Llm: Send + Sync {
     async fn resolve_model(&self) -> Result<String>;
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn model_info(&self) -> Result<ModelDescriptor> {
+        Ok(ModelDescriptor {
+            id: self.resolve_model().await?,
+            capabilities: self.capabilities(),
+            ..Default::default()
+        })
+    }
+
+    async fn supported_models(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     async fn chat(
         &self,
         model: &str,
@@ -323,104 +361,130 @@ impl Llm for LlmClient {
             body["tools"] = serde_json::Value::Array(t);
         }
 
-        let mut last_err: Option<anyhow::Error> = None;
-        for attempt in 0..3u32 {
-            let res = self
-                .http
-                .post(&url)
-                .bearer_auth(self.cfg.api_key.trim())
-                .json(&body)
-                .send()
-                .await;
-            match res {
-                Ok(r) => {
-                    if r.status().is_success() {
-                        let v: serde_json::Value = r.json().await.context("invalid chat json")?;
-                        let usage = v.get("usage").map(|usage| TokenUsage {
-                            prompt_tokens: usage
-                                .get("prompt_tokens")
-                                .and_then(|value| value.as_u64())
-                                .unwrap_or(0),
-                            completion_tokens: usage
-                                .get("completion_tokens")
-                                .and_then(|value| value.as_u64())
-                                .unwrap_or(0),
-                        });
-                        let response = parse_chat_response(&v, model)?;
-                        return Ok(ChatResponseWithUsage { response, usage });
-                    }
-                    let status = r.status().as_u16();
-                    let retry_after = r
-                        .headers()
-                        .get(RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(parse_retry_after)
-                        .map(|d| d.min(Duration::from_secs(10)));
-                    let text = r.text().await.unwrap_or_default();
-                    let kind = LlmErrorKind::from_status(status, &text);
-                    if kind.retryable() {
-                        if attempt == 2 {
-                            return Err(LlmError {
-                                kind,
-                                message: format!("chat failed {status}: {text}"),
-                                status: Some(status),
-                                retry_after,
-                                model: Some(model.to_string()),
-                            }
-                            .into());
+        let mut candidates = vec![model.to_string()];
+        for extra in &self.cfg.fallback_models {
+            if extra != model {
+                candidates.push(extra.clone());
+            }
+        }
+        let mut fallback_error: Option<anyhow::Error> = None;
+        for candidate in &candidates {
+            body["model"] = serde_json::json!(candidate);
+            let mut last_err: Option<anyhow::Error> = None;
+            for attempt in 0..3u32 {
+                let res = self
+                    .http
+                    .post(&url)
+                    .bearer_auth(self.cfg.api_key.trim())
+                    .json(&body)
+                    .send()
+                    .await;
+                match res {
+                    Ok(r) => {
+                        if r.status().is_success() {
+                            let v: serde_json::Value =
+                                r.json().await.context("invalid chat json")?;
+                            let usage = v.get("usage").map(|usage| TokenUsage {
+                                prompt_tokens: usage
+                                    .get("prompt_tokens")
+                                    .and_then(|value| value.as_u64())
+                                    .unwrap_or(0),
+                                completion_tokens: usage
+                                    .get("completion_tokens")
+                                    .and_then(|value| value.as_u64())
+                                    .unwrap_or(0),
+                            });
+                            let response = parse_chat_response(&v, model)?;
+                            return Ok(ChatResponseWithUsage { response, usage });
                         }
-                        let fallback = Duration::from_millis(500 * (1u64 << attempt));
-                        let delay = retry_after.unwrap_or(fallback);
+                        let status = r.status().as_u16();
+                        let retry_after = r
+                            .headers()
+                            .get(RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(parse_retry_after)
+                            .map(|d| d.min(Duration::from_secs(10)));
+                        let text = r.text().await.unwrap_or_default();
+                        let kind = LlmErrorKind::from_status(status, &text);
+                        if kind.retryable() {
+                            if attempt == 2 {
+                                return Err(LlmError {
+                                    kind,
+                                    message: format!("chat failed {status}: {text}"),
+                                    status: Some(status),
+                                    retry_after,
+                                    model: Some(model.to_string()),
+                                }
+                                .into());
+                            }
+                            let fallback = Duration::from_millis(500 * (1u64 << attempt));
+                            let delay = retry_after.unwrap_or(fallback);
+                            last_err = Some(
+                                LlmError {
+                                    kind,
+                                    message: format!(
+                                        "chat failed {status}: {text} (retrying in {}s)",
+                                        delay.as_secs()
+                                    ),
+                                    status: Some(status),
+                                    retry_after,
+                                    model: Some(model.to_string()),
+                                }
+                                .into(),
+                            );
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                        let err = LlmError {
+                            kind,
+                            message: format!("chat failed {status}: {text}"),
+                            status: Some(status),
+                            retry_after,
+                            model: Some(model.to_string()),
+                        };
+                        if err.kind == LlmErrorKind::ModelNotFound {
+                            last_err = Some(err.into());
+                            break;
+                        }
+                        return Err(err.into());
+                    }
+                    Err(e) => {
+                        let kind = if e.is_timeout() {
+                            LlmErrorKind::Timeout
+                        } else {
+                            LlmErrorKind::Transport
+                        };
                         last_err = Some(
                             LlmError {
                                 kind,
-                                message: format!(
-                                    "chat failed {status}: {text} (retrying in {}s)",
-                                    delay.as_secs()
-                                ),
-                                status: Some(status),
-                                retry_after,
+                                message: format!("POST {url} failed: {e}"),
+                                status: e.status().map(|s| s.as_u16()),
+                                retry_after: None,
                                 model: Some(model.to_string()),
                             }
                             .into(),
                         );
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    return Err(LlmError {
-                        kind,
-                        message: format!("chat failed {status}: {text}"),
-                        status: Some(status),
-                        retry_after,
-                        model: Some(model.to_string()),
-                    }
-                    .into());
-                }
-                Err(e) => {
-                    let kind = if e.is_timeout() {
-                        LlmErrorKind::Timeout
-                    } else {
-                        LlmErrorKind::Transport
-                    };
-                    last_err = Some(
-                        LlmError {
-                            kind,
-                            message: format!("POST {url} failed: {e}"),
-                            status: e.status().map(|s| s.as_u16()),
-                            retry_after: None,
-                            model: Some(model.to_string()),
+                        if attempt < 2 {
+                            tokio::time::sleep(Duration::from_millis(500 * (1u64 << attempt)))
+                                .await;
+                            continue;
                         }
-                        .into(),
-                    );
-                    if attempt < 2 {
-                        tokio::time::sleep(Duration::from_millis(500 * (1u64 << attempt))).await;
-                        continue;
+                        break;
                     }
-                    break;
                 }
             }
+            let err = last_err.unwrap_or_else(|| anyhow!("chat failed"));
+            let kind = err
+                .downcast_ref::<LlmError>()
+                .map(|e| e.kind)
+                .unwrap_or_else(|| LlmErrorKind::from_message(&err.to_string()));
+            if kind == LlmErrorKind::ModelNotFound {
+                fallback_error = Some(err);
+                continue;
+            }
+            return Err(err);
         }
-        Err(last_err.unwrap_or_else(|| anyhow!("chat failed")))
+        Err(fallback_error.unwrap_or_else(|| anyhow!("chat failed")))
     }
 
     async fn chat(
@@ -702,5 +766,154 @@ mod tests {
         let (response, usage) = ChatOnly.chat_with_usage("m", &[], &[]).await.unwrap();
         assert_eq!(response.content.as_deref(), Some("hi"));
         assert!(usage.is_none());
+    }
+
+    fn serve(
+        responses: Vec<(u16, &'static str, Option<&'static str>)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for (status, body, retry_after) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut buf = vec![0u8; 8192];
+                let mut raw = Vec::new();
+                loop {
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let text = String::from_utf8_lossy(&raw);
+                        if let Some(line) = text
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                        {
+                            let expected: usize = line
+                                .split(':')
+                                .nth(1)
+                                .unwrap_or("0")
+                                .trim()
+                                .parse()
+                                .unwrap_or(0);
+                            let head = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                            if raw.len() >= head + expected {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                seen.push(String::from_utf8_lossy(&raw).to_string());
+                let retry = retry_after
+                    .map(|value| format!("Retry-After: {value}\r\n"))
+                    .unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{retry}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+            seen
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn fallback_client(base: &str, fallbacks: &[&str]) -> LlmClient {
+        LlmClient::new(LlmConfig {
+            base_url: base.to_string(),
+            api_key: "k".to_string(),
+            default_model: Some("m-a".to_string()),
+            fallback_models: fallbacks.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn model_not_found_falls_back_to_second_model() {
+        let (base, server) = serve(vec![
+            (404, r#"{"error":{"code":"model_not_found"}}"#, None),
+            (
+                200,
+                r#"{"choices":[{"message":{"content":"ok","tool_calls":[]},"finish_reason":"stop"}],"model":"m-b","usage":{"prompt_tokens":2,"completion_tokens":3}}"#,
+                None,
+            ),
+        ]);
+        let client = fallback_client(&base, &["m-b"]);
+        let full = client.chat_full("m-a", &[], &[]).await.unwrap();
+        assert_eq!(full.response.content.as_deref(), Some("ok"));
+        assert_eq!(full.response.model, "m-b");
+        assert_eq!(full.usage.unwrap().prompt_tokens, 2);
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].contains(r#""model":"m-a""#));
+        assert!(seen[1].contains(r#""model":"m-b""#));
+    }
+
+    #[tokio::test]
+    async fn auth_error_never_falls_back() {
+        let (base, server) = serve(vec![(401, "unauthorized", None)]);
+        let client = fallback_client(&base, &["m-b"]);
+        let err = client.chat_full("m-a", &[], &[]).await.unwrap_err();
+        assert_eq!(err.to_string(), "chat failed 401: unauthorized");
+        assert_eq!(
+            err.downcast_ref::<LlmError>().unwrap().kind,
+            LlmErrorKind::Auth
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_exhaustion_returns_last_error_verbatim() {
+        let (base, server) = serve(vec![
+            (
+                404,
+                r#"{"error":{"code":"model_not_found","message":"model a missing"}}"#,
+                None,
+            ),
+            (
+                404,
+                r#"{"error":{"code":"model_not_found","message":"model b missing"}}"#,
+                None,
+            ),
+        ]);
+        let client = fallback_client(&base, &["m-b"]);
+        let err = client.chat_full("m-a", &[], &[]).await.unwrap_err();
+        assert!(err.to_string().contains("model b missing"));
+        assert_eq!(
+            err.downcast_ref::<LlmError>().unwrap().kind,
+            LlmErrorKind::ModelNotFound
+        );
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn generic_404_is_not_a_fallback_trigger() {
+        let (base, server) = serve(vec![(404, r#"{"error":{"code":"unknown"}}"#, None)]);
+        let client = fallback_client(&base, &["m-b"]);
+        let err = client.chat_full("m-a", &[], &[]).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<LlmError>().unwrap().kind,
+            LlmErrorKind::InvalidRequest
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn capabilities_default_to_conservative() {
+        let caps = ChatOnly.capabilities();
+        assert!(!caps.tool_calling);
+        assert!(!caps.streaming);
+        let info = ChatOnly.model_info().await.unwrap();
+        assert_eq!(info.id, "m");
+        assert_eq!(info.capabilities, caps);
     }
 }

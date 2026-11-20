@@ -557,6 +557,7 @@ fn build_runner(cfg: &FileConfig, cwd: &str, mode: Mode, open_store: bool) -> Re
             .as_ref()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
+        fallback_models: Vec::new(),
         timeout_ms: cfg.llm.timeout_ms,
     };
     let client = agentbug_llm::LlmClient::new(llm_cfg)?;

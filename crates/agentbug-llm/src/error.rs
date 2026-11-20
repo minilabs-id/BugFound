@@ -16,6 +16,7 @@ pub enum LlmErrorKind {
     Server,
     Timeout,
     Transport,
+    ModelNotFound,
     Truncated,
     InvalidResponse,
     Config,
@@ -41,6 +42,12 @@ impl LlmErrorKind {
             Self::ContentPolicy
         } else if lower.contains("rate limit") || lower.contains("429") {
             Self::RateLimited
+        } else if lower.contains("model not found")
+            || lower.contains("model_not_found")
+            || lower.contains("unknown model")
+            || lower.contains("does not exist")
+        {
+            Self::ModelNotFound
         } else if lower.contains("finish_reason=length") || lower.contains("cut short") {
             Self::Truncated
         } else if lower.contains("api_key") || lower.contains("base_url") {
@@ -63,8 +70,20 @@ impl LlmErrorKind {
             408 | 425 => Self::Timeout,
             413 => Self::PayloadTooLarge,
             429 => Self::RateLimited,
+            404 => {
+                let lower = body.to_ascii_lowercase();
+                if lower.contains("model_not_found")
+                    || lower.contains("model not found")
+                    || lower.contains("unknown model")
+                    || lower.contains("does not exist")
+                {
+                    Self::ModelNotFound
+                } else {
+                    Self::InvalidRequest
+                }
+            }
             500..=599 => Self::Server,
-            400 | 404 | 422 => {
+            400 | 422 => {
                 let lower = body.to_ascii_lowercase();
                 if lower.contains("context_length_exceeded")
                     || lower.contains("maximum_context_length")
@@ -105,6 +124,7 @@ impl LlmErrorKind {
             Self::ContextOverflow | Self::PayloadTooLarge | Self::Truncated => {
                 Recovery::CompactAndRetry
             }
+            Self::ModelNotFound => Recovery::Fallback,
             Self::Auth
             | Self::ContentPolicy
             | Self::InvalidRequest
@@ -125,6 +145,7 @@ impl LlmErrorKind {
             Self::Server => "server",
             Self::Timeout => "timeout",
             Self::Transport => "transport",
+            Self::ModelNotFound => "model_not_found",
             Self::Truncated => "truncated",
             Self::InvalidResponse => "invalid_response",
             Self::Config => "config",
@@ -200,6 +221,12 @@ mod tests {
             LlmErrorKind::from_status(404, r#"{"error":{"code":"unknown"}}"#),
             LlmErrorKind::InvalidRequest
         );
+        assert_eq!(
+            LlmErrorKind::from_status(404, r#"{"error":{"code":"model_not_found"}}"#),
+            LlmErrorKind::ModelNotFound
+        );
+        assert_eq!(LlmErrorKind::ModelNotFound.recovery(), Recovery::Fallback);
+        assert!(!LlmErrorKind::ModelNotFound.retryable());
     }
 
     #[test]

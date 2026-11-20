@@ -767,6 +767,7 @@ async fn run_engagement(
             base_url,
             api_key: key.clone(),
             default_model: model,
+            fallback_models: Vec::new(),
             timeout_ms: 60_000,
         })?),
         None => None,

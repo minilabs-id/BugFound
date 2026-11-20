@@ -72,8 +72,12 @@ Exit evidence: 222 tests green, fmt/clippy `-D warnings` green.
 - ✅ 8 new tests; 230 tests green, fmt/clippy clean.
 
 ### R3c — Remaining core maturity (DEFERRED, each needs its own review)
-1. Capability descriptors + model routing/fallback — adapter-only, needs local
-   HTTP fixture tests before core consumes it.
+1. ✅ (adapter-only) `ModelCapabilities` / `ModelDescriptor` with conservative
+   defaults, `LlmConfig.fallback_models`, typed `ModelNotFound` mapped to
+   `Recovery::Fallback`, and an outer candidate loop in `LlmClient::chat_full`.
+   Five local `TcpListener` fixture tests cover fallback, no-fallback-on-auth,
+   verbatim exhaustion errors and generic-404 handling. Core is untouched; the
+   config file does not yet expose `fallback_models`.
 2. ✅ (partial) `tool_calls` table, host-risk consistency and explicit
    `session.finish` terminal tool. Intercepted in deferred, approval-resume and
    main-loop paths; still checks goal lock and stop before committing; exempt

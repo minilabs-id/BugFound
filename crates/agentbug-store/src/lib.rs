@@ -347,6 +347,19 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS idx_tool_calls_session_sig
                ON tool_calls(session_id, name, args_sig, created_at);
+             CREATE TABLE IF NOT EXISTS memory_items(
+               id TEXT PRIMARY KEY, session_id TEXT NOT NULL, parent_session_id TEXT,
+               source_kind TEXT NOT NULL, source_id TEXT NOT NULL, source_event_hash TEXT,
+               role TEXT, task_id TEXT, scope_key TEXT NOT NULL, tier TEXT NOT NULL,
+               content TEXT NOT NULL, sha256 TEXT NOT NULL, created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_memory_scope
+               ON memory_items(session_id, scope_key, tier, created_at);
+             CREATE TABLE IF NOT EXISTS session_results(
+               session_id TEXT PRIMARY KEY, parent_session_id TEXT, parent_tool_call_id TEXT,
+               role TEXT NOT NULL, status TEXT NOT NULL, payload_json TEXT NOT NULL,
+               sha256 TEXT NOT NULL, created_at TEXT NOT NULL
+             );
              CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
              CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
              CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id);
@@ -3256,6 +3269,167 @@ impl Store {
     }
 }
 
+/// Provenance-bearing memory row. `role` and `scope_key` are opaque to the
+/// kernel; the domain owns their meaning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryItem {
+    pub id: String,
+    pub session_id: String,
+    pub parent_session_id: Option<String>,
+    pub source_kind: String,
+    pub source_id: String,
+    pub source_event_hash: Option<String>,
+    pub role: Option<String>,
+    pub task_id: Option<String>,
+    pub scope_key: String,
+    pub tier: String,
+    pub content: String,
+    pub sha256: String,
+    pub created_at: String,
+}
+
+/// Input for [`Store::add_memory`], grouped to keep the method signature small.
+pub struct MemoryWrite<'a> {
+    pub session_id: &'a str,
+    pub parent_session_id: Option<&'a str>,
+    pub source_kind: &'a str,
+    pub source_id: &'a str,
+    pub source_event_hash: Option<&'a str>,
+    pub role: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+    pub scope_key: &'a str,
+    pub tier: &'a str,
+    pub content: &'a str,
+}
+
+impl Store {
+    pub fn add_memory(&self, item: MemoryWrite<'_>) -> Result<String> {
+        let MemoryWrite {
+            session_id,
+            parent_session_id,
+            source_kind,
+            source_id,
+            source_event_hash,
+            role,
+            task_id,
+            scope_key,
+            tier,
+            content,
+        } = item;
+        let id = Uuid::new_v4().to_string();
+        let digest = sha256_hex(content);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO memory_items(id, session_id, parent_session_id, source_kind,
+             source_id, source_event_hash, role, task_id, scope_key, tier, content, sha256, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                id, session_id, parent_session_id, source_kind, source_id,
+                source_event_hash, role, task_id, scope_key, tier, content, digest, now()
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Scope-gated retrieval: rows from another goal digest are never returned.
+    pub fn list_memory(
+        &self,
+        session_id: &str,
+        scope_key: &str,
+        tier: &str,
+        role: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<MemoryItem>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, parent_session_id, source_kind, source_id,
+                    source_event_hash, role, task_id, scope_key, tier, content, sha256, created_at
+             FROM memory_items
+             WHERE session_id=?1 AND scope_key=?2 AND tier=?3
+               AND (?4 IS NULL OR role=?4)
+             ORDER BY rowid DESC LIMIT ?5",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, scope_key, tier, role, limit], |row| {
+                Ok(MemoryItem {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    parent_session_id: row.get(2)?,
+                    source_kind: row.get(3)?,
+                    source_id: row.get(4)?,
+                    source_event_hash: row.get(5)?,
+                    role: row.get(6)?,
+                    task_id: row.get(7)?,
+                    scope_key: row.get(8)?,
+                    tier: row.get(9)?,
+                    content: row.get(10)?,
+                    sha256: row.get(11)?,
+                    created_at: row.get(12)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn verify_memory_hashes(&self, session_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT sha256, content FROM memory_items WHERE session_id=?1")?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .all(|(digest, content)| digest == sha256_hex(&content)))
+    }
+
+    pub fn put_session_result(
+        &self,
+        session_id: &str,
+        parent_session_id: Option<&str>,
+        parent_tool_call_id: Option<&str>,
+        role: &str,
+        status: &str,
+        payload_json: &str,
+    ) -> Result<()> {
+        let digest = sha256_hex(payload_json);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO session_results(session_id, parent_session_id, parent_tool_call_id,
+             role, status, payload_json, sha256, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(session_id) DO UPDATE SET
+               parent_session_id=excluded.parent_session_id,
+               parent_tool_call_id=excluded.parent_tool_call_id,
+               role=excluded.role, status=excluded.status,
+               payload_json=excluded.payload_json, sha256=excluded.sha256",
+            params![
+                session_id,
+                parent_session_id,
+                parent_tool_call_id,
+                role,
+                status,
+                payload_json,
+                digest,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_session_result(&self, session_id: &str) -> Result<Option<(String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT role, status, payload_json FROM session_results WHERE session_id=?1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4729,5 +4903,77 @@ mod tests {
             .recent_echoable_results_for_signature("s", "echo", "sig", 8)
             .unwrap();
         assert_eq!(results, vec!["B".to_string(), "A".to_string()]);
+    }
+
+    #[test]
+    fn memory_items_are_scope_gated_and_hash_verified() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .add_memory(MemoryWrite {
+                session_id: "s",
+                parent_session_id: None,
+                source_kind: "tool_call",
+                source_id: "t1",
+                source_event_hash: None,
+                role: Some("research"),
+                task_id: None,
+                scope_key: "scope-a",
+                tier: "episodic",
+                content: "fact-a",
+            })
+            .unwrap();
+        store
+            .add_memory(MemoryWrite {
+                session_id: "s",
+                parent_session_id: None,
+                source_kind: "tool_call",
+                source_id: "t2",
+                source_event_hash: None,
+                role: Some("testing"),
+                task_id: None,
+                scope_key: "scope-b",
+                tier: "episodic",
+                content: "fact-b",
+            })
+            .unwrap();
+        let scoped = store
+            .list_memory("s", "scope-a", "episodic", None, 8)
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].content, "fact-a");
+        let role_scoped = store
+            .list_memory("s", "scope-a", "episodic", Some("testing"), 8)
+            .unwrap();
+        assert!(role_scoped.is_empty());
+        assert!(store.verify_memory_hashes("s").unwrap());
+    }
+
+    #[test]
+    fn session_result_is_upserted_once_per_child() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .put_session_result(
+                "child",
+                Some("parent"),
+                Some("call-1"),
+                "verification",
+                "ok",
+                "{\"verdict\":\"confirmed\"}",
+            )
+            .unwrap();
+        store
+            .put_session_result(
+                "child",
+                Some("parent"),
+                Some("call-1"),
+                "verification",
+                "ok",
+                "{\"verdict\":\"ruled_out\"}",
+            )
+            .unwrap();
+        let (role, status, payload) = store.get_session_result("child").unwrap().unwrap();
+        assert_eq!(role, "verification");
+        assert_eq!(status, "ok");
+        assert!(payload.contains("ruled_out"));
     }
 }

@@ -91,12 +91,21 @@ Exit evidence: 222 tests green, fmt/clippy `-D warnings` green.
 
 R3c is now complete except the explicitly deferred JSON Schema item. R4 may proceed.
 
-### R4 — Multi-agent & memory (10–14 days)
-- Role profiles with tool allowlists; General + ProgramIntel + Recon + Research + Testing + Verification + Report.
-- Synchronous child-session handoff with typed result and lineage.
-- Working/episodic/semantic memory over SQLite with provenance + scope-gated retrieval.
+### R4a — Multi-agent & memory foundation (COMPLETE, 2026-11-20)
+- ✅ `memory_items` and `session_results` tables with provenance fields,
+  scope-gated retrieval, hash verification and typed child results.
+- ✅ `agentbug-engagement::roles` with 7 domain-owned role profiles and
+  `build_role_tools` (role filtering is a second layer over ROE filtering and
+  preserves host-owned risk).
+- ✅ `BountyDomain` carries an opaque `RoleId` and composes the role addendum
+  into its prompt through the existing `PromptContributor` port.
 
-Exit: one goal delegated to ≥2 roles; recalled memory provenance visible in replay.
+Deferred to R4b: `HandoffTool` / `RoleResultTool` / `MemoryRecallTool` and the
+episodic write path; one-goal-multi-role integration test. Semantic tier stays
+off by default (SQLite only, no embeddings).
+
+Exit (R4b): one goal delegated to ≥2 roles; recalled memory provenance visible
+in replay.
 
 ### R5 — Domain depth (10–14 days)
 - Program intelligence: typed assets, scope versions, VRT/safe-harbor/status, source-linked rules.

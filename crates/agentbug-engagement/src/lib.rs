@@ -14,8 +14,10 @@
 //! `*_at` variants.
 
 pub mod domain;
+pub mod roles;
 
 pub use domain::{prioritize_targets, BountyDomain};
+pub use roles::{build_role_tools, role_profile, RoleId};
 
 use agentbug_core::{build_policy_config, AgentConfig, Runner};
 use agentbug_llm::{ChatMessage, ChatResponse, Llm, LlmClient, LlmConfig};
@@ -954,7 +956,10 @@ async fn run_engagement(
         });
         let scope_summary = policy.scope_summary();
         let runner = Runner::new(store.clone(), runner_llm.clone(), tools, policy, agent)
-            .with_domain(Arc::new(BountyDomain { scope_summary }));
+            .with_domain(Arc::new(BountyDomain {
+                scope_summary,
+                role: RoleId::General,
+            }));
         let goal = format!(
             "engagement_id={id}\n{}\n\nScope reminder: {scope_reminder}\n\
              Use the available tools to gather evidence. Return findings and evidence in your final answer. \

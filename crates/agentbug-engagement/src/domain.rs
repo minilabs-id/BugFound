@@ -11,10 +11,13 @@ use agentbug_tools::ToolResult;
 use serde_json::Value;
 use std::collections::HashSet;
 
+use crate::roles::{role_profile, RoleId};
+
 /// Domain adapter supplied to the kernel Runner by engagement orchestration.
 #[derive(Debug, Clone)]
 pub struct BountyDomain {
     pub scope_summary: Option<String>,
+    pub role: RoleId,
 }
 
 impl GoalLock for BountyDomain {
@@ -25,12 +28,16 @@ impl GoalLock for BountyDomain {
 
 impl PromptContributor for BountyDomain {
     fn additional_system_prompt(&self) -> Option<String> {
-        Some(match &self.scope_summary {
+        let scope = match &self.scope_summary {
             Some(summary) => {
                 format!("Engagement scope: {summary}. Never probe out-of-scope targets.")
             }
             None => "Never probe out-of-scope targets.".to_string(),
-        })
+        };
+        Some(format!(
+            "{scope} {}",
+            role_profile(self.role).system_addendum
+        ))
     }
 }
 

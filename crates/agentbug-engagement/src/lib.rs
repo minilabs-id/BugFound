@@ -3937,7 +3937,7 @@ No DoS testing. Do not modify data. No disclosure.
         let report = build_canonical_report(
             &store,
             ReportContext {
-                workspace: std::path::Path::new("."),
+                workspace: std::path::Path::new(&temp_db("r14-report-workspace")),
                 engagement_id: "e",
             },
             &profile,

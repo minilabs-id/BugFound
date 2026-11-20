@@ -1,2 +1,0 @@
-GET /?q=1 HTTP/1.1HTTP/1.1 200 OK
-content: agentbug-canary-bf224bfc11710eeee7e117f5c719072e4672874466a2184b85daedc3e244324bagentbug-canary-bf224bfc11710eeee7e117f5c719072e4672874466a2184b85daedc3e244324b

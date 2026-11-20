@@ -11,3 +11,6 @@ __pycache__/
 
 # Local research clones (third-party repos); not part of AgentBug source.
 /research/
+
+# Evidence artifacts are generated under the engagement workspace, never in source.
+**/evidence/*.bin

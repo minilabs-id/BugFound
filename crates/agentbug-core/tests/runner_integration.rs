@@ -2279,3 +2279,107 @@ async fn enqueue_prompt_admits_durable_item_and_rings_doorbell() {
         Some(agentbug_core::execution::WakeScope::Steer)
     );
 }
+
+struct NeedyTool {
+    attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for NeedyTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "needy".to_string(),
+            description: String::new(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"needle": {"type": "string"}},
+                "required": ["needle"]
+            }),
+            risk: "safe".to_string(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let n = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if input.get("needle").and_then(|v| v.as_str()).is_none() {
+            return Err(anyhow::anyhow!("missing field `needle`"));
+        }
+        Ok(ToolResult {
+            ok: true,
+            output: format!("attempt-{n}"),
+            structured: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn args_error_hints_next_step_without_extra_model_call() {
+    let store = Store::open(":memory:").unwrap();
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let llm = Arc::new(MockLlm::new(
+        "m",
+        vec![
+            ChatResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "b1".to_string(),
+                    name: "needy".to_string(),
+                    arguments: json!({}),
+                }],
+                model: "m".to_string(),
+            },
+            ChatResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "g1".to_string(),
+                    name: "needy".to_string(),
+                    arguments: json!({"needle": "fixed"}),
+                }],
+                model: "m".to_string(),
+            },
+            ChatResponse {
+                content: Some("done".to_string()),
+                tool_calls: vec![],
+                model: "m".to_string(),
+            },
+        ],
+    ));
+    let mut tools = ToolRegistry::new();
+    tools.register_with_host_risk(
+        Arc::new(NeedyTool {
+            attempts: attempts.clone(),
+        }),
+        "safe",
+    );
+    let runner = Runner::new(
+        store.clone(),
+        llm.clone(),
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            max_steps: 6,
+            ..Default::default()
+        },
+    );
+    runner.run_goal("repair").await.unwrap();
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(
+        llm.responses.lock().unwrap().is_empty(),
+        "script fully consumed once per step"
+    );
+    let session = &store.list_sessions(10).unwrap()[0].id;
+    let events = store.list_events(session, 50).unwrap();
+    assert!(events.iter().any(|e| e.kind == "tool.args_repair_hint"));
+    let text = store
+        .list_messages(session)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("attempt-2"));
+}

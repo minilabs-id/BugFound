@@ -208,8 +208,16 @@ Other oracle classes remain `open_proof_gap` (no implementation exists).
 - ✅ `Scope`-aware coalesced doorbell: `WakeScope::{Steer, Input}` with widening,
   consumed by `Runner` at each step boundary; `Runner::enqueue_prompt` admits a
   durable inbox item and rings it. Docs updated (no longer claimed unwired).
-- Deferred: one-shot arg repair (needs typed tool errors; must not break one
-  LLM call per step).
+- ✅ Arg repair resolved safely: an in-step second LLM call was implemented,
+  then reviewed and reverted. It re-ran a side-effecting tool with arguments
+  that never passed schema/policy/scope/budget/approval gates, permanently
+  poisoned a durable one-shot flag on transient failure, consumed scripted
+  responses in mocks, and made the transcript describe args that never ran.
+  The shipped behavior instead emits an additive `tool.args_repair_hint`
+  event naming required fields; the model sees the existing `ok=false` tool
+  result and self-corrects on the next step, preserving one LLM call per step
+  and every gate. Test `args_error_hints_next_step_without_extra_model_call`
+  proves correction without an extra model call.
 
 #### R8 — Later
 - Measured results from real local engagements N>=3 + baseline lane.

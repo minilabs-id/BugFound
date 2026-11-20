@@ -386,6 +386,24 @@ impl Default for AgentConfig {
     }
 }
 
+/// Advisory classifier for tool errors that look like bad arguments. It is
+/// only used to emit a corrective hint event; it never triggers a second tool
+/// run or a second model call, so a false positive cannot bypass a gate.
+fn is_args_error(error: &anyhow::Error) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    if text.starts_with("invalid tool schema") || text.contains("error decoding response body") {
+        return false;
+    }
+    [
+        "missing field",
+        "invalid type",
+        "unknown field",
+        "deserialize",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum TerminalOutcome {
     NotTerminal,
@@ -1496,6 +1514,30 @@ impl Runner {
                 let _ = self
                     .store
                     .finish_tool_call(&row, "error", Some(false), Some(&text));
+                if is_args_error(err) {
+                    // The model already receives `ok=false error=...` as the
+                    // tool result and reloads history on the next step. This
+                    // additive event only names the required fields; it never
+                    // executes a second tool call or a second LLM call.
+                    let required: Vec<String> = spec
+                        .input_schema
+                        .get("required")
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|v| v.as_str())
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.log_event(
+                        session_id,
+                        "info",
+                        "tool.args_repair_hint",
+                        &format!("tool={} required={}", spec.name, required.join(",")),
+                    );
+                }
             }
         }
         outcome

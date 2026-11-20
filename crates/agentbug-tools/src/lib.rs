@@ -135,19 +135,47 @@ pub trait Tool: Send + Sync {
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// Host-owned classification frozen at registration. `ToolSpec.risk` is a
+    /// tool-supplied hint and must never decide a security action on its own.
+    host_risk: BTreeMap<String, String>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: BTreeMap::new(),
+            host_risk: BTreeMap::new(),
         }
     }
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.spec().name.clone(), tool);
+        let spec = tool.spec();
+        self.host_risk.insert(spec.name.clone(), spec.risk.clone());
+        self.tools.insert(spec.name, tool);
     }
+
+    /// Register with an explicit host classification (config/plugin paths).
+    /// The tool's self-reported `risk` is ignored.
+    pub fn register_with_host_risk(&mut self, tool: Arc<dyn Tool>, risk: impl Into<String>) {
+        let name = tool.spec().name;
+        self.host_risk.insert(name.clone(), risk.into());
+        self.tools.insert(name, tool);
+    }
+
+    /// Classification decided by the host, not by the tool descriptor.
+    pub fn host_risk(&self, name: &str) -> &str {
+        self.host_risk
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    }
+
     pub fn register_alias(&mut self, name: impl Into<String>, tool: Arc<dyn Tool>) {
         let name = name.into();
+        let risk = self
+            .host_risk
+            .get(&tool.spec().name)
+            .cloned()
+            .unwrap_or_else(|| tool.spec().risk);
         struct AliasTool {
             name: String,
             inner: Arc<dyn Tool>,
@@ -163,6 +191,7 @@ impl ToolRegistry {
                 self.inner.run(input).await
             }
         }
+        self.host_risk.insert(name.clone(), risk);
         self.tools
             .insert(name.clone(), Arc::new(AliasTool { name, inner: tool }));
     }
@@ -3094,7 +3123,7 @@ pub struct ReportInput {
 pub fn render_canonical_report(input: &ReportInput) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "# {} — Security Assessment Report\n\n",
+        "# {} â€” Security Assessment Report\n\n",
         input.engagement
     ));
 
@@ -4022,7 +4051,7 @@ mod tests {
 
     #[test]
     fn truncate_handles_multibyte_boundaries() {
-        let s = "é".repeat(MAX_OUTPUT_BYTES + 8);
+        let s = "Ã©".repeat(MAX_OUTPUT_BYTES + 8);
         let out = truncate(&s);
         assert!(out.ends_with("\n...[truncated]"));
         assert!(out.is_char_boundary(out.len() - "\n...[truncated]".len()));
@@ -4597,7 +4626,7 @@ mod tests {
         };
         let markdown = render_canonical_report(&input);
         for section in [
-            "# Acme Spring 2026 — Security Assessment Report",
+            "# Acme Spring 2026 â€” Security Assessment Report",
             "## Executive Summary",
             "## Scope & ROE",
             "## Methodology",
@@ -5505,4 +5534,37 @@ pub fn redact_secrets(input: &str) -> String {
 }
 pub fn redact_text(input: &str) -> String {
     redact(input)
+}
+
+#[cfg(test)]
+mod host_risk_tests {
+    use super::*;
+
+    #[test]
+    fn registry_host_risk_is_frozen_at_registration() {
+        struct Forged;
+        #[async_trait]
+        impl Tool for Forged {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "forged".to_string(),
+                    description: String::new(),
+                    input_schema: json!({"type":"object"}),
+                    risk: "safe".to_string(),
+                }
+            }
+            async fn run(&self, _input: Value) -> Result<ToolResult> {
+                Ok(ToolResult {
+                    ok: true,
+                    output: "ok".to_string(),
+                    structured: None,
+                })
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register_with_host_risk(Arc::new(Forged), "network-write");
+        assert_eq!(registry.host_risk("forged"), "network-write");
+        assert_eq!(registry.specs()[0].risk, "safe");
+    }
 }

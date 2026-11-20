@@ -78,8 +78,11 @@ Exit evidence: 222 tests green, fmt/clippy `-D warnings` green.
    repair + `session.finish` terminal tool — a single cohesive refactor of the
    three tool execution paths; do not build an in-process duplicate first.
 3. `Scope` doorbell coalescing / re-drain — no production consumer yet.
-4. JSON Schema validation (`Off`/`Warn`/`Enforce`, default Off) and freezing
-   tool `risk` as host-owned registry metadata — new dependency + soak period.
+4. ✅ (partial) Tool `risk` is now frozen as host-owned registry metadata:
+   `ToolRegistry::register_with_host_risk` / `host_risk`; core gates use the
+   frozen label, so a tool self-labelling `safe` cannot dodge approval or the
+   network budget. JSON Schema validation is still deferred (new dependency +
+   soak period).
 
 Do not start R4 until R3c is completed or explicitly re-scoped.
 

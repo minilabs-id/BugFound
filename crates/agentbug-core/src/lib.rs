@@ -595,12 +595,15 @@ impl Runner {
     }
 
     fn is_network_tool(spec: &agentbug_tools::ToolSpec) -> bool {
-        // `exec` is a local shell risk, not a network call: counting it here
-        // would wrongly charge shell tools against the network budget.
-        matches!(
-            spec.risk.as_str(),
-            "network" | "network-write" | "intrusive"
-        ) || spec.name.contains("http")
+        Self::is_network_tool_with_risk(spec, &spec.risk)
+    }
+
+    /// Network classification uses the host-owned risk label, never the
+    /// tool-supplied hint, so a self-labelled `safe` tool cannot dodge the
+    /// network budget or its approval gate.
+    fn is_network_tool_with_risk(spec: &agentbug_tools::ToolSpec, risk: &str) -> bool {
+        matches!(risk, "network" | "network-write" | "intrusive" | "unknown")
+            || spec.name.contains("http")
             || spec.name.contains("dns")
             || spec.name.contains("scan")
     }
@@ -618,7 +621,7 @@ impl Runner {
                 spec.name
             ));
         }
-        if Self::is_network_tool(spec) {
+        if Self::is_network_tool_with_risk(spec, self.tools.host_risk(&spec.name)) {
             let max_network = self.effective_max_network_calls();
             if max_network > 0 && usage.network_calls_used >= max_network {
                 return Some(format!(
@@ -699,8 +702,8 @@ impl Runner {
             return false;
         }
         let dangerous = matches!(
-            spec.risk.as_str(),
-            "exec" | "intrusive" | "network-write" | "destructive"
+            self.tools.host_risk(&spec.name),
+            "exec" | "intrusive" | "network-write" | "destructive" | "unknown"
         );
         if dangerous && !self.agent.auto_approve_all {
             return false;
@@ -744,7 +747,7 @@ impl Runner {
 
         let (mut decision, reason) = self.policy.evaluate(&ActionRequest {
             tool: spec.name.clone(),
-            risk: spec.risk.clone(),
+            risk: self.tools.host_risk(&spec.name).to_string(),
             target: target.map(str::to_string),
         });
         if decision == Decision::Deny {
@@ -1830,7 +1833,7 @@ impl Runner {
                                 session_id: session_id.to_string(),
                                 tool_name: spec.name.clone(),
                                 args_json: args_str.clone(),
-                                risk: spec.risk.clone(),
+                                risk: self.tools.host_risk(&spec.name).to_string(),
                                 status: "pending".to_string(),
                                 reason: Some(reason.clone()),
                                 created_at: now_ts.to_rfc3339(),

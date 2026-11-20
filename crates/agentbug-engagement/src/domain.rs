@@ -6,7 +6,7 @@
 use agentbug_kernel_traits::{
     digest_goal_and_context, GoalLock, ProgressObserver, PromptContributor, ToolResultSink,
 };
-use agentbug_store::{domain_progress_count, persist_tool_result, Hypothesis, Store};
+use agentbug_store::{domain_progress_count, persist_tool_result, Hypothesis, MemoryWrite, Store};
 use agentbug_tools::ToolResult;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -18,6 +18,9 @@ use crate::roles::{role_profile, RoleId};
 pub struct BountyDomain {
     pub scope_summary: Option<String>,
     pub role: RoleId,
+    pub scope_key: String,
+    pub parent_session_id: Option<String>,
+    pub task_id: Option<String>,
 }
 
 impl GoalLock for BountyDomain {
@@ -51,6 +54,30 @@ impl ToolResultSink for BountyDomain {
         result: &ToolResult,
     ) {
         persist_tool_result(store, session_id, tool_name, args, result);
+        if !result.ok || tool_name.starts_with("memory.") || tool_name.starts_with("role.") {
+            return;
+        }
+        let raw = format!("tool={tool_name} args={} result={}", args, result.output);
+        let content = agentbug_store::redact(&raw)
+            .chars()
+            .take(4096)
+            .collect::<String>();
+        let anchor = store
+            .list_events(session_id, 1)
+            .ok()
+            .and_then(|events| events.first().map(|event| event.hash.clone()));
+        let _ = store.add_memory(MemoryWrite {
+            session_id,
+            parent_session_id: self.parent_session_id.as_deref(),
+            source_kind: "tool_result",
+            source_id: tool_name,
+            source_event_hash: anchor.as_deref(),
+            role: Some(self.role.as_str()),
+            task_id: self.task_id.as_deref(),
+            scope_key: &self.scope_key,
+            tier: "episodic",
+            content: &content,
+        });
     }
 }
 

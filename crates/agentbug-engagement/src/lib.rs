@@ -14,9 +14,11 @@
 //! `*_at` variants.
 
 pub mod domain;
+pub mod handoff;
 pub mod roles;
 
 pub use domain::{prioritize_targets, BountyDomain};
+pub use handoff::{HandoffTool, MemoryRecallTool, RoleResultTool};
 pub use roles::{build_role_tools, role_profile, RoleId};
 
 use agentbug_core::{build_policy_config, AgentConfig, Runner};
@@ -942,7 +944,7 @@ async fn run_engagement(
         // TC-4: FullAuto no longer implicitly trusts intrusive/network-write
         // tools. Every such tool is denied by name unless the operator opted in.
         let denied_tools = default_denied_tools(&tools, &options);
-        let policy = build_policy_config(PolicyConfig {
+        let policy_config = PolicyConfig {
             mode: options.mode,
             deny_destructive: true,
             scope: profile.scope.clone(),
@@ -953,12 +955,31 @@ async fn run_engagement(
                 ..BudgetConfig::default()
             },
             ..PolicyConfig::default()
-        });
+        };
+        let policy = build_policy_config(policy_config.clone());
         let scope_summary = policy.scope_summary();
-        let runner = Runner::new(store.clone(), runner_llm.clone(), tools, policy, agent)
+        let base_tools = tools.clone();
+        let mut root_tools = tools;
+        root_tools.register_with_host_risk(
+            Arc::new(HandoffTool {
+                store: store.clone(),
+                llm: runner_llm.clone(),
+                base_tools,
+                policy_config,
+                agent: agent.clone(),
+                scope_summary: scope_summary.clone(),
+                engagement_marker: format!("engagement_id={id}"),
+                memory_scope_key: format!("engagement={id}"),
+            }),
+            "network",
+        );
+        let runner = Runner::new(store.clone(), runner_llm.clone(), root_tools, policy, agent)
             .with_domain(Arc::new(BountyDomain {
                 scope_summary,
                 role: RoleId::General,
+                scope_key: format!("engagement={id}"),
+                parent_session_id: None,
+                task_id: Some(task.id.clone()),
             }));
         let goal = format!(
             "engagement_id={id}\n{}\n\nScope reminder: {scope_reminder}\n\

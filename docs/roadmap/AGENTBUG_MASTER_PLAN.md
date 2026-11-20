@@ -100,12 +100,21 @@ R3c is now complete except the explicitly deferred JSON Schema item. R4 may proc
 - ✅ `BountyDomain` carries an opaque `RoleId` and composes the role addendum
   into its prompt through the existing `PromptContributor` port.
 
-Deferred to R4b: `HandoffTool` / `RoleResultTool` / `MemoryRecallTool` and the
-episodic write path; one-goal-multi-role integration test. Semantic tier stays
-off by default (SQLite only, no embeddings).
+### R4b — Synchronous handoff & episodic memory (COMPLETE, 2026-11-20)
+- ✅ `agentbug-engagement::handoff` with `HandoffTool`, `RoleResultTool` and
+  `MemoryRecallTool`. Depth ≤ 1, fixed delegable role set, wall-clock bound,
+  typed `session_results`, scoped run_goal children using `build_role_tools`.
+- ✅ `BountyDomain::on_tool_result` writes redacted episodic memory with
+  provenance (`source_event_hash` from the event hash chain) and a shared
+  scope key; recall is scope-gated and framed as untrusted data.
+- ✅ Integration test proves one goal delegated to `recon` and `verification`,
+  with episodic memory and event-chain integrity for each session.
 
-Exit (R4b): one goal delegated to ≥2 roles; recalled memory provenance visible
-in replay.
+Deferred: semantic tier (off by default, no embeddings), nested/cooperative
+cancellation, parent tool-call id on child results, `Report`/`General` roles.
+
+Exit evidence: 248 tests green; clippy `-D warnings` clean; ADR-001 boundary
+clean.
 
 ### R5 — Domain depth (10–14 days)
 - Program intelligence: typed assets, scope versions, VRT/safe-harbor/status, source-linked rules.

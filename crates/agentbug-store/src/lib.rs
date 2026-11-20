@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -330,6 +332,13 @@ impl Store {
                finding_id TEXT PRIMARY KEY, request_bytes BLOB NOT NULL,
                response_bytes BLOB NOT NULL, canary TEXT NOT NULL, created_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS session_inbox(
+               id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL,
+               delivery TEXT NOT NULL, payload_json TEXT NOT NULL,
+               state TEXT NOT NULL, created_at TEXT NOT NULL, enqueued_seq INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_session_inbox_session
+               ON session_inbox(session_id, state, enqueued_seq);
              CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
              CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
              CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id);
@@ -379,7 +388,9 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_reports_engagement ON reports(engagement_id);
              CREATE INDEX IF NOT EXISTS idx_trace_events_engagement ON trace_events(engagement_id);
              INSERT OR IGNORE INTO schema_version(version, applied_at)
-               VALUES(1, strftime('%Y-%m-%dT%H:%M:%SZ','now'));",
+               VALUES(1, strftime('%Y-%m-%dT%H:%M:%SZ','now'));
+             INSERT OR IGNORE INTO schema_version(version, applied_at)
+               VALUES(2, strftime('%Y-%m-%dT%H:%M:%SZ','now'));",
         )?;
         // best-effort migrations
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT", []);
@@ -407,6 +418,10 @@ impl Store {
         let _ = conn.execute("ALTER TABLE evidence ADD COLUMN request_bytes BLOB", []);
         let _ = conn.execute("ALTER TABLE evidence ADD COLUMN response_bytes BLOB", []);
         let _ = conn.execute("ALTER TABLE evidence ADD COLUMN artifact_bytes BLOB", []);
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN resume_attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -2846,6 +2861,276 @@ pub fn domain_progress_count(store: &Store, session_id: &str) -> usize {
     confirmed_findings + assets + artifacts
 }
 
+/// A durable inbox item. The in-memory `Inbox` remains a compatibility source;
+/// this row is authoritative for callers that need delivery to survive restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInboxItem {
+    pub id: String,
+    pub session_id: String,
+    pub kind: String,
+    pub delivery: String,
+    pub payload_json: String,
+    pub state: String,
+    pub created_at: String,
+    pub enqueued_seq: i64,
+}
+
+fn inbox_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInboxItem> {
+    Ok(SessionInboxItem {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        kind: row.get(2)?,
+        delivery: row.get(3)?,
+        payload_json: row.get(4)?,
+        state: row.get(5)?,
+        created_at: row.get(6)?,
+        enqueued_seq: row.get(7)?,
+    })
+}
+
+impl Store {
+    /// First admission wins: a retry with the same id is ignored entirely.
+    pub fn enqueue_inbox(
+        &self,
+        id: &str,
+        session_id: &str,
+        kind: &str,
+        delivery: &str,
+        payload_json: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let seq: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(enqueued_seq), 0) + 1 FROM session_inbox WHERE session_id=?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO session_inbox
+             (id, session_id, kind, delivery, payload_json, state, created_at, enqueued_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7)",
+            params![id, session_id, kind, delivery, payload_json, now(), seq],
+        )?;
+        Ok(conn.changes() > 0)
+    }
+
+    /// Promote the next item: controls first, then steer-delivery, then queued
+    /// items when `include_queue` is true. Promotion is non-consuming.
+    pub fn promote_inbox(
+        &self,
+        session_id: &str,
+        include_queue: bool,
+    ) -> Result<Option<SessionInboxItem>> {
+        let conn = self.conn.lock().unwrap();
+        let found: Option<SessionInboxItem> = conn
+            .query_row(
+                "SELECT id, session_id, kind, delivery, payload_json, state, created_at, enqueued_seq
+                 FROM session_inbox
+                 WHERE session_id=?1 AND state='pending'
+                   AND (?2=1 OR kind='control' OR delivery='steer')
+                 ORDER BY CASE kind WHEN 'control' THEN 0 ELSE 1 END ASC,
+                          CASE delivery WHEN 'steer' THEN 0 ELSE 1 END ASC,
+                          enqueued_seq ASC
+                 LIMIT 1",
+                params![session_id, include_queue as i64],
+                inbox_item_from_row,
+            )
+            .optional()?;
+        if let Some(item) = &found {
+            conn.execute(
+                "UPDATE session_inbox SET state='steered' WHERE id=?1 AND state='pending'",
+                params![item.id],
+            )?;
+        }
+        Ok(found)
+    }
+
+    /// Atomically deliver: mark consumed and insert the visible message in one
+    /// transaction. A second delivery of the same id is a no-op.
+    pub fn deliver_inbox(
+        &self,
+        id: &str,
+        visible: Option<(&str, &str)>,
+    ) -> Result<Option<SessionInboxItem>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let item: Option<SessionInboxItem> = tx
+            .query_row(
+                "SELECT id, session_id, kind, delivery, payload_json, state, created_at, enqueued_seq
+                 FROM session_inbox WHERE id=?1 AND state IN ('pending','steered')",
+                params![id],
+                inbox_item_from_row,
+            )
+            .optional()?;
+        let Some(item) = item else {
+            return Ok(None);
+        };
+        if let Some((role, content)) = visible {
+            tx.execute(
+                "INSERT INTO messages(id, session_id, role, content, tool_call_id, tool_calls_json, name)
+                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL)",
+                params![Uuid::new_v4().to_string(), item.session_id, role, content],
+            )?;
+        }
+        tx.execute(
+            "UPDATE session_inbox SET state='delivered' WHERE id=?1",
+            params![id],
+        )?;
+        tx.commit()?;
+        Ok(Some(item))
+    }
+
+    pub fn cancel_inbox(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE session_inbox SET state='cancelled'
+             WHERE id=?1 AND state IN ('pending','steered')",
+            params![id],
+        )?;
+        Ok(conn.changes() > 0)
+    }
+
+    pub fn resteer_inbox(&self, id: &str, delivery: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE session_inbox SET delivery=?2, state='pending'
+             WHERE id=?1 AND state IN ('pending','steered')",
+            params![id, delivery],
+        )?;
+        Ok(conn.changes() > 0)
+    }
+
+    pub fn list_pending_inbox(&self, session_id: &str) -> Result<Vec<SessionInboxItem>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, kind, delivery, payload_json, state, created_at, enqueued_seq
+             FROM session_inbox
+             WHERE session_id=?1 AND state IN ('pending','steered')
+             ORDER BY enqueued_seq ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id], inbox_item_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn resume_attempt(&self, session_id: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COALESCE(resume_attempts, 0) FROM sessions WHERE id=?1",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
+    }
+
+    pub fn increment_resume_attempt(&self, session_id: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET resume_attempts=COALESCE(resume_attempts,0)+1 WHERE id=?1",
+            params![session_id],
+        )?;
+        Ok(conn.query_row(
+            "SELECT COALESCE(resume_attempts, 0) FROM sessions WHERE id=?1",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
+    }
+
+    pub fn reset_resume_attempt(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET resume_attempts=0 WHERE id=?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Convert assistant tool calls that never received a result into terminal
+    /// tool messages. Idempotent: a second run finds nothing to settle.
+    pub fn settle_unanswered_tool_calls(
+        &self,
+        session_id: &str,
+        status_text: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT tool_calls_json FROM messages WHERE session_id=?1 AND role='assistant'",
+        )?;
+        let raws: Vec<String> = stmt
+            .query_map(params![session_id], |row| row.get::<_, Option<String>>(0))?
+            .filter_map(Result::ok)
+            .flatten()
+            .collect();
+        let mut answered: HashSet<String> = HashSet::new();
+        let mut stmt = conn.prepare(
+            "SELECT tool_call_id FROM messages WHERE session_id=?1 AND role='tool' AND tool_call_id IS NOT NULL",
+        )?;
+        for id in (stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?).flatten() {
+            answered.insert(id);
+        }
+        drop(stmt);
+        let mut missing = Vec::new();
+        for raw in raws {
+            if let Ok(Value::Array(calls)) = serde_json::from_str::<Value>(&raw) {
+                for call in calls {
+                    if let (Some(id), Some(name)) = (
+                        call.get("id").and_then(|v| v.as_str()),
+                        call.get("name").and_then(|v| v.as_str()),
+                    ) {
+                        if !answered.contains(id) {
+                            missing.push((id.to_string(), name.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        let mut settled = 0;
+        for (id, name) in missing {
+            conn.execute(
+                "INSERT INTO messages(id, session_id, role, content, tool_call_id, tool_calls_json, name)
+                 VALUES (?1, ?2, 'tool', ?3, ?4, NULL, ?5)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    session_id,
+                    status_text,
+                    id,
+                    name
+                ],
+            )?;
+            settled += 1;
+        }
+        Ok(settled)
+    }
+
+    /// Drain any parked deferred calls into terminal tool messages.
+    pub fn settle_pending_calls(&self, session_id: &str, status_text: &str) -> Result<usize> {
+        let approval_ids: Vec<String> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt =
+                conn.prepare("SELECT id FROM approvals WHERE session_id=?1 AND status='pending'")?;
+            let ids = stmt
+                .query_map(params![session_id], |row| row.get::<_, String>(0))?
+                .filter_map(Result::ok)
+                .collect();
+            ids
+        };
+        let mut settled = 0;
+        for approval_id in approval_ids {
+            for call in self.take_pending_calls(session_id, &approval_id)? {
+                self.add_message_full(
+                    session_id,
+                    "tool",
+                    status_text,
+                    call.tool_call_id.as_deref(),
+                    None,
+                    Some(&call.name),
+                )?;
+                settled += 1;
+            }
+        }
+        Ok(settled)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4105,5 +4390,147 @@ mod tests {
             .list_findings_by_status(&other.id, "validated")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn durable_inbox_enqueue_is_first_admission_wins() {
+        let store = Store::open(":memory:").unwrap();
+        assert!(store
+            .enqueue_inbox("id-1", "s", "user", "queue", r#"{"text":"first"}"#)
+            .unwrap());
+        assert!(!store
+            .enqueue_inbox("id-1", "s", "user", "queue", r#"{"text":"second"}"#)
+            .unwrap());
+        let items = store.list_pending_inbox("s").unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].payload_json.contains("first"));
+    }
+
+    #[test]
+    fn durable_inbox_promotion_prioritizes_control_then_steer() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .enqueue_inbox("q", "s", "user", "queue", "{}")
+            .unwrap();
+        store
+            .enqueue_inbox("st", "s", "steer", "steer", "{}")
+            .unwrap();
+        store
+            .enqueue_inbox("c", "s", "control", "queue", r#"{"op":"cancel"}"#)
+            .unwrap();
+        let first = store.promote_inbox("s", false).unwrap().unwrap();
+        assert_eq!(first.id, "c");
+        let second = store.promote_inbox("s", false).unwrap().unwrap();
+        assert_eq!(second.id, "st");
+        assert!(store.promote_inbox("s", false).unwrap().is_none());
+        let queued = store.promote_inbox("s", true).unwrap().unwrap();
+        assert_eq!(queued.id, "q");
+    }
+
+    #[test]
+    fn durable_inbox_delivery_is_atomic_and_double_deliver_safe() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .enqueue_inbox("u", "s", "user", "steer", r#"{"text":"hello"}"#)
+            .unwrap();
+        let item = store.promote_inbox("s", true).unwrap().unwrap();
+        assert!(store
+            .deliver_inbox(&item.id, Some(("user", "hello")))
+            .unwrap()
+            .is_some());
+        assert!(store
+            .deliver_inbox(&item.id, Some(("user", "hello")))
+            .unwrap()
+            .is_none());
+        let messages = store.list_messages("s").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "hello");
+        assert!(store.list_pending_inbox("s").unwrap().is_empty());
+    }
+
+    #[test]
+    fn durable_inbox_cancel_and_resteer_apply_only_while_pending() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .enqueue_inbox("i", "s", "user", "queue", "{}")
+            .unwrap();
+        assert!(store.resteer_inbox("i", "steer").unwrap());
+        assert_eq!(store.promote_inbox("s", false).unwrap().unwrap().id, "i");
+        assert!(store.cancel_inbox("i").unwrap());
+        assert!(!store.cancel_inbox("i").unwrap());
+        assert!(store.list_pending_inbox("s").unwrap().is_empty());
+    }
+
+    #[test]
+    fn resume_attempt_counter_is_bounded_and_resettable() {
+        let store = Store::open(":memory:").unwrap();
+        let session = store.create_session("goal").unwrap();
+        assert_eq!(store.resume_attempt(&session.id).unwrap(), 0);
+        for expected in 1..=10 {
+            assert_eq!(
+                store.increment_resume_attempt(&session.id).unwrap(),
+                expected
+            );
+        }
+        store.reset_resume_attempt(&session.id).unwrap();
+        assert_eq!(store.resume_attempt(&session.id).unwrap(), 0);
+    }
+
+    #[test]
+    fn settling_unanswered_calls_is_idempotent() {
+        let store = Store::open(":memory:").unwrap();
+        let session = store.create_session("goal").unwrap();
+        store
+            .add_message_full(
+                &session.id,
+                "assistant",
+                "calling tools",
+                None,
+                Some(r#"[{"id":"a","name":"echo"},{"id":"b","name":"echo"}]"#),
+                None,
+            )
+            .unwrap();
+        store
+            .add_message_full(&session.id, "tool", "ok", Some("a"), None, Some("echo"))
+            .unwrap();
+        let text = "interrupted";
+        assert_eq!(
+            store
+                .settle_unanswered_tool_calls(&session.id, text)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .settle_unanswered_tool_calls(&session.id, text)
+                .unwrap(),
+            0
+        );
+        let messages = store.list_messages(&session.id).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn schema_creation_is_idempotent_with_durable_inbox() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentbug-durable-inbox-schema-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("store.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .enqueue_inbox("persist", "s", "user", "queue", "{}")
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.list_pending_inbox("s").unwrap().len(), 1);
+        assert!(!store
+            .enqueue_inbox("persist", "s", "user", "queue", "{}")
+            .unwrap());
+        let _ = std::fs::remove_file(&path);
     }
 }

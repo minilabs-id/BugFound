@@ -113,6 +113,7 @@ fn build_runner(config: &AppConfig, cwd: &str, mode: Mode) -> Result<Runner> {
     let agent = agent_config(config, mode);
 
     let store = Store::open(&config.storage.path)?;
+    agentbug_core::settle_on_boot(&store)?;
     Ok(Runner::new(store, Arc::new(client), tools, policy, agent))
 }
 

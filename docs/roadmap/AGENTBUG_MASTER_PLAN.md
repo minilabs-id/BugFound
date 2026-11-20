@@ -61,20 +61,27 @@ evaluation/research.
 
 Exit evidence: 222 tests green, fmt/clippy `-D warnings` green.
 
-### R3b — Remaining core maturity (DEFERRED, needs fresh evaluation)
-Not built yet, with reasons recorded:
-1. Capability descriptors + model routing/fallback — designed in R3 research;
-   adapters need local HTTP fixture tests before core calls them.
-2. Sliding-window repeat detection + schema arg repair + terminal tool —
-   require tool-call lifecycle state; better done once with the `tool_calls`
-   table rather than an in-process duplicate.
-3. Durable `session_inbox` + `Scope` doorbell + boot stale settlement — needs a
-   SQLite schema migration and step-boundary semantics; separate review.
-4. JSON Schema argument validation — requires a new dependency and an
-   observe-only rollout (`Off`/`Warn`/`Enforce`) to avoid breaking loose schemas.
+### R3b-1 — Durable inbox + boot settlement (COMPLETE, 2026-11-20)
+- ✅ `session_inbox` table + idempotent enqueue, priority promotion
+  (control > steer > queue), atomic deliver with visible message, cancel/resteer.
+- ✅ `Runner::drain_inbox` drains durable rows first, keeps the in-memory
+  `Inbox` as a compatibility source (existing control-cancel test untouched).
+- ✅ `settle_on_boot` called from CLI/desktop construction: interrupts stale
+  running sessions, settles unanswered tool calls and parked deferred calls,
+  bounded by `resume_attempts` (max 10, no auto-resume).
+- ✅ 8 new tests; 230 tests green, fmt/clippy clean.
 
-Exit (when done): multi-step task with provider failure + cancel + resume passes
-integration tests. Do not start R4 until R3b is completed or explicitly re-scoped.
+### R3c — Remaining core maturity (DEFERRED, each needs its own review)
+1. Capability descriptors + model routing/fallback — adapter-only, needs local
+   HTTP fixture tests before core consumes it.
+2. `tool_calls` lifecycle table + sliding-window repeat echo + one-shot schema
+   repair + `session.finish` terminal tool — a single cohesive refactor of the
+   three tool execution paths; do not build an in-process duplicate first.
+3. `Scope` doorbell coalescing / re-drain — no production consumer yet.
+4. JSON Schema validation (`Off`/`Warn`/`Enforce`, default Off) and freezing
+   tool `risk` as host-owned registry metadata — new dependency + soak period.
+
+Do not start R4 until R3c is completed or explicitly re-scoped.
 
 ### R4 — Multi-agent & memory (10–14 days)
 - Role profiles with tool allowlists; General + ProgramIntel + Recon + Research + Testing + Verification + Report.

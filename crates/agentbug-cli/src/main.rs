@@ -579,7 +579,9 @@ fn build_runner(cfg: &FileConfig, cwd: &str, mode: Mode, open_store: bool) -> Re
     let policy = agentbug_core::build_policy_config(policy_config(cfg, mode));
     let agent = agent_config(cfg, mode);
     let store = if open_store {
-        Some(Store::open(&cfg.storage.path)?)
+        let store = Store::open(&cfg.storage.path)?;
+        agentbug_core::settle_on_boot(&store)?;
+        Some(store)
     } else {
         None
     };

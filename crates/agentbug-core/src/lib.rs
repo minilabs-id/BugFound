@@ -6,6 +6,7 @@ use agentbug_tools::ToolRegistry;
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -30,6 +31,53 @@ pub fn request_stop(store: &Store, session_id: &str) {
     if let Err(e) = store.set_session_flag(session_id, STOP_REQUESTED_FLAG) {
         warn!(error=%e, session=session_id, "failed to set stop flag");
     }
+}
+
+/// Upper bound on boot recovery cycles for a single session.
+pub const MAX_BOOT_RESUMES: u64 = 10;
+
+/// Result of a process-start recovery sweep.
+#[derive(Debug, Default)]
+pub struct BootSettlement {
+    pub interrupted: Vec<String>,
+    pub settled_tool_calls: usize,
+    pub settled_deferred_calls: usize,
+    pub resume_exhausted: Vec<String>,
+}
+
+/// Settle work left half-done by a previous process. Conservative by design:
+/// sessions are marked `interrupted` for an explicit resume, never auto-resumed,
+/// because replaying side-effecting tools without operator intent is unsafe.
+pub fn settle_on_boot(store: &Store) -> Result<BootSettlement> {
+    let mut result = BootSettlement::default();
+    let _ = store.expire_stale_approvals();
+    let stale = store.mark_stale_running_interrupted()?;
+    const TEXT: &str =
+        "ok=false error=tool call interrupted by process restart; no result was persisted";
+    for id in stale {
+        result.settled_tool_calls += store.settle_unanswered_tool_calls(&id, TEXT)?;
+        result.settled_deferred_calls += store.settle_pending_calls(&id, TEXT)?;
+        let attempts = store.increment_resume_attempt(&id)?;
+        if attempts > MAX_BOOT_RESUMES {
+            store.set_session_state(&id, "failed")?;
+            store.add_event(
+                &id,
+                "warn",
+                "session.recovery_exhausted",
+                &format!("boot resume attempts exceeded {MAX_BOOT_RESUMES}"),
+            )?;
+            result.resume_exhausted.push(id);
+            continue;
+        }
+        store.add_event(
+            &id,
+            "warn",
+            "session.recovered_stale",
+            "stale running session interrupted during boot recovery",
+        )?;
+        result.interrupted.push(id);
+    }
+    Ok(result)
 }
 
 // Re-export the wired core capabilities so other crates can use the documented
@@ -388,12 +436,42 @@ impl Runner {
         );
     }
 
-    /// Consume inbox items at a step boundary. Control items carrying `cancel`
-    /// request interruption; user/steer items are persisted as durable prompts
-    /// so a delivered steer is never silently dropped.
+    /// Consume inbox items at a step boundary. Durable rows are authoritative;
+    /// the in-process inbox stays as a compatibility source for existing callers.
+    /// Control items carrying `cancel` request interruption; user/steer items
+    /// are delivered into the durable message store atomically.
     fn drain_inbox(&self, session_id: &str) -> bool {
-        let inbox = inbox::Inbox::global();
         let mut cancel = false;
+        while let Ok(Some(item)) = self.store.promote_inbox(session_id, true) {
+            let payload: Value = serde_json::from_str(&item.payload_json).unwrap_or(Value::Null);
+            let is_cancel = item.kind == "control" && inbox_control_is_cancel(&payload);
+            let visible = if item.kind == "user" || item.kind == "steer" {
+                Some(("user", inbox_payload_text(&payload)))
+            } else {
+                None
+            };
+            match self.store.deliver_inbox(
+                &item.id,
+                visible.as_ref().map(|(role, text)| (*role, text.as_str())),
+            ) {
+                Ok(Some(_)) => {
+                    self.log_event(
+                        session_id,
+                        "info",
+                        "inbox.delivered",
+                        &format!("id={} kind={}", item.id, item.kind),
+                    );
+                    cancel |= is_cancel;
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(error=%e, session=session_id, "failed to deliver durable inbox item")
+                }
+            }
+        }
+        // Compatibility path: the in-process inbox remains public API and is
+        // the source used by existing control-cancel callers and tests.
+        let inbox = inbox::Inbox::global();
         while let Some(item) = inbox.promote_and_deliver(session_id, true) {
             if item.kind == inbox::InboxKind::Control && inbox_control_is_cancel(&item.payload) {
                 cancel = true;
@@ -2056,5 +2134,31 @@ mod tests {
             sanitize_model_tokens(raw),
             "hello assist to=echoanalysis world"
         );
+    }
+
+    #[test]
+    fn boot_settlement_interrupts_stale_sessions_and_settles_calls() {
+        let store = Store::open(":memory:").unwrap();
+        let session = store.create_session("goal").unwrap();
+        store.set_session_state(&session.id, "running").unwrap();
+        store
+            .add_message_full(
+                &session.id,
+                "assistant",
+                "calling",
+                None,
+                Some(r#"[{"id":"c1","name":"echo"}]"#),
+                None,
+            )
+            .unwrap();
+        let result = settle_on_boot(&store).unwrap();
+        assert_eq!(result.interrupted, vec![session.id.clone()]);
+        assert_eq!(result.settled_tool_calls, 1);
+        assert_eq!(store.resume_attempt(&session.id).unwrap(), 1);
+        let session = store.get_session(&session.id).unwrap().unwrap();
+        assert_eq!(session.state, "interrupted");
+        let messages = store.list_messages(&session.id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("c1"));
     }
 }

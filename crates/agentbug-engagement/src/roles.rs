@@ -37,6 +37,15 @@ pub struct RoleProfile {
     pub max_tool_calls: usize,
 }
 
+/// Deterministic role selection for a WSTG playbook. No LLM choice.
+pub fn role_for_playbook(playbook_id: &str) -> RoleId {
+    match playbook_id {
+        "wstg-info" => RoleId::Recon,
+        "wstg-config" => RoleId::Research,
+        _ => RoleId::Testing,
+    }
+}
+
 pub fn role_profile(id: RoleId) -> RoleProfile {
     match id {
         RoleId::General => RoleProfile {
@@ -114,6 +123,7 @@ pub fn role_profile(id: RoleId) -> RoleProfile {
                 "knowledge_lookup",
                 "echo",
                 "clue_put",
+                "role_result",
                 SESSION_FINISH_TOOL,
             ],
             max_steps: 10,
@@ -177,4 +187,15 @@ mod tests {
         let names: Vec<String> = scoped.specs().into_iter().map(|s| s.name).collect();
         assert_eq!(names, vec![SESSION_FINISH_TOOL.to_string()]);
     }
+}
+
+#[test]
+fn playbook_role_mapping_is_total_and_deterministic() {
+    assert_eq!(role_for_playbook("wstg-info"), RoleId::Recon);
+    assert_eq!(role_for_playbook("wstg-config"), RoleId::Research);
+    assert_eq!(role_for_playbook("wstg-authz"), RoleId::Testing);
+    assert_eq!(role_for_playbook("custom"), RoleId::Testing);
+    assert!(role_profile(RoleId::Verification)
+        .allow_tools
+        .contains(&"role_result"));
 }

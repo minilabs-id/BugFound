@@ -280,5 +280,12 @@ No effectiveness number may be asserted until those artifacts exist.
   asset hypotheses from discoveries and feeds them into later task goals, and
   `open_hypotheses > 0` blocking `completed` outcome. Coverage mirroring no
   longer launders `blocked` into `covered`.
-- Next: deterministic role pipeline with mandatory verification (build step 3
-  of `docs/research/17_ideal_workflow.md`).
+- ✅ Deterministic role pipeline (COMPLETE): `role_for_playbook` maps WSTG
+  playbooks to Recon/Research/Testing; each task's Runner uses a role-scoped
+  ToolRegistry over the ROE-filtered base (no privilege widening) and a
+  role-specific agent config.
+- ✅ Mandatory verification before confirmation: every candidate finding spawns
+  a bounded Verification-role session that must write a complete `role_result`
+  verdict; only then is the hypothesis marked `confirmed-candidate`. The
+  verdict is advisory — only `verify_findings` may promote to `validated`.
+- Next: per-class oracles + falsification fields (build step 4).

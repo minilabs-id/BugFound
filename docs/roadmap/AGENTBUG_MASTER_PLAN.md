@@ -274,5 +274,11 @@ No effectiveness number may be asserted until those artifacts exist.
   `done`; an `engagement.outcome` trace records `incomplete` when tasks or
   coverage are missing.
 - ✅ Report Coverage section now prints a Result column with reason.
-- Next: hypothesis terminal states and passive→active feedback (build step 2
+- ✅ Hypothesis lifecycle (COMPLETE): structured fields, production status
+  transitions (`running → tested/blocked → confirmed-candidate → validated/
+  ruled_out/open_proof_gap`), passive→active feedback that creates in-scope
+  asset hypotheses from discoveries and feeds them into later task goals, and
+  `open_hypotheses > 0` blocking `completed` outcome. Coverage mirroring no
+  longer launders `blocked` into `covered`.
+- Next: deterministic role pipeline with mandatory verification (build step 3
   of `docs/research/17_ideal_workflow.md`).

@@ -128,6 +128,20 @@ pub struct Hypothesis {
     pub statement: String,
     pub status: String,
     pub created_at: String,
+    #[serde(default)]
+    pub requirement_id: String,
+    #[serde(default)]
+    pub claim: String,
+    #[serde(default)]
+    pub preconditions: String,
+    #[serde(default)]
+    pub oracle_type: String,
+    #[serde(default)]
+    pub rationale: String,
+    #[serde(default)]
+    pub evidence_ref: String,
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,7 +363,11 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS hypotheses(
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, statement TEXT NOT NULL,
-               status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL
+               status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL,
+               requirement_id TEXT NOT NULL DEFAULT '', claim TEXT NOT NULL DEFAULT '',
+               preconditions TEXT NOT NULL DEFAULT '', oracle_type TEXT NOT NULL DEFAULT '',
+               rationale TEXT NOT NULL DEFAULT '', evidence_ref TEXT NOT NULL DEFAULT '',
+               updated_at TEXT
              );
              CREATE TABLE IF NOT EXISTS approved_targets(
                session_id TEXT NOT NULL, target TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -2051,25 +2069,62 @@ impl Store {
     }
 
     pub fn add_hypothesis(&self, session_id: &str, statement: &str) -> Result<Hypothesis> {
-        let h = Hypothesis {
+        self.add_structured_hypothesis(session_id, statement, "", statement, "", "")
+    }
+
+    pub fn add_structured_hypothesis(
+        &self,
+        session_id: &str,
+        statement: &str,
+        requirement_id: &str,
+        claim: &str,
+        preconditions: &str,
+        oracle_type: &str,
+    ) -> Result<Hypothesis> {
+        let ts = now();
+        let row = Hypothesis {
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
             statement: statement.to_string(),
             status: "open".to_string(),
-            created_at: now(),
+            created_at: ts.clone(),
+            requirement_id: requirement_id.to_string(),
+            claim: claim.to_string(),
+            preconditions: preconditions.to_string(),
+            oracle_type: oracle_type.to_string(),
+            rationale: String::new(),
+            evidence_ref: String::new(),
+            updated_at: Some(ts.clone()),
         };
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO hypotheses(id,session_id,statement,status,created_at) VALUES(?1,?2,?3,?4,?5)",
-            params![h.id, h.session_id, h.statement, h.status, h.created_at],
+            "INSERT INTO hypotheses(id,session_id,statement,status,created_at,
+             requirement_id,claim,preconditions,oracle_type,rationale,evidence_ref,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![
+                row.id,
+                row.session_id,
+                row.statement,
+                row.status,
+                row.created_at,
+                row.requirement_id,
+                row.claim,
+                row.preconditions,
+                row.oracle_type,
+                row.rationale,
+                row.evidence_ref,
+                row.updated_at
+            ],
         )?;
-        Ok(h)
+        Ok(row)
     }
 
     pub fn list_hypotheses(&self, session_id: &str) -> Result<Vec<Hypothesis>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,session_id,statement,status,created_at FROM hypotheses WHERE session_id=?1 ORDER BY rowid ASC",
+            "SELECT id,session_id,statement,status,created_at,requirement_id,claim,
+             preconditions,oracle_type,rationale,evidence_ref,updated_at
+             FROM hypotheses WHERE session_id=?1 ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
             Ok(Hypothesis {
@@ -2078,6 +2133,13 @@ impl Store {
                 statement: r.get(2)?,
                 status: r.get(3)?,
                 created_at: r.get(4)?,
+                requirement_id: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                claim: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                preconditions: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                oracle_type: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                rationale: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                evidence_ref: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                updated_at: r.get(11)?,
             })
         })?;
         let mut out = vec![];
@@ -2090,8 +2152,23 @@ impl Store {
     pub fn set_hypothesis_status(&self, id: &str, status: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE hypotheses SET status=?2 WHERE id=?1",
-            params![id, status],
+            "UPDATE hypotheses SET status=?2, updated_at=?3 WHERE id=?1",
+            params![id, status, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn hypothesis_transition(
+        &self,
+        id: &str,
+        status: &str,
+        rationale: &str,
+        evidence_ref: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE hypotheses SET status=?2, rationale=?3, evidence_ref=?4, updated_at=?5 WHERE id=?1",
+            params![id, status, rationale, evidence_ref, now()],
         )?;
         Ok(())
     }
@@ -5623,4 +5700,34 @@ fn blocked_coverage_is_recorded_as_requirement_keyed_row() {
         .unwrap();
     assert_eq!(store.list_coverage(&session.id).unwrap().len(), 1);
     assert_eq!(store.covered_requirement_count(&session.id).unwrap(), 1);
+}
+
+#[test]
+fn structured_hypothesis_transitions_round_trip() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("goal").unwrap();
+    let legacy = store.add_hypothesis(&session.id, "legacy").unwrap();
+    assert_eq!(legacy.status, "open");
+    assert_eq!(legacy.requirement_id, "");
+    let h = store
+        .add_structured_hypothesis(
+            &session.id,
+            "Investigate api.example.com",
+            "WSTG-INFO",
+            "exposed admin API",
+            "low-priv user",
+            "differential",
+        )
+        .unwrap();
+    assert_eq!(h.requirement_id, "WSTG-INFO");
+    assert_eq!(h.oracle_type, "differential");
+    store
+        .hypothesis_transition(&h.id, "tested", "probe recorded", "capture-1")
+        .unwrap();
+    let rows = store.list_hypotheses(&session.id).unwrap();
+    let updated = rows.iter().find(|row| row.id == h.id).unwrap();
+    assert_eq!(updated.status, "tested");
+    assert_eq!(updated.rationale, "probe recorded");
+    assert_eq!(updated.evidence_ref, "capture-1");
+    assert!(updated.updated_at.is_some());
 }

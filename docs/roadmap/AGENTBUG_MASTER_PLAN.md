@@ -169,14 +169,16 @@ No effectiveness number is recorded. All artifacts state
 - ✅ `set_finding_verdict` never stamps `validated_at`; ruled-out/uncertain
   findings cannot enter `verified_findings`.
 
-#### R7a-2 — Verifier closure (NOT STARTED, blocked on a real gap)
-Research found there is **no production path** attaching an HTTP tool capture to
-a finding: `persist_tool_result` only reads `structured` from tools whose name
-contains `finding`, while `SaveFindingTool` echoes LLM input. The canary is
-scrubbed from LLM output, so the model cannot supply it. Before `ruled_out` can
-be authoritative, the runner must attach the tool's own capture at the boundary,
-and `ValidatePoCTool` must emit tool-minted benign/payload pairs. Until then any
-closure verdict would be LLM-asserted, which violates ADR-008.
+#### R7a-2 — Production capture attachment (COMPLETE)
+Fixed the gap where no production path attached an HTTP tool capture to a
+finding: `persist_tool_result` now keeps every tool-generated capture at
+session scope (`session_captures`) and consumes it once when a `save_finding`
+result has no capture of its own. LLM-supplied request/response remain advisory.
+Regression test `http_capture_flows_to_a_later_finding_without_llm_bytes`
+proves the tool bytes, not LLM text, reach `tool_captures`.
+
+Still deferred: tool-minted benign/payload pairs in `ValidatePoCTool` and the
+authoritative `ruled_out` decision. Until those exist, verdicts stay advisory.
 
 #### R7b — Program intelligence provenance (DESIGNED, NOT STARTED)
 Additive advisory sidecar (`brief_rule_provenance`) with source URL, section

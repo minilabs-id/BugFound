@@ -350,6 +350,10 @@ impl Store {
                finding_id TEXT PRIMARY KEY, request_bytes BLOB NOT NULL,
                response_bytes BLOB NOT NULL, canary TEXT NOT NULL, created_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS session_captures(
+               session_id TEXT PRIMARY KEY, request_bytes BLOB NOT NULL,
+               response_bytes BLOB NOT NULL, canary TEXT NOT NULL, created_at TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS finding_captures(
                id TEXT PRIMARY KEY, finding_id TEXT NOT NULL,
                role TEXT NOT NULL CHECK(role IN ('primary','paired_benign','paired_payload')),
@@ -1250,6 +1254,60 @@ impl Store {
             })
             .optional()?;
         Ok(row)
+    }
+
+    /// Keep the most recent tool-generated capture for a session. Written by
+    /// the sink for every tool result carrying `structured.capture`, so the
+    /// bytes exist even when the tool name has no domain meaning.
+    pub fn put_session_capture(
+        &self,
+        session_id: &str,
+        request: &[u8],
+        response: &[u8],
+        canary: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO session_captures(session_id, request_bytes, response_bytes, canary, created_at)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(session_id) DO UPDATE SET
+               request_bytes=excluded.request_bytes,
+               response_bytes=excluded.response_bytes,
+               canary=excluded.canary, created_at=excluded.created_at",
+            params![session_id, request, response, canary, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Consume the pending capture once, so a stale exchange cannot be attached
+    /// to a later, unrelated finding.
+    pub fn take_session_capture(&self, session_id: &str) -> Result<Option<ToolCapture>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let found: Option<ToolCapture> = tx
+            .query_row(
+                "SELECT session_id, request_bytes, response_bytes, canary, created_at
+                 FROM session_captures WHERE session_id=?1",
+                params![session_id],
+                |r| {
+                    Ok(ToolCapture {
+                        finding_id: r.get(0)?,
+                        request_bytes: r.get(1)?,
+                        response_bytes: r.get(2)?,
+                        canary: r.get(3)?,
+                        created_at: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        if found.is_some() {
+            tx.execute(
+                "DELETE FROM session_captures WHERE session_id=?1",
+                params![session_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(found)
     }
 
     /// Attach a control capture. Idempotent per `(finding_id, role)` and
@@ -2794,6 +2852,17 @@ pub fn persist_tool_result(
     if !result.ok {
         return;
     }
+    // Any tool may produce an authoritative capture (HTTP, PoC replay). Keep
+    // it at session scope so a later `save_finding` can bind real bytes to the
+    // finding instead of trusting LLM-supplied request/response arguments.
+    if let Some((request, response, canary)) = result
+        .structured
+        .as_ref()
+        .and_then(agentbug_tools::capture_from_structured)
+    {
+        let _ =
+            store.put_session_capture(session_id, request.as_bytes(), response.as_bytes(), &canary);
+    }
     let effective_args = if args.is_object() {
         args.clone()
     } else if let Some(s) = result.structured.as_ref() {
@@ -2857,11 +2926,26 @@ pub fn persist_tool_result(
                 tracing::info!(session=%session_id, title=%title, "finding persisted");
                 // The authoritative bytes come from the tool's capture, never
                 // from the LLM-supplied request/response arguments above.
-                if let Some((request, response, canary)) = result
+                let own_capture = result
                     .structured
                     .as_ref()
-                    .and_then(agentbug_tools::capture_from_structured)
-                {
+                    .and_then(agentbug_tools::capture_from_structured);
+                let capture = if own_capture.is_some() {
+                    own_capture
+                } else {
+                    store
+                        .take_session_capture(session_id)
+                        .ok()
+                        .flatten()
+                        .map(|c| {
+                            (
+                                String::from_utf8_lossy(&c.request_bytes).to_string(),
+                                String::from_utf8_lossy(&c.response_bytes).to_string(),
+                                c.canary,
+                            )
+                        })
+                };
+                if let Some((request, response, canary)) = capture {
                     if let Err(e) = store.attach_capture(
                         &finding.id,
                         request.as_bytes(),
@@ -5185,4 +5269,64 @@ fn finding_verdict_never_stamps_validation() {
     assert!(store
         .set_finding_verdict(&finding.id, "bogus", None)
         .is_err());
+}
+
+#[test]
+fn http_capture_flows_to_a_later_finding_without_llm_bytes() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("goal").unwrap();
+    let http_result = agentbug_tools::ToolResult {
+        ok: true,
+        output: "status 200".to_string(),
+        structured: Some(serde_json::json!({
+            "ok": true,
+            "capture": {
+                "request": "GET /reflect?q=canary HTTP/1.1",
+                "response": "HTTP/1.1 200 OK\nreflected canary",
+                "canary": "agentbug-canary-abc"
+            }
+        })),
+    };
+    persist_tool_result(
+        &store,
+        &session.id,
+        "http_request",
+        &serde_json::json!({"url": "http://127.0.0.1/reflect"}),
+        &http_result,
+    );
+    assert!(store.take_session_capture(&session.id).unwrap().is_some());
+    // Put it back: the real flow consumes it when the finding is saved.
+    store
+        .put_session_capture(
+            &session.id,
+            b"GET /reflect?q=canary HTTP/1.1",
+            b"HTTP/1.1 200 OK\nreflected canary",
+            "agentbug-canary-abc",
+        )
+        .unwrap();
+
+    let finding_args = serde_json::json!({
+        "title": "Reflected canary",
+        "severity": "high",
+        "description": "tool bytes only",
+        "request": "LLM must not be trusted",
+        "response": "LLM must not be trusted"
+    });
+    persist_tool_result(
+        &store,
+        &session.id,
+        "save_finding",
+        &finding_args,
+        &agentbug_tools::ToolResult {
+            ok: true,
+            output: "saved".to_string(),
+            structured: None,
+        },
+    );
+    let findings = store.list_findings(&session.id).unwrap();
+    assert_eq!(findings.len(), 1);
+    let capture = store.get_capture(&findings[0].id).unwrap().unwrap();
+    assert_eq!(capture.canary, "agentbug-canary-abc");
+    assert!(String::from_utf8_lossy(&capture.response_bytes).contains("reflected canary"));
+    assert!(store.take_session_capture(&session.id).unwrap().is_none());
 }

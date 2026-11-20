@@ -489,6 +489,28 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS idx_brief_rule_provenance_engagement
                ON brief_rule_provenance(engagement_id);
+             CREATE TABLE IF NOT EXISTS authorization_snapshots(
+               id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, version INTEGER NOT NULL,
+               source_url TEXT NOT NULL, content_hash TEXT NOT NULL,
+               scope_hash TEXT NOT NULL, roe_hash TEXT NOT NULL,
+               observed_at TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL,
+               UNIQUE(engagement_id, content_hash)
+             );
+             CREATE INDEX IF NOT EXISTS idx_authorization_snapshots_engagement
+               ON authorization_snapshots(engagement_id);
+             CREATE TABLE IF NOT EXISTS authorization_acks(
+               id TEXT PRIMARY KEY, program_url TEXT NOT NULL, content_hash TEXT NOT NULL,
+               subject_kind TEXT NOT NULL, subject_hash TEXT NOT NULL,
+               subject_text TEXT NOT NULL, decision TEXT NOT NULL,
+               operator TEXT NOT NULL, note TEXT NOT NULL, created_at TEXT NOT NULL,
+               UNIQUE(program_url, content_hash, subject_kind, subject_hash)
+             );
+             CREATE TABLE IF NOT EXISTS authorization_open_rules(
+               id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, snapshot_hash TEXT NOT NULL,
+               rule_hash TEXT NOT NULL, rule_text TEXT NOT NULL, state TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               UNIQUE(engagement_id, snapshot_hash, rule_hash)
+             );
              CREATE TABLE IF NOT EXISTS tasks(
                id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, statement TEXT NOT NULL,
                playbook_id TEXT NOT NULL DEFAULT '', target TEXT, priority INTEGER NOT NULL DEFAULT 0,
@@ -3082,6 +3104,164 @@ pub fn redact_secrets(input: &str) -> String {
 }
 pub fn redact_text(input: &str) -> String {
     redact(input)
+}
+
+/// Versioned, hash-bound authorization snapshot for a program brief.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorizationSnapshot {
+    pub engagement_id: String,
+    pub version: i64,
+    pub source_url: String,
+    pub content_hash: String,
+    pub scope_hash: String,
+    pub roe_hash: String,
+    pub observed_at: String,
+    pub state: String,
+    pub created_at: String,
+}
+
+/// An out-of-band operator acknowledgement for one ambiguous line or version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorizationAck {
+    pub program_url: String,
+    pub content_hash: String,
+    pub subject_kind: String,
+    pub subject_hash: String,
+    pub subject_text: String,
+    pub decision: String,
+    pub operator: String,
+    pub note: String,
+    pub created_at: String,
+}
+
+/// An unmapped ROE rule kept visible (never silently dropped).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAuthorizationRule {
+    pub engagement_id: String,
+    pub snapshot_hash: String,
+    pub rule_hash: String,
+    pub rule_text: String,
+    pub state: String,
+    pub created_at: String,
+}
+
+impl Store {
+    pub fn save_authorization_snapshot(&self, snapshot: &AuthorizationSnapshot) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO authorization_snapshots(
+             id, engagement_id, version, source_url, content_hash, scope_hash,
+             roe_hash, observed_at, state, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                Uuid::new_v4().to_string(),
+                snapshot.engagement_id,
+                snapshot.version,
+                snapshot.source_url,
+                snapshot.content_hash,
+                snapshot.scope_hash,
+                snapshot.roe_hash,
+                snapshot.observed_at,
+                snapshot.state,
+                snapshot.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn count_authorization_snapshots(&self, engagement_id: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM authorization_snapshots WHERE engagement_id=?1",
+            params![engagement_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn save_authorization_ack(&self, ack: &AuthorizationAck) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO authorization_acks(
+             id, program_url, content_hash, subject_kind, subject_hash,
+             subject_text, decision, operator, note, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                Uuid::new_v4().to_string(),
+                ack.program_url,
+                ack.content_hash,
+                ack.subject_kind,
+                ack.subject_hash,
+                ack.subject_text,
+                ack.decision,
+                ack.operator,
+                ack.note,
+                now()
+            ],
+        )?;
+        Ok(conn.changes() > 0)
+    }
+
+    pub fn has_authorization_ack(
+        &self,
+        program_url: &str,
+        content_hash: &str,
+        subject_kind: &str,
+        subject_hash: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM authorization_acks
+             WHERE program_url=?1 AND content_hash=?2 AND subject_kind=?3
+               AND subject_hash=?4 AND decision='acknowledged'",
+            params![program_url, content_hash, subject_kind, subject_hash],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn save_open_authorization_rule(&self, rule: &OpenAuthorizationRule) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO authorization_open_rules(
+             id, engagement_id, snapshot_hash, rule_hash, rule_text, state, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                Uuid::new_v4().to_string(),
+                rule.engagement_id,
+                rule.snapshot_hash,
+                rule.rule_hash,
+                rule.rule_text,
+                rule.state,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_open_authorization_rules(
+        &self,
+        engagement_id: &str,
+    ) -> Result<Vec<OpenAuthorizationRule>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT engagement_id, snapshot_hash, rule_hash, rule_text, state, created_at
+             FROM authorization_open_rules WHERE engagement_id=?1 ORDER BY rowid",
+        )?;
+        let rows = stmt
+            .query_map(params![engagement_id], |row| {
+                Ok(OpenAuthorizationRule {
+                    engagement_id: row.get(0)?,
+                    snapshot_hash: row.get(1)?,
+                    rule_hash: row.get(2)?,
+                    rule_text: row.get(3)?,
+                    state: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 }
 
 /// Generic durable eval-trace record. The kernel reads this for telemetry;
@@ -5817,4 +5997,78 @@ fn structured_hypothesis_transitions_round_trip() {
     assert_eq!(updated.rationale, "probe recorded");
     assert_eq!(updated.evidence_ref, "capture-1");
     assert!(updated.updated_at.is_some());
+}
+
+#[test]
+fn authorization_ack_is_hash_scoped_and_idempotent() {
+    let store = Store::open(":memory:").unwrap();
+    let ack = AuthorizationAck {
+        program_url: "https://hackerone.com/acme".to_string(),
+        content_hash: "content-1".to_string(),
+        subject_kind: "unparsed_roe".to_string(),
+        subject_hash: "rule-1".to_string(),
+        subject_text: "Do not scan staging".to_string(),
+        decision: "acknowledged".to_string(),
+        operator: "operator".to_string(),
+        note: String::new(),
+        created_at: String::new(),
+    };
+    assert!(store.save_authorization_ack(&ack).unwrap());
+    assert!(!store.save_authorization_ack(&ack).unwrap());
+    assert!(store
+        .has_authorization_ack(
+            &ack.program_url,
+            &ack.content_hash,
+            &ack.subject_kind,
+            &ack.subject_hash
+        )
+        .unwrap());
+    assert!(!store
+        .has_authorization_ack(
+            &ack.program_url,
+            "content-2",
+            &ack.subject_kind,
+            &ack.subject_hash
+        )
+        .unwrap());
+    assert!(!store
+        .has_authorization_ack(
+            &ack.program_url,
+            &ack.content_hash,
+            &ack.subject_kind,
+            "rule-2"
+        )
+        .unwrap());
+}
+
+#[test]
+fn authorization_snapshot_and_open_rule_round_trip() {
+    let store = Store::open(":memory:").unwrap();
+    let snapshot = AuthorizationSnapshot {
+        engagement_id: "e".to_string(),
+        version: 1,
+        source_url: "https://hackerone.com/acme".to_string(),
+        content_hash: "content-1".to_string(),
+        scope_hash: "scope".to_string(),
+        roe_hash: "roe".to_string(),
+        observed_at: "1".to_string(),
+        state: "ingested".to_string(),
+        created_at: "1".to_string(),
+    };
+    store.save_authorization_snapshot(&snapshot).unwrap();
+    assert_eq!(store.count_authorization_snapshots("e").unwrap(), 1);
+    store.save_authorization_snapshot(&snapshot).unwrap();
+    assert_eq!(store.count_authorization_snapshots("e").unwrap(), 1);
+    let rule = OpenAuthorizationRule {
+        engagement_id: "e".to_string(),
+        snapshot_hash: "content-1".to_string(),
+        rule_hash: "rule-1".to_string(),
+        rule_text: "Do not scan staging".to_string(),
+        state: "pending".to_string(),
+        created_at: "1".to_string(),
+    };
+    store.save_open_authorization_rule(&rule).unwrap();
+    let rows = store.list_open_authorization_rules("e").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, "pending");
 }

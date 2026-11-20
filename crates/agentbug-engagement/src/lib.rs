@@ -25,7 +25,9 @@ pub use roles::{build_role_tools, role_for_playbook, role_profile, RoleId};
 use agentbug_core::{build_policy_config, AgentConfig, Runner};
 use agentbug_llm::{ChatMessage, ChatResponse, Llm, LlmClient, LlmConfig};
 use agentbug_policy::{BudgetConfig, Mode, PolicyConfig, ScopeConfig};
-use agentbug_store::{redact, RuleProvenance, Store, ToolCapture};
+use agentbug_store::{
+    redact, AuthorizationSnapshot, OpenAuthorizationRule, RuleProvenance, Store, ToolCapture,
+};
 use agentbug_tools::{try_default_registry_with_options, ToolOptions};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -725,10 +727,67 @@ async fn run_engagement(
             "program brief has no deterministically parseable in-scope targets; refusing to engage (fail-closed)"
         ));
     }
+    // Versioned authorization snapshot. The brief hash is the authority for
+    // every later decision; provenance remains advisory.
+    let content_hash = hex_digest(brief_text.as_bytes());
+    let observed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+    let version = store.count_authorization_snapshots(id).unwrap_or(0) + 1;
+    let _ = store.save_authorization_snapshot(&AuthorizationSnapshot {
+        engagement_id: id.to_string(),
+        version,
+        source_url: program_url.to_string(),
+        content_hash: content_hash.clone(),
+        scope_hash: hex_digest(
+            serde_json::to_string(&deterministic_scope)
+                .unwrap_or_default()
+                .as_bytes(),
+        ),
+        roe_hash: String::new(),
+        observed_at: observed_at.clone(),
+        state: "ingested".to_string(),
+        created_at: observed_at.clone(),
+    });
+
     // H-02: parse the full brief into a typed, fail-closed ROE policy and abort
     // on any safety constraint we cannot translate into a field.
     let (roe, unparsed) = roe_classify(&brief_text);
     if !unparsed.is_empty() {
+        // Keep every unmapped rule visible. An operator may record a hash-
+        // scoped acknowledgement out of band, but this step still aborts by
+        // default — acknowledgement never becomes implicit permission.
+        for line in &unparsed {
+            let rule_hash = hex_digest(line.trim().as_bytes());
+            let acknowledged = store
+                .has_authorization_ack(program_url, &content_hash, "unparsed_roe", &rule_hash)
+                .unwrap_or(false);
+            let _ = store.save_open_authorization_rule(&OpenAuthorizationRule {
+                engagement_id: id.to_string(),
+                snapshot_hash: content_hash.clone(),
+                rule_hash: rule_hash.clone(),
+                rule_text: line.clone(),
+                state: if acknowledged {
+                    "operator_acknowledged".to_string()
+                } else {
+                    "pending".to_string()
+                },
+                created_at: observed_at.clone(),
+            });
+            let _ = store.append_trace(
+                id,
+                id,
+                "authorization.open_rule",
+                &json!({
+                    "rule_hash": rule_hash,
+                    "acknowledged": acknowledged,
+                    "rule": redact(line),
+                })
+                .to_string(),
+            );
+        }
         let message = format!(
             "unparsed ROE constraints; refusing to engage (fail-closed): {}",
             unparsed.join(" | ")

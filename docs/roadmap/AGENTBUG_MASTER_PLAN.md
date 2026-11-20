@@ -295,4 +295,11 @@ No effectiveness number may be asserted until those artifacts exist.
   `canary_echo` byte-identical and routes every other class to
   `open_proof_gap` with a named missing proof — never confirming from absence.
   Differential remains rule-out-only (no identity pair exists).
-- Next: authorization snapshot + operator acknowledgement (build step 5).
+- ✅ Authorization snapshot foundation (COMPLETE, conservative slice):
+  `authorization_snapshots` (version + content/scope hashes + observed_at),
+  `authorization_acks` (hash-scoped, out-of-band, idempotent) and
+  `authorization_open_rules` (nothing silently dropped) are stored before the
+  ROE abort. The abort remains the ONLY behavior — an acknowledgement is
+  recorded but does not yet bypass it, so no LLM/tool path can self-authorize.
+- Deferred from step 5: ack-driven bypass, version-change revalidation on
+  resume, and CLI/desktop authorize entry points.

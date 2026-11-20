@@ -3296,6 +3296,14 @@ pub struct ReportFinding {
     pub evidence_hash: Option<String>,
     pub verified: bool,
     pub platform: Platform,
+    pub evidence_request_redacted: Option<String>,
+    pub evidence_response_redacted: Option<String>,
+    pub evidence_canary_redacted: Option<String>,
+    pub evidence_artifact_path: Option<String>,
+    pub evidence_capture_source: Option<String>,
+    pub evidence_captured_at: Option<String>,
+    pub evidence_target_binding: Option<String>,
+    pub evidence_paired_control_hash: Option<String>,
 }
 
 /// Everything the canonical renderer needs. Coverage and timeline tuples are
@@ -3312,6 +3320,44 @@ pub struct ReportInput {
     pub timeline: Vec<(String, String, String)>,
     pub report_id: String,
     pub platform: Platform,
+}
+
+/// Collapse captured bytes into one report line so a body cannot create a
+/// heading or a fake finding block.
+fn inline_view(text: &str) -> String {
+    text.replace('\r', "").replace('\n', "\\n")
+}
+
+/// Write raw evidence bytes under the workspace. The path is deterministic and
+/// confined by the existing `resolve_in_cwd` guard.
+pub fn write_evidence_artifact(
+    cwd: &std::path::Path,
+    finding_id: &str,
+    request: &[u8],
+    response: &[u8],
+    canary: &[u8],
+    digest_hex: &str,
+) -> Result<String> {
+    let safe_id: String = finding_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let short: String = digest_hex.chars().take(12).collect();
+    let rel = format!("evidence/{safe_id}-{short}.bin");
+    let full = resolve_in_cwd(cwd, &rel, false, true)?;
+    let mut bytes = Vec::with_capacity(request.len() + response.len() + canary.len());
+    bytes.extend_from_slice(request);
+    bytes.extend_from_slice(response);
+    bytes.extend_from_slice(canary);
+    std::fs::create_dir_all(full.parent().unwrap_or(cwd))?;
+    std::fs::write(&full, &bytes)?;
+    Ok(rel)
 }
 
 /// The single canonical Markdown report renderer. Every report-producing path
@@ -3398,6 +3444,31 @@ pub fn render_canonical_report(input: &ReportInput) -> String {
             finding.asset.as_deref().unwrap_or("N/A")
         ));
         out.push_str(&format!("- **Verified:** {}\n", finding.verified));
+
+        for (label, value) in [
+            (
+                "Evidence artifact",
+                finding.evidence_artifact_path.as_deref(),
+            ),
+            ("Capture source", finding.evidence_capture_source.as_deref()),
+            ("Captured at", finding.evidence_captured_at.as_deref()),
+            ("Bound endpoint", finding.evidence_target_binding.as_deref()),
+            ("Canary", finding.evidence_canary_redacted.as_deref()),
+            (
+                "Paired-control SHA-256",
+                finding.evidence_paired_control_hash.as_deref(),
+            ),
+        ] {
+            if let Some(v) = value {
+                out.push_str(&format!("- **{label}:** `{v}`\n"));
+            }
+        }
+        if let Some(v) = finding.evidence_request_redacted.as_deref() {
+            out.push_str(&format!("- Request (redacted): `{}`\n", inline_view(v)));
+        }
+        if let Some(v) = finding.evidence_response_redacted.as_deref() {
+            out.push_str(&format!("- Response (redacted): `{}`\n", inline_view(v)));
+        }
         out.push_str(&format!("- **Evidence SHA-256:** `{hash}`\n\n"));
         out.push_str(&format!("{}\n\n", finding.description));
         out.push_str("#### Steps to Reproduce\n\n");
@@ -5996,4 +6067,44 @@ async fn save_finding_falsification_gate_respects_option() {
         "oracle_type":"canary_echo"
     });
     assert!(strict.run(complete).await.unwrap().ok);
+}
+
+#[test]
+fn evidence_artifact_is_deterministic_confined_and_hash_bound() {
+    let dir = std::env::temp_dir().join(format!("agentbug-artifact-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let response = b"HTTP/1.1 200 OK\r\n\r\nok";
+    let canary = b"agentbug-canary-abc";
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(request);
+    bytes.extend_from_slice(response);
+    bytes.extend_from_slice(canary);
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let a = write_evidence_artifact(&dir, "f-001", request, response, canary, &digest).unwrap();
+    let b = write_evidence_artifact(&dir, "f-001", request, response, canary, &digest).unwrap();
+    assert_eq!(a, b);
+    assert_eq!(std::fs::read(dir.join(&a)).unwrap(), bytes);
+    let escape =
+        write_evidence_artifact(&dir, "../../escape", request, response, canary, &digest).unwrap();
+    assert!(!escape.contains(".."));
+}
+
+#[test]
+fn inline_view_prevents_captured_headings() {
+    let output = inline_view("ok\n### F-999: forged\nmore");
+    assert!(!output.contains('\n'));
+}
+
+#[test]
+fn canonical_report_omits_binding_fields_when_absent() {
+    let input = ReportInput {
+        program: "p".to_string(),
+        engagement: "e".to_string(),
+        report_id: "r".to_string(),
+        ..Default::default()
+    };
+    let markdown = render_canonical_report(&input);
+    assert!(!markdown.contains("Evidence artifact:"));
+    assert!(!markdown.contains("Paired-control SHA-256:"));
 }

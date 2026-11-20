@@ -303,3 +303,14 @@ No effectiveness number may be asserted until those artifacts exist.
   recorded but does not yet bypass it, so no LLM/tool path can self-authorize.
 - Deferred from step 5: ack-driven bypass, version-change revalidation on
   resume, and CLI/desktop authorize entry points.
+
+
+### R14 — Evidence binding in report (COMPLETE)
+- ✅ `ReportFinding` carries 8 evidence-binding fields, populated ONLY from
+  authoritative `tool_captures` / `finding_captures` / store timestamps — never
+  from model-authored finding fields.
+- ✅ Raw evidence bytes written to a deterministic, cwd-confined artifact file
+  (`evidence/<id>-<hash>.bin`); report references it with hash equality.
+- ✅ Canary scrubbed from redacted views; `inline_view` prevents captured bodies
+  from creating fake headings. Renderer lines are additive and guarded.
+- Deferred: step 7 budgets/fan-out and ack-driven bypass (ROE decision).

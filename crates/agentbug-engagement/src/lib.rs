@@ -28,7 +28,7 @@ use agentbug_policy::{BudgetConfig, Mode, PolicyConfig, ScopeConfig};
 use agentbug_store::{
     redact, AuthorizationSnapshot, OpenAuthorizationRule, RuleProvenance, Store, ToolCapture,
 };
-use agentbug_tools::{try_default_registry_with_options, ToolOptions};
+use agentbug_tools::{try_default_registry_with_options, write_evidence_artifact, ToolOptions};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use regex::Regex;
@@ -1324,7 +1324,10 @@ async fn run_engagement(
     let status = status_at(db_path, id)?;
     let report = build_canonical_report(
         store,
-        id,
+        ReportContext {
+            workspace,
+            engagement_id: id,
+        },
         &profile,
         &status,
         &verified_findings,
@@ -3070,9 +3073,54 @@ fn is_self_graded_marker(response: &str, canary: &str) -> bool {
 
 /// Build the single canonical report. Only verified findings are passed to the
 /// renderer; candidates are reported through events and the replay log.
+fn extract_target_binding(request_bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(request_bytes);
+    let first = text.lines().next().unwrap_or("").trim();
+    let host = text
+        .lines()
+        .find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower
+                .strip_prefix("host:")
+                .map(|value| value.trim().to_string())
+        })
+        .unwrap_or_default();
+    format!("{first} Host: {host}")
+}
+
+fn paired_control_digest(store: &Store, finding_id: &str) -> Option<String> {
+    let benign = store.get_role_capture(finding_id, "paired_benign").ok()??;
+    let payload = store
+        .get_role_capture(finding_id, "paired_payload")
+        .ok()??;
+    let digest = |request: &[u8], response: &[u8], canary: &str| {
+        let mut hasher = Sha256::new();
+        hasher.update(request);
+        hasher.update(response);
+        hasher.update(canary.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+    let b = digest(
+        &benign.request_bytes,
+        &benign.response_bytes,
+        &benign.canary,
+    );
+    let p = digest(
+        &payload.request_bytes,
+        &payload.response_bytes,
+        &payload.canary,
+    );
+    Some(hex_digest(format!("{b}{p}").as_bytes()))
+}
+
+struct ReportContext<'a> {
+    workspace: &'a std::path::Path,
+    engagement_id: &'a str,
+}
+
 fn build_canonical_report(
     store: &Store,
-    id: &str,
+    context: ReportContext<'_>,
     profile: &EngagementProfile,
     status: &EngagementStatus,
     verified: &[agentbug_store::Finding],
@@ -3126,12 +3174,40 @@ fn build_canonical_report(
                 finding.vuln_type.as_deref(),
                 Some(&finding.description),
             );
-            let evidence_hash = evidence_hashes
+            let mut evidence_hash = evidence_hashes
                 .get(&finding.id)
                 .cloned()
                 .or_else(|| finding.evidence_hash.clone());
+            let binding = (|| -> Option<(String, String, String, String, String, String)> {
+                let capture = store.get_capture(&finding.id).ok().flatten()?;
+                let canary = capture_canary(&capture);
+                let scrub = |text: String| text.replace(&canary, "<redacted-canary>");
+                let request = scrub(String::from_utf8_lossy(&capture.request_bytes).to_string());
+                let response = scrub(String::from_utf8_lossy(&capture.response_bytes).to_string());
+                let hash = evidence_hash
+                    .clone()
+                    .unwrap_or_else(|| capture_digest(&capture, &canary));
+                evidence_hash = Some(hash.clone());
+                let artifact = write_evidence_artifact(
+                    context.workspace,
+                    &finding.id,
+                    &capture.request_bytes,
+                    &capture.response_bytes,
+                    canary.as_bytes(),
+                    &hash,
+                )
+                .ok()?;
+                Some((
+                    redact(&request),
+                    redact(&response),
+                    artifact,
+                    capture.created_at.clone(),
+                    redact(&extract_target_binding(&capture.request_bytes)),
+                    paired_control_digest(store, &finding.id).unwrap_or_default(),
+                ))
+            })();
             ReportFinding {
-                id: redact(&finding.id),
+                id: redact(context.engagement_id),
                 title: redact(&finding.title),
                 severity,
                 cvss: (score > 0.0).then_some(score),
@@ -3150,12 +3226,27 @@ fn build_canonical_report(
                 evidence_hash,
                 verified: true,
                 platform,
+                evidence_request_redacted: binding.as_ref().map(|b| b.0.clone()),
+                evidence_response_redacted: binding.as_ref().map(|b| b.1.clone()),
+                evidence_canary_redacted: binding
+                    .as_ref()
+                    .map(|_| "agentbug-canary-<redacted>".to_string()),
+                evidence_artifact_path: binding.as_ref().map(|b| b.2.clone()),
+                evidence_capture_source: binding
+                    .as_ref()
+                    .map(|_| "tool_captures (authoritative tool capture)".to_string()),
+                evidence_captured_at: binding.as_ref().map(|b| b.3.clone()),
+                evidence_target_binding: binding.as_ref().map(|b| b.4.clone()),
+                evidence_paired_control_hash: binding
+                    .as_ref()
+                    .filter(|b| !b.5.is_empty())
+                    .map(|b| b.5.clone()),
             }
         })
         .collect();
 
     let coverage = store
-        .list_coverage(id)
+        .list_coverage(context.engagement_id)
         .unwrap_or_default()
         .into_iter()
         .map(|row| {
@@ -3202,7 +3293,7 @@ fn build_canonical_report(
         findings,
         coverage,
         timeline,
-        report_id: redact(id),
+        report_id: redact(context.engagement_id),
     })
 }
 
@@ -3845,7 +3936,10 @@ No DoS testing. Do not modify data. No disclosure.
         };
         let report = build_canonical_report(
             &store,
-            "e",
+            ReportContext {
+                workspace: std::path::Path::new("."),
+                engagement_id: "e",
+            },
             &profile,
             &status,
             &verified,

@@ -190,12 +190,15 @@ proves the tool bytes, not LLM text, reach `tool_captures`.
 
 Other oracle classes remain `open_proof_gap` (no implementation exists).
 
-#### R7b — Program intelligence provenance (DESIGNED, NOT STARTED)
-Additive advisory sidecar (`brief_rule_provenance`) with source URL, section
-pointer, verbatim quote + hash, extractor and observed time. Traced sibling
-parsers delegate to current logic; `ScopeConfig`/`RoePolicy`/ROE fail-closed
-behavior stay byte-identical. Typed assets, eligibility flags, freshness gating
-and platform semantics remain deferred (sources unpinned/stale/license-bound).
+#### R7b — Program intelligence provenance (COMPLETE)
+- ✅ Additive advisory `brief_rule_provenance` table with source URL, section
+  pointer, verbatim quote + SHA-256, document hash, extractor and observed time.
+- ✅ `parse_scope_brief_traced` in policy; legacy parser delegates to it, so
+  scope decisions are structurally identical. Engagement captures deterministic
+  provenance at brief time and persists it best-effort after `save_brief`.
+- ✅ Provenance never feeds `PolicyEngine`, `build_tools`, or ROE enforcement.
+- Deferred: typed assets, eligibility flags, freshness/TTL gating, platform
+  VRT/safe-harbor semantics (sources stale/unpinned/license-restricted).
 
 #### R7c / R8 — Later
 - R7c: JSON Schema validation (offline dependency decision), `Scope` doorbell,

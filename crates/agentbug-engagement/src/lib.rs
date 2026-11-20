@@ -24,7 +24,7 @@ pub use roles::{build_role_tools, role_profile, RoleId};
 use agentbug_core::{build_policy_config, AgentConfig, Runner};
 use agentbug_llm::{ChatMessage, ChatResponse, Llm, LlmClient, LlmConfig};
 use agentbug_policy::{BudgetConfig, Mode, PolicyConfig, ScopeConfig};
-use agentbug_store::{redact, Store, ToolCapture};
+use agentbug_store::{redact, RuleProvenance, Store, ToolCapture};
 use agentbug_tools::{try_default_registry_with_options, ToolOptions};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -705,7 +705,8 @@ async fn run_engagement(
     }
     // H-11: never write an empty extraction snapshot. The deterministic scope
     // parse must be non-empty before any planning or tool execution happens.
-    let mut deterministic_scope = agentbug_policy::parse_scope_brief(&brief_text);
+    let (mut deterministic_scope, scope_traces) =
+        agentbug_policy::parse_scope_brief_traced(&brief_text);
     deterministic_scope.in_scope = deterministic_scope
         .in_scope
         .iter()
@@ -827,6 +828,30 @@ async fn run_engagement(
         &serde_json::to_string(&profile.scope)?,
         &serde_json::to_string(&profile.reporting_rules)?,
     );
+    // Advisory provenance only. These rows never influence scope matching,
+    // tool gating, or ROE enforcement; they exist solely for audit/replay.
+    let content_hash = format!("{:x}", Sha256::digest(brief_text.as_bytes()));
+    let observed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+    let provenance: Vec<RuleProvenance> = scope_traces
+        .iter()
+        .map(|trace| RuleProvenance {
+            engagement_id: id.to_string(),
+            rule_kind: trace.kind.to_string(),
+            rule_value: trace.value.clone(),
+            source_url: program_url.to_string(),
+            section_pointer: trace.section.clone(),
+            verbatim_quote: trace.quote.clone(),
+            verbatim_quote_hash: format!("{:x}", Sha256::digest(trace.quote.as_bytes())),
+            content_hash: content_hash.clone(),
+            extractor: "deterministic".to_string(),
+            observed_at: observed_at.clone(),
+        })
+        .collect();
+    let _ = store.save_rule_provenance(&provenance);
     let _ = store.append_trace(
         id,
         id,

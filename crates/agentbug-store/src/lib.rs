@@ -225,6 +225,22 @@ pub struct RoleCapture {
     pub created_at: String,
 }
 
+/// Advisory provenance for one brief-derived rule. Never used to authorize
+/// an action; it only records where a rule came from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleProvenance {
+    pub engagement_id: String,
+    pub rule_kind: String,
+    pub rule_value: String,
+    pub source_url: String,
+    pub section_pointer: String,
+    pub verbatim_quote: String,
+    pub verbatim_quote_hash: String,
+    pub content_hash: String,
+    pub extractor: String,
+    pub observed_at: String,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -409,6 +425,16 @@ impl Store {
                id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, raw_html TEXT,
                extracted_json TEXT, scope_json TEXT, roe_json TEXT, created_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS brief_rule_provenance(
+               id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL,
+               rule_kind TEXT NOT NULL, rule_value TEXT NOT NULL,
+               source_url TEXT NOT NULL, section_pointer TEXT,
+               verbatim_quote TEXT NOT NULL, verbatim_quote_hash TEXT NOT NULL,
+               content_hash TEXT NOT NULL, extractor TEXT NOT NULL,
+               observed_at TEXT NOT NULL, created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_brief_rule_provenance_engagement
+               ON brief_rule_provenance(engagement_id);
              CREATE TABLE IF NOT EXISTS tasks(
                id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, statement TEXT NOT NULL,
                playbook_id TEXT NOT NULL DEFAULT '', target TEXT, priority INTEGER NOT NULL DEFAULT 0,
@@ -3501,6 +3527,61 @@ impl Store {
     }
 }
 
+impl Store {
+    pub fn save_rule_provenance(&self, rows: &[RuleProvenance]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        for row in rows {
+            conn.execute(
+                "INSERT INTO brief_rule_provenance(id, engagement_id, rule_kind, rule_value,
+                 source_url, section_pointer, verbatim_quote, verbatim_quote_hash,
+                 content_hash, extractor, observed_at, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    row.engagement_id,
+                    row.rule_kind,
+                    row.rule_value,
+                    row.source_url,
+                    row.section_pointer,
+                    row.verbatim_quote,
+                    row.verbatim_quote_hash,
+                    row.content_hash,
+                    row.extractor,
+                    row.observed_at,
+                    now()
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_rule_provenance(&self, engagement_id: &str) -> Result<Vec<RuleProvenance>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT engagement_id, rule_kind, rule_value, source_url, section_pointer,
+             verbatim_quote, verbatim_quote_hash, content_hash, extractor, observed_at
+             FROM brief_rule_provenance WHERE engagement_id=?1 ORDER BY rowid",
+        )?;
+        let rows = stmt
+            .query_map(params![engagement_id], |r| {
+                Ok(RuleProvenance {
+                    engagement_id: r.get(0)?,
+                    rule_kind: r.get(1)?,
+                    rule_value: r.get(2)?,
+                    source_url: r.get(3)?,
+                    section_pointer: r.get(4)?,
+                    verbatim_quote: r.get(5)?,
+                    verbatim_quote_hash: r.get(6)?,
+                    content_hash: r.get(7)?,
+                    extractor: r.get(8)?,
+                    observed_at: r.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
 /// Provenance-bearing memory row. `role` and `scope_key` are opaque to the
 /// kernel; the domain owns their meaning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5363,4 +5444,27 @@ fn http_capture_flows_to_a_later_finding_without_llm_bytes() {
     assert_eq!(capture.canary, "agentbug-canary-abc");
     assert!(String::from_utf8_lossy(&capture.response_bytes).contains("reflected canary"));
     assert!(store.take_session_capture(&session.id).unwrap().is_none());
+}
+
+#[test]
+fn rule_provenance_round_trips_and_does_not_change_scope_decisions() {
+    let store = Store::open(":memory:").unwrap();
+    let rows = vec![RuleProvenance {
+        engagement_id: "e".to_string(),
+        rule_kind: "scope_in".to_string(),
+        rule_value: "example.com".to_string(),
+        source_url: "https://hackerone.com/acme".to_string(),
+        section_pointer: "In scope".to_string(),
+        verbatim_quote: "- example.com".to_string(),
+        verbatim_quote_hash: sha256_hex("- example.com"),
+        content_hash: sha256_hex("brief"),
+        extractor: "deterministic".to_string(),
+        observed_at: "1".to_string(),
+    }];
+    store.save_rule_provenance(&rows).unwrap();
+    let loaded = store.list_rule_provenance("e").unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].rule_value, "example.com");
+    assert_eq!(loaded[0].verbatim_quote_hash, sha256_hex("- example.com"));
+    assert_eq!(loaded[0].content_hash, sha256_hex("brief"));
 }

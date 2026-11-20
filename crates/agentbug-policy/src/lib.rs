@@ -165,11 +165,22 @@ impl ScopeConfig {
     }
 }
 
-/// Parse a human-authored program brief into a ScopeConfig.
-/// Section headings switch between in-scope and out-of-scope patterns;
-/// lines beginning with `-` or `*` are treated as patterns.
-pub fn parse_scope_brief(text: &str) -> ScopeConfig {
+/// Advisory trace for one brief-derived scope rule. Never consulted by
+/// `PolicyEngine`; it exists only so the domain can record where a rule came
+/// from. `kind` is `scope_in` or `scope_out`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeRuleTrace {
+    pub kind: &'static str,
+    pub value: String,
+    pub quote: String,
+    pub section: String,
+}
+
+/// Parse with provenance. The legacy [`parse_scope_brief`] delegates here and
+/// discards the traces, giving one implementation of matching semantics.
+pub fn parse_scope_brief_traced(text: &str) -> (ScopeConfig, Vec<ScopeRuleTrace>) {
     let mut scope = ScopeConfig::default();
+    let mut traces = Vec::new();
     let mut out_section = false;
     let mut notes = Vec::new();
     for raw in text.lines() {
@@ -198,8 +209,6 @@ pub fn parse_scope_brief(text: &str) -> ScopeConfig {
             .or_else(|| line.strip_prefix('-'))
             .unwrap_or(line)
             .trim();
-        // Scope patterns are single tokens: hosts, `*.` wildcards, URLs or CIDRs.
-        // Prose lines (which contain spaces) remain notes.
         let looks_like_pattern = !candidate.is_empty()
             && !candidate.contains(char::is_whitespace)
             && (candidate.starts_with("*.")
@@ -207,11 +216,23 @@ pub fn parse_scope_brief(text: &str) -> ScopeConfig {
                 || candidate.contains('/')
                 || candidate.contains(':'));
         if looks_like_pattern {
+            let kind = if out_section { "scope_out" } else { "scope_in" };
             if out_section {
                 scope.out_of_scope.push(candidate.to_string());
             } else {
                 scope.in_scope.push(candidate.to_string());
             }
+            traces.push(ScopeRuleTrace {
+                kind,
+                value: candidate.to_string(),
+                quote: line.to_string(),
+                section: if out_section {
+                    "Out of scope"
+                } else {
+                    "In scope"
+                }
+                .to_string(),
+            });
             continue;
         }
         notes.push(line.to_string());
@@ -219,7 +240,12 @@ pub fn parse_scope_brief(text: &str) -> ScopeConfig {
     if !notes.is_empty() {
         scope.notes = Some(notes.join(" | "));
     }
-    scope
+    (scope, traces)
+}
+
+/// Parse a human-authored program brief into a ScopeConfig.
+pub fn parse_scope_brief(text: &str) -> ScopeConfig {
+    parse_scope_brief_traced(text).0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -651,5 +677,26 @@ mod tests {
         assert_eq!(b.max_tool_calls, 7);
         assert_eq!(b.max_network_calls, 3);
         assert_eq!(b.requests_per_minute, 10);
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    #[test]
+    fn traced_parser_matches_legacy_decision() {
+        let brief = "Program: Acme\nIn scope\n- example.com\n- *.example.org\nOut of scope\n- admin.example.com\nSome note here";
+        let legacy = parse_scope_brief(brief);
+        let (traced, traces) = parse_scope_brief_traced(brief);
+        assert_eq!(legacy.in_scope, traced.in_scope);
+        assert_eq!(legacy.out_of_scope, traced.out_of_scope);
+        assert_eq!(legacy.engagement, traced.engagement);
+        assert_eq!(legacy.notes, traced.notes);
+        assert_eq!(traces.len(), 3);
+        assert_eq!(traces[0].kind, "scope_in");
+        assert_eq!(traces[0].value, "example.com");
+        assert_eq!(traces[2].kind, "scope_out");
+        assert!(traces[0].quote.contains("example.com"));
     }
 }

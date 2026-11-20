@@ -1337,6 +1337,29 @@ impl Tool for ValidatePoCTool {
             replay["body"] = body.clone();
         }
         let response = self.http.run(replay).await?;
+        // Tool-minted benign control: same endpoint and method, but a distinct
+        // local label in the request. The HTTP tool derives a fresh canary from
+        // the request bytes, so the benign and payload captures can never share
+        // a marker. The model never supplies or sees the benign label.
+        let benign_label = format!(
+            "benign-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let mut benign_replay = json!({"url": url, "method": method});
+        if let Some(headers) = input.get("headers") {
+            benign_replay["headers"] = headers.clone();
+        }
+        if benign_replay.get("headers").is_none() {
+            benign_replay["headers"] = json!({});
+        }
+        benign_replay["headers"]["X-AgentBug-Control"] = json!(benign_label);
+        if let Some(body) = input.get("body") {
+            benign_replay["body"] = body.clone();
+        }
+        let benign_response = self.http.run(benign_replay).await.ok();
         let status = response
             .structured
             .as_ref()
@@ -1371,6 +1394,15 @@ impl Tool for ValidatePoCTool {
         if let Some(http_structured) = response.structured.as_ref() {
             if let Some(capture) = http_structured.get("capture") {
                 structured["capture"] = capture.clone();
+                if let Some(benign) = benign_response
+                    .as_ref()
+                    .and_then(|r| r.structured.as_ref().and_then(|v| v.get("capture")))
+                {
+                    structured["paired_capture"] = json!({
+                        "benign": benign,
+                        "payload": capture,
+                    });
+                }
             }
             if let Some(error) = http_structured.get("error") {
                 structured["error"] = error.clone();

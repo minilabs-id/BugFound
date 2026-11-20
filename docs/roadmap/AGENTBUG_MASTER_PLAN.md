@@ -177,8 +177,18 @@ result has no capture of its own. LLM-supplied request/response remain advisory.
 Regression test `http_capture_flows_to_a_later_finding_without_llm_bytes`
 proves the tool bytes, not LLM text, reach `tool_captures`.
 
-Still deferred: tool-minted benign/payload pairs in `ValidatePoCTool` and the
-authoritative `ruled_out` decision. Until those exist, verdicts stay advisory.
+#### R7a-3 — Paired control & authoritative closure (COMPLETE)
+- ✅ `ValidatePoCTool` runs a tool-minted benign control alongside the payload;
+  both captures carry distinct HTTP-tool canaries and are stored as role-tagged
+  `finding_captures` (never from LLM input).
+- ✅ `verify_findings` rules a candidate out only on a benign-success /
+  payload-blocked contrast with matching tool markers; anything else becomes
+  `open_proof_gap`. Verdicts never stamp `validated_at`, so ruled-out and
+  uncertain findings cannot enter `verified_findings`.
+- ✅ Negative-control tests: benign failure and missing pair stay
+  `open_proof_gap`; full pair yields `ruled_out`.
+
+Other oracle classes remain `open_proof_gap` (no implementation exists).
 
 #### R7b — Program intelligence provenance (DESIGNED, NOT STARTED)
 Additive advisory sidecar (`brief_rule_provenance`) with source URL, section

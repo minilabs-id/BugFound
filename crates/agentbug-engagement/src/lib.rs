@@ -2350,6 +2350,7 @@ fn verify_findings(
                 "candidate": redact(&finding.id),
                 "verified": verified,
                 "rejected": !verified,
+                "verdict": if verified { "confirmed" } else if !finding.id.trim().is_empty() { paired_control_verdict(store, &finding.id) } else { "open_proof_gap" },
             }),
         );
         trace.record(
@@ -2365,6 +2366,15 @@ fn verify_findings(
         );
 
         if !verified {
+            if !finding.id.trim().is_empty() {
+                let verdict = paired_control_verdict(store, &finding.id);
+                let reason = if verdict == "ruled_out" {
+                    None
+                } else {
+                    Some("no authoritative benign-success/payload-blocked control pair")
+                };
+                let _ = store.set_finding_verdict(&finding.id, verdict, reason);
+            }
             continue;
         }
         let hash = capture_hash.expect("verified finding has a capture hash");
@@ -2375,6 +2385,41 @@ fn verify_findings(
         promoted += 1;
     }
     Ok(promoted)
+}
+
+/// Authoritative paired-control decision. Both exchanges must be tool-captured
+/// with distinct tool-minted markers; a benign success plus a blocked payload
+/// is the only condition that rules a candidate out. Anything else stays an
+/// open proof gap, never a silent "safe" conclusion.
+fn paired_control_verdict(store: &Store, finding_id: &str) -> &'static str {
+    let (Ok(Some(benign)), Ok(Some(payload))) = (
+        store.get_role_capture(finding_id, "paired_benign"),
+        store.get_role_capture(finding_id, "paired_payload"),
+    ) else {
+        return "open_proof_gap";
+    };
+    let (Some(b_marker), Some(p_marker)) = (benign.marker.as_deref(), payload.marker.as_deref())
+    else {
+        return "open_proof_gap";
+    };
+    if b_marker.is_empty() || p_marker.is_empty() || b_marker == p_marker {
+        return "open_proof_gap";
+    }
+    let benign_request = String::from_utf8_lossy(&benign.request_bytes);
+    let payload_request = String::from_utf8_lossy(&payload.request_bytes);
+    let benign_response = String::from_utf8_lossy(&benign.response_bytes);
+    let payload_response = String::from_utf8_lossy(&payload.response_bytes);
+    if !benign_request.contains(b_marker) || !payload_request.contains(p_marker) {
+        return "open_proof_gap";
+    }
+    let benign_success = has_success_status(&benign_response) && benign_response.contains(b_marker);
+    let payload_blocked =
+        !has_success_status(&payload_response) || !payload_response.contains(p_marker);
+    if benign_success && payload_blocked {
+        "ruled_out"
+    } else {
+        "open_proof_gap"
+    }
 }
 
 fn has_success_status(response: &str) -> bool {
@@ -2659,7 +2704,7 @@ mod tests {
     use super::*;
     use agentbug_tools::Tool;
 
-    fn temp_db(name: &str) -> PathBuf {
+    pub(super) fn temp_db(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "agentbug-hardening-{name}-{}.db",
             std::process::id()
@@ -2669,7 +2714,12 @@ mod tests {
     }
 
     /// Persist an authoritative tool capture for a finding (B1).
-    fn capture_for(store: &Store, finding: &agentbug_store::Finding, response: &str, canary: &str) {
+    pub(super) fn capture_for(
+        store: &Store,
+        finding: &agentbug_store::Finding,
+        response: &str,
+        canary: &str,
+    ) {
         store
             .attach_capture(
                 &finding.id,
@@ -3030,7 +3080,11 @@ No DoS testing. Do not modify data. No disclosure.
         assert!(!roe.allow_state_change);
     }
 
-    fn stored_finding(store: &Store, session: &str, response: &str) -> agentbug_store::Finding {
+    pub(super) fn stored_finding(
+        store: &Store,
+        session: &str,
+        response: &str,
+    ) -> agentbug_store::Finding {
         store
             .add_finding_with_evidence(
                 session,
@@ -3474,5 +3528,115 @@ mod r5_tests {
         let unknown = classify_cwe("nothing particular", None, None);
         assert_eq!(unknown.cwe, "CWE-284");
         assert_eq!(unknown.basis, CweBasis::Unclassified);
+    }
+}
+
+#[cfg(test)]
+mod r7a_tests {
+    use super::tests::{capture_for, stored_finding, temp_db};
+    use super::*;
+
+    fn add_pair(store: &Store, finding_id: &str, benign_ok: bool) {
+        store
+            .attach_role_capture(
+                finding_id,
+                "paired_benign",
+                b"GET /safe HTTP/1.1\nX-AgentBug-Canary: benign-marker\r\n\r\n",
+                if benign_ok {
+                    b"HTTP/1.1 200 OK\nreflected benign-marker"
+                } else {
+                    b"HTTP/1.1 403 Forbidden\nblocked"
+                },
+                "benign-canary",
+                Some("benign-marker"),
+            )
+            .unwrap();
+        store
+            .attach_role_capture(
+                finding_id,
+                "paired_payload",
+                b"GET /payload HTTP/1.1\nX-AgentBug-Canary: payload-marker\r\n\r\n",
+                b"HTTP/1.1 403 Forbidden\nblocked",
+                "payload-canary",
+                Some("payload-marker"),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn paired_control_benign_success_payload_blocked_is_ruled_out() {
+        let db = temp_db("r7a-ruled-out");
+        let store = Store::open(&db).unwrap();
+        let session = "r7a-ruled-out";
+        let finding = stored_finding(&store, session, "HTTP/1.1 403 Forbidden\nblocked");
+        capture_for(
+            &store,
+            &finding,
+            "HTTP/1.1 403 Forbidden\nblocked",
+            "primary-canary",
+        );
+        add_pair(&store, &finding.id, true);
+
+        let mut trace = TraceRun::new(session);
+        let promoted = verify_findings(&store, session, &RoePolicy::default(), &mut trace).unwrap();
+        assert_eq!(promoted, 0);
+        let updated = store
+            .list_findings(session)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == finding.id)
+            .unwrap();
+        assert_eq!(updated.verdict.as_deref(), Some("ruled_out"));
+        assert!(updated.validated_at.is_none());
+        assert!(store.verified_findings(session).unwrap().is_empty());
+    }
+
+    #[test]
+    fn benign_failure_stays_open_proof_gap() {
+        let db = temp_db("r7a-gap");
+        let store = Store::open(&db).unwrap();
+        let session = "r7a-gap";
+        let finding = stored_finding(&store, session, "HTTP/1.1 403 Forbidden\nblocked");
+        capture_for(
+            &store,
+            &finding,
+            "HTTP/1.1 403 Forbidden\nblocked",
+            "primary-canary",
+        );
+        add_pair(&store, &finding.id, false);
+
+        let mut trace = TraceRun::new(session);
+        verify_findings(&store, session, &RoePolicy::default(), &mut trace).unwrap();
+        let updated = store
+            .list_findings(session)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == finding.id)
+            .unwrap();
+        assert_eq!(updated.verdict.as_deref(), Some("open_proof_gap"));
+        assert!(updated.validated_at.is_none());
+    }
+
+    #[test]
+    fn missing_paired_control_is_open_proof_gap() {
+        let db = temp_db("r7a-no-pair");
+        let store = Store::open(&db).unwrap();
+        let session = "r7a-no-pair";
+        let finding = stored_finding(&store, session, "HTTP/1.1 403 Forbidden\nblocked");
+        capture_for(
+            &store,
+            &finding,
+            "HTTP/1.1 403 Forbidden\nblocked",
+            "primary-canary",
+        );
+        let mut trace = TraceRun::new(session);
+        verify_findings(&store, session, &RoePolicy::default(), &mut trace).unwrap();
+        let updated = store
+            .list_findings(session)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == finding.id)
+            .unwrap();
+        assert_eq!(updated.verdict.as_deref(), Some("open_proof_gap"));
     }
 }

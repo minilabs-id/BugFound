@@ -3039,6 +3039,40 @@ pub fn persist_tool_result(
             session = %session_id,
             "ignoring tool-reported validation; engagement verifier is authoritative"
         );
+        // The paired control bytes come from the tool, never from LLM args.
+        // They are stored as role-tagged captures for the verifier; this path
+        // still never promotes a finding.
+        if let Some(finding_id) = args.get("finding_id").and_then(|v| v.as_str()) {
+            if let Some(paired) = result
+                .structured
+                .as_ref()
+                .and_then(|v| v.get("paired_capture"))
+            {
+                for (role, key) in [("paired_benign", "benign"), ("paired_payload", "payload")] {
+                    if let Some(capture) = paired.get(key) {
+                        let request = capture
+                            .get("request")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let response = capture
+                            .get("response")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let canary = capture.get("canary").and_then(|v| v.as_str()).unwrap_or("");
+                        if !request.is_empty() && !response.is_empty() && !canary.is_empty() {
+                            let _ = store.attach_role_capture(
+                                finding_id,
+                                role,
+                                request.as_bytes(),
+                                response.as_bytes(),
+                                canary,
+                                Some(canary),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

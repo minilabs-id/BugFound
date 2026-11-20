@@ -1,7 +1,8 @@
 # ADR-008: Verification Oracle Model and Canary Satisfiability
 
-- Status: Accepted (R1). R1.1 fix implemented; multi-oracle/ternary closure
-  deferred to R5.
+- Status: Accepted (R1). R1.1 canary injection, R7a paired-control closure and
+  tool-bound finding-capture attachment implemented. Other oracle classes
+  (state_delta/timing/oob_hit/browser_deferred) remain deferred.
 - Date: 2026-11-20
 - Basis: deep-dive P0 investigation; research `04`, `06`, `09`, `11`, `14`, `16`
 

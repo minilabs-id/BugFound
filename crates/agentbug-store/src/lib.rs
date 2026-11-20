@@ -3109,6 +3109,32 @@ impl Store {
         Ok(settled)
     }
 
+    /// Successful low-risk results eligible for repeat echo. The risk filter
+    /// is applied to the stored, host-owned label; a tool re-registered under
+    /// a different hint cannot make a dangerous result echoable.
+    pub fn recent_echoable_results_for_signature(
+        &self,
+        session_id: &str,
+        name: &str,
+        args_sig: &str,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT result_text FROM tool_calls
+             WHERE session_id=?1 AND name=?2 AND args_sig=?3
+               AND status='ok' AND ok=1 AND risk IN ('safe','read')
+               AND result_text IS NOT NULL
+             ORDER BY rowid DESC LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, name, args_sig, limit], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Drain any parked deferred calls into terminal tool messages.
     pub fn settle_pending_calls(&self, session_id: &str, status_text: &str) -> Result<usize> {
         let approval_ids: Vec<String> = {
@@ -4678,5 +4704,30 @@ mod tests {
             })
             .unwrap();
         assert_eq!(risk, "network");
+    }
+
+    #[test]
+    fn echoable_results_only_include_low_risk_successes() {
+        let store = Store::open(":memory:").unwrap();
+        for (id, risk, ok, status, text) in [
+            ("a", "safe", true, "ok", "A"),
+            ("b", "read", true, "ok", "B"),
+            ("c", "network", true, "ok", "C"),
+            ("d", "write", true, "ok", "D"),
+            ("e", "safe", false, "error", "E"),
+        ] {
+            let row = store
+                .start_tool_call("s", None, "echo", "{}", "sig", risk)
+                .unwrap();
+            assert!(!row.is_empty());
+            let _ = id;
+            store
+                .finish_tool_call(&row, status, Some(ok), Some(text))
+                .unwrap();
+        }
+        let results = store
+            .recent_echoable_results_for_signature("s", "echo", "sig", 8)
+            .unwrap();
+        assert_eq!(results, vec!["B".to_string(), "A".to_string()]);
     }
 }

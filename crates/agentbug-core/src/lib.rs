@@ -93,6 +93,8 @@ const DEFAULT_LEASE_SECS: i64 = 120;
 const DEFAULT_APPROVAL_TTL_SECS: i64 = 900;
 /// A tool call may repeat this many times before the duplicate guard skips it.
 const MAX_DUPLICATE_REPEATS: usize = 2;
+/// Number of recent successful low-risk results considered for repeat echo.
+const REPEAT_ECHO_WINDOW: i64 = 4;
 /// Window during which a 429/403 target stays on cooldown.
 const COOLDOWN_SECS: u64 = 30;
 
@@ -104,9 +106,11 @@ const GUARD_APPROVAL: &str = "approval:";
 const GUARD_REAPPROVE: &str = "reapprove:";
 /// Marker on a hard policy/goal denial; the tool result reports `DENIED`.
 const GUARD_DENY: &str = "deny:";
+/// Marker for a repeated tool call; eligible low-risk calls echo the prior result.
+const GUARD_DUPLICATE: &str = "duplicate:";
 
 fn strip_guard_prefix(reason: &str) -> &str {
-    [GUARD_APPROVAL, GUARD_REAPPROVE, GUARD_DENY]
+    [GUARD_APPROVAL, GUARD_REAPPROVE, GUARD_DENY, GUARD_DUPLICATE]
         .into_iter()
         .find_map(|prefix| reason.strip_prefix(prefix))
         .unwrap_or(reason)
@@ -859,7 +863,7 @@ impl Runner {
             let seen = durable_duplicate_count(&self.store, session_id, &signature) + 1;
             if seen > MAX_DUPLICATE_REPEATS {
                 return Some(format!(
-                    "duplicate tool call ignored ({seen} repeats): choose a different target or parameter"
+                    "{GUARD_DUPLICATE}duplicate tool call ignored ({seen} repeats): choose a different target or parameter"
                 ));
             }
             // Mirror the count durably so a fresh Runner sees the repeats.
@@ -1408,6 +1412,92 @@ impl Runner {
 
     /// Execute one tool call that was deferred because an earlier call in the
     /// same assistant batch required approval. Policy and budget are rechecked.
+    /// Execute a tool with a durable lifecycle row. Echoes and blocks never
+    /// reach this helper, so only real executions enter the repeat window.
+    async fn run_tool_recorded(
+        &self,
+        session_id: &str,
+        tool: &dyn agentbug_tools::Tool,
+        spec: &agentbug_tools::ToolSpec,
+        args: serde_json::Value,
+        tool_call_id: Option<&str>,
+    ) -> Result<agentbug_tools::ToolResult> {
+        let signature = normalized_args_signature(&spec.name, &args);
+        let risk = self.tools.host_risk(&spec.name).to_string();
+        let row = self.store.start_tool_call(
+            session_id,
+            tool_call_id,
+            &spec.name,
+            &args.to_string(),
+            &signature,
+            &risk,
+        )?;
+        let outcome = tool.run(args).await;
+        match &outcome {
+            Ok(result) => {
+                let text = truncate_event(&Self::tool_message_text(result), 4096);
+                let status = if result.ok { "ok" } else { "error" };
+                let _ = self
+                    .store
+                    .finish_tool_call(&row, status, Some(result.ok), Some(&text));
+            }
+            Err(err) => {
+                let text = truncate_event(&format!("error={err}"), 4096);
+                let _ = self
+                    .store
+                    .finish_tool_call(&row, "error", Some(false), Some(&text));
+            }
+        }
+        outcome
+    }
+
+    /// Route a duplicate guard result to a prior-result echo when the host
+    /// classification is low-risk and a successful result exists; otherwise
+    /// keep the original hard block byte-identical.
+    fn report_duplicate_or_block(
+        &self,
+        session_id: &str,
+        spec: &agentbug_tools::ToolSpec,
+        args: &serde_json::Value,
+        tool_call_id: Option<&str>,
+        block: &str,
+        deny_prefix: &str,
+    ) -> Result<()> {
+        if !block.starts_with(GUARD_DUPLICATE) {
+            return self.report_blocked_call(session_id, spec, tool_call_id, block, deny_prefix);
+        }
+        let reason = strip_guard_prefix(block);
+        let host_risk = self.tools.host_risk(&spec.name);
+        let prior = if matches!(host_risk, "safe" | "read") {
+            let signature = normalized_args_signature(&spec.name, args);
+            self.store
+                .recent_echoable_results_for_signature(
+                    session_id,
+                    &spec.name,
+                    &signature,
+                    REPEAT_ECHO_WINDOW,
+                )
+                .ok()
+                .and_then(|rows| rows.into_iter().next())
+        } else {
+            None
+        };
+        if let Some(text) = prior {
+            let text = truncate_event(&text, 4096);
+            self.store.add_message_full(
+                session_id,
+                "tool",
+                &text,
+                tool_call_id,
+                None,
+                Some(&spec.name),
+            )?;
+            self.log_event(session_id, "warn", "tool.duplicate_skipped", reason);
+            return Ok(());
+        }
+        self.report_blocked_call(session_id, spec, tool_call_id, block, deny_prefix)
+    }
+
     async fn execute_deferred_call(
         &self,
         session_id: &str,
@@ -1439,11 +1529,27 @@ impl Runner {
         let block =
             self.pre_execute_guards(session_id, &self.owner_id, &spec, &args, target.as_deref());
         if let Some(block) = block.as_deref().filter(|b| !b.starts_with(GUARD_APPROVAL)) {
-            self.report_blocked_call(session_id, &spec, call.tool_call_id.as_deref(), block, "")?;
+            self.report_duplicate_or_block(
+                session_id,
+                &spec,
+                &args,
+                call.tool_call_id.as_deref(),
+                block,
+                "",
+            )?;
             return Ok(());
         }
         self.check_stop(session_id)?;
-        match tool.run(args.clone()).await {
+        match self
+            .run_tool_recorded(
+                session_id,
+                tool.as_ref(),
+                &spec,
+                args.clone(),
+                call.tool_call_id.as_deref(),
+            )
+            .await
+        {
             Ok(result) => {
                 self.record_call(session_id, &spec);
                 self.domain
@@ -1542,9 +1648,10 @@ impl Runner {
                 block
             };
             if let Some(block) = block.as_deref() {
-                self.report_blocked_call(
+                self.report_duplicate_or_block(
                     session_id,
                     &spec,
+                    &args,
                     tool_call_id.as_deref(),
                     block,
                     "policy changed: ",
@@ -1557,7 +1664,16 @@ impl Runner {
                     "tool.execute",
                     &format!("tool={} (approved)", spec.name),
                 );
-                match tool.run(args.clone()).await {
+                match self
+                    .run_tool_recorded(
+                        session_id,
+                        tool.as_ref(),
+                        &spec,
+                        args.clone(),
+                        tool_call_id.as_deref(),
+                    )
+                    .await
+                {
                     Ok(result) => {
                         self.record_call(session_id, &spec);
                         if let Some(target) = extract_policy_target(&args) {
@@ -1861,7 +1977,15 @@ impl Runner {
                                     self.tools.host_risk(&spec.name)
                                 ),
                             );
-                            let result = tool.run(tc.arguments.clone()).await;
+                            let result = self
+                                .run_tool_recorded(
+                                    session_id,
+                                    tool.as_ref(),
+                                    &spec,
+                                    tc.arguments.clone(),
+                                    Some(&tc.id),
+                                )
+                                .await;
                             match result {
                                 Ok(r) => {
                                     self.record_call(session_id, &spec);
@@ -2001,7 +2125,14 @@ impl Runner {
                         Some(block) => {
                             // Hard block (goal drift, duplicate, cooldown,
                             // budget or policy deny): no approval is offered.
-                            self.report_blocked_call(session_id, &spec, Some(&tc.id), &block, "")?;
+                            self.report_duplicate_or_block(
+                                session_id,
+                                &spec,
+                                &tc.arguments,
+                                Some(&tc.id),
+                                &block,
+                                "",
+                            )?;
                         }
                     }
                 }

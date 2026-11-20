@@ -2038,3 +2038,123 @@ async fn session_finish_tool_terminates_explicitly() {
     assert_eq!(session.state, "completed");
     assert!(store.verify_event_chain(&session.id).unwrap());
 }
+
+struct CountingEcho {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    host_risk: &'static str,
+}
+
+#[async_trait]
+impl Tool for CountingEcho {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "echo".to_string(),
+            description: String::new(),
+            input_schema: json!({"type":"object","properties":{"text":{"type":"string"}}}),
+            risk: self.host_risk.to_string(),
+        }
+    }
+
+    async fn run(&self, _input: Value) -> Result<ToolResult> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        Ok(ToolResult {
+            ok: true,
+            output: format!("call-{n}"),
+            structured: None,
+        })
+    }
+}
+
+async fn run_duplicate_scenario(
+    host_risk: &'static str,
+) -> (Store, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let store = Store::open(":memory:").unwrap();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let repeat = || ToolCall {
+        id: "x".to_string(),
+        name: "echo".to_string(),
+        arguments: json!({"text":"same"}),
+    };
+    let llm = Arc::new(MockLlm::new(
+        "m",
+        vec![
+            ChatResponse {
+                content: None,
+                tool_calls: vec![repeat()],
+                model: "m".to_string(),
+            },
+            ChatResponse {
+                content: None,
+                tool_calls: vec![repeat()],
+                model: "m".to_string(),
+            },
+            ChatResponse {
+                content: None,
+                tool_calls: vec![repeat()],
+                model: "m".to_string(),
+            },
+            ChatResponse {
+                content: Some("done".to_string()),
+                tool_calls: vec![],
+                model: "m".to_string(),
+            },
+        ],
+    ));
+    let mut tools = ToolRegistry::new();
+    tools.register_with_host_risk(
+        Arc::new(CountingEcho {
+            calls: calls.clone(),
+            host_risk,
+        }),
+        host_risk,
+    );
+    let runner = Runner::new(
+        store.clone(),
+        llm,
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            max_steps: 8,
+            ..Default::default()
+        },
+    );
+    let _ = runner.run_goal("dup").await;
+    (store, calls)
+}
+
+#[tokio::test]
+async fn duplicate_safe_tool_echoes_prior_result() {
+    let (store, calls) = run_duplicate_scenario("safe").await;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let messages = store.list_sessions(10).unwrap();
+    let session_id = &messages[0].id;
+    let text = store
+        .list_messages(session_id)
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.role == "tool")
+        .map(|m| m.content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("call-2"),
+        "prior result must be echoed: {text}"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_dangerous_tool_keeps_hard_block() {
+    let (store, calls) = run_duplicate_scenario("network-write").await;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let sessions = store.list_sessions(10).unwrap();
+    let text = store
+        .list_messages(&sessions[0].id)
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.role == "tool")
+        .map(|m| m.content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("duplicate tool call ignored"), "{text}");
+}

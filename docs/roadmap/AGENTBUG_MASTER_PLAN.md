@@ -78,18 +78,18 @@ Exit evidence: 222 tests green, fmt/clippy `-D warnings` green.
    Five local `TcpListener` fixture tests cover fallback, no-fallback-on-auth,
    verbatim exhaustion errors and generic-404 handling. Core is untouched; the
    config file does not yet expose `fallback_models`.
-2. ✅ (partial) `tool_calls` table, host-risk consistency and explicit
-   `session.finish` terminal tool. Intercepted in deferred, approval-resume and
-   main-loop paths; still checks goal lock and stop before committing; exempt
-   from policy/budget/approval. Remaining: table-backed sliding-window repeat
-   echo and one-shot arg repair (repair deferred: needs typed tool errors and
-   schema validation).
+2. ✅ `tool_calls` table, host-risk consistency, explicit `session.finish`
+   terminal tool, and table-backed sliding-window repeat echo. Echo is limited
+   to host-owned `safe`/`read` tools with a prior successful result; dangerous
+   tools keep the hard block. Existing flag detector is retained; the table is
+   the echo source. One-shot arg repair remains deferred (needs typed tool
+   errors and schema validation).
 3. `Scope` doorbell coalescing / re-drain — no production consumer yet.
 4. ✅ (partial) Tool `risk` is frozen as host-owned registry metadata. JSON
    Schema validation remains deferred: `jsonschema` is not in the offline cargo
    cache; adding it needs an explicit dependency/network decision.
 
-Do not start R4 until R3c is completed or explicitly re-scoped.
+R3c is now complete except the explicitly deferred JSON Schema item. R4 may proceed.
 
 ### R4 — Multi-agent & memory (10–14 days)
 - Role profiles with tool allowlists; General + ProgramIntel + Recon + Research + Testing + Verification + Report.

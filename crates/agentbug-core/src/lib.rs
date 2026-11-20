@@ -19,6 +19,7 @@ pub mod error;
 pub mod event;
 pub mod execution;
 pub mod inbox;
+pub mod monitor;
 pub mod step;
 
 /// Durable per-session flag used to request an interrupt from any process.
@@ -87,6 +88,9 @@ pub use error::AgentError;
 pub use event::EventBus;
 pub use execution::ExecutionCoordinator;
 pub use inbox::Inbox;
+pub use monitor::{
+    HealthReport, Monitor, MonitorConfig, MonitorSnapshot, MonitorState, JOURNAL_CLAIM,
+};
 
 const DEFAULT_LEASE_SECS: i64 = 120;
 /// TTL for a freshly parked approval, matching `Store::create_approval`.
@@ -472,7 +476,7 @@ impl Runner {
         let (level, kind) = if state == "failed" {
             ("error", "session.failed")
         } else {
-            ("info", "session.finish")
+            ("info", "session_finish")
         };
         self.finish(session_id, state, level, kind, &reason);
         Ok(TerminalOutcome::Finished(reason))

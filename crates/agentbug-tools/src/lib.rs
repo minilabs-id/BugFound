@@ -2168,7 +2168,7 @@ pub fn validate_tool_args(spec: &ToolSpec, args: &Value) -> Result<(), String> {
     }
 }
 
-pub const SESSION_FINISH_TOOL: &str = "session.finish";
+pub const SESSION_FINISH_TOOL: &str = "session_finish";
 
 /// Explicit terminal tool. The kernel intercepts it; `run` is never called on
 /// the production path, but returning a harmless result keeps the type usable
@@ -3256,7 +3256,7 @@ pub struct ReportInput {
 pub fn render_canonical_report(input: &ReportInput) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "# {} â€” Security Assessment Report\n\n",
+        "# {} Ã¢â‚¬â€ Security Assessment Report\n\n",
         input.engagement
     ));
 
@@ -4249,7 +4249,7 @@ mod tests {
 
     #[test]
     fn truncate_handles_multibyte_boundaries() {
-        let s = "Ã©".repeat(MAX_OUTPUT_BYTES + 8);
+        let s = "ÃƒÂ©".repeat(MAX_OUTPUT_BYTES + 8);
         let out = truncate(&s);
         assert!(out.ends_with("\n...[truncated]"));
         assert!(out.is_char_boundary(out.len() - "\n...[truncated]".len()));
@@ -4828,7 +4828,7 @@ mod tests {
         };
         let markdown = render_canonical_report(&input);
         for section in [
-            "# Acme Spring 2026 â€” Security Assessment Report",
+            "# Acme Spring 2026 Ã¢â‚¬â€ Security Assessment Report",
             "## Executive Summary",
             "## Scope & ROE",
             "## Methodology",

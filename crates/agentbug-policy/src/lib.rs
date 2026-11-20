@@ -139,24 +139,50 @@ impl ScopeConfig {
         if target.trim().is_empty() {
             return (false, "empty target".to_string());
         }
-        for d in &self.out_of_scope {
-            if Self::matches(d, target) {
+        let out_matches: Vec<&String> = self
+            .out_of_scope
+            .iter()
+            .filter(|rule| Self::matches(rule, target))
+            .collect();
+        if self.in_scope.is_empty() {
+            if let Some(rule) = out_matches.first() {
                 return (
                     false,
-                    format!("target '{target}' matches out-of-scope rule '{d}'"),
+                    format!("target '{target}' matches out-of-scope rule '{rule}'"),
                 );
             }
-        }
-        if self.in_scope.is_empty() {
             return (true, "no in-scope restrictions configured".to_string());
         }
-        for a in &self.in_scope {
-            if Self::matches(a, target) {
+        let in_matches: Vec<&String> = self
+            .in_scope
+            .iter()
+            .filter(|rule| Self::matches(rule, target))
+            .collect();
+        // A program may list a concrete asset as in-scope while also excluding
+        // a broad wildcard subdomain. The more specific, explicitly named asset
+        // wins; an out-of-scope wildcard alone never overrides it.
+        let exact_in = in_matches.iter().find(|rule| !rule.contains('*'));
+        if let Some(exact) = exact_in {
+            if !out_matches.is_empty() && out_matches.iter().all(|rule| rule.contains('*')) {
                 return (
                     true,
-                    format!("target '{target}' allowed by scope rule '{a}'"),
+                    format!(
+                        "target '{target}' allowed by explicit in-scope asset '{exact}' despite broader out-of-scope wildcard"
+                    ),
                 );
             }
+        }
+        if let Some(rule) = out_matches.first() {
+            return (
+                false,
+                format!("target '{target}' matches out-of-scope rule '{rule}'"),
+            );
+        }
+        if let Some(rule) = in_matches.first() {
+            return (
+                true,
+                format!("target '{target}' allowed by scope rule '{rule}'"),
+            );
         }
         (
             false,

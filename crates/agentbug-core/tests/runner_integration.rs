@@ -2013,7 +2013,7 @@ async fn session_finish_tool_terminates_explicitly() {
             content: None,
             tool_calls: vec![ToolCall {
                 id: "f1".to_string(),
-                name: "session.finish".to_string(),
+                name: "session_finish".to_string(),
                 arguments: json!({"reason": "goal achieved", "state": "completed"}),
             }],
             model: "mock-model".to_string(),

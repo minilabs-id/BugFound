@@ -56,7 +56,7 @@ async fn one_goal_is_delegated_to_two_distinct_roles() {
             content: None,
             tool_calls: vec![tool_call(
                 "h1",
-                "role.handoff",
+                "role_handoff",
                 json!({"role": "recon", "goal": "map assets"}),
             )],
             model: "m".to_string(),
@@ -71,7 +71,7 @@ async fn one_goal_is_delegated_to_two_distinct_roles() {
             content: None,
             tool_calls: vec![tool_call(
                 "f1",
-                "session.finish",
+                "session_finish",
                 json!({"reason": "recon complete"}),
             )],
             model: "m".to_string(),
@@ -81,7 +81,7 @@ async fn one_goal_is_delegated_to_two_distinct_roles() {
             content: None,
             tool_calls: vec![tool_call(
                 "h2",
-                "role.handoff",
+                "role_handoff",
                 json!({"role": "verification", "goal": "disprove candidate"}),
             )],
             model: "m".to_string(),
@@ -95,7 +95,7 @@ async fn one_goal_is_delegated_to_two_distinct_roles() {
             content: None,
             tool_calls: vec![tool_call(
                 "f2",
-                "session.finish",
+                "session_finish",
                 json!({"reason": "verification complete"}),
             )],
             model: "m".to_string(),

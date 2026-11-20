@@ -2868,6 +2868,56 @@ pub fn redact_text(input: &str) -> String {
     redact(input)
 }
 
+/// Generic durable eval-trace record. The kernel reads this for telemetry;
+/// it never interprets the payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceRecord {
+    pub engagement_id: String,
+    pub run_id: String,
+    pub kind: String,
+    pub payload_json: String,
+    pub created_at: String,
+}
+
+impl Store {
+    /// Durable event counts by kind for one session.
+    pub fn event_kind_counts(
+        &self,
+        session_id: &str,
+    ) -> Result<std::collections::BTreeMap<String, usize>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT kind, COUNT(*) FROM events WHERE session_id=?1 GROUP BY kind")?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+            })?
+            .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()?;
+        Ok(rows)
+    }
+
+    /// Read the durable eval trace for one engagement, oldest first.
+    pub fn list_trace(&self, engagement_id: &str, limit: usize) -> Result<Vec<TraceRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT engagement_id, run_id, kind, payload_json, created_at
+             FROM trace_events WHERE engagement_id=?1 ORDER BY rowid ASC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![engagement_id, limit], |row| {
+                Ok(TraceRecord {
+                    engagement_id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    payload_json: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
 pub fn persist_tool_result(
     store: &Store,
     session_id: &str,

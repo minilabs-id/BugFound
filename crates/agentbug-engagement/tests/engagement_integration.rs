@@ -125,3 +125,26 @@ fn planner_has_supported_playbook_count() {
     assert!(ids.contains(&"wstg-injection"));
     assert!(ids.contains(&"wstg-api"));
 }
+
+#[test]
+fn cake_brief_lines_classify_without_abort() {
+    use agentbug_engagement::roe_classifier::{classify_line, BriefLineClass};
+    let csrf = "CSRF-able actions that do not require authentication (or a session) to exploit";
+    let reward = "We determine bounty amounts based on a variety of factors, including (but not limited to) Impact, classification and sensitivity of the data, ease of exploitation and overall risk to our applications.";
+    let csrf_class = classify_line(csrf);
+    assert_eq!(csrf_class.class, BriefLineClass::ProhibitedVulnClass);
+    assert_eq!(csrf_class.rule_id, "csrf_without_auth");
+    let reward_class = classify_line(reward);
+    assert_eq!(reward_class.class, BriefLineClass::ReportOrRewardPolicy);
+
+    let (policy, unparsed) = agentbug_engagement::roe_classify(&format!("{csrf}\n{reward}"));
+    assert!(unparsed.is_empty(), "unexpected: {unparsed:?}");
+    assert!(policy.denied_finding_classes.iter().any(|c| c == "CWE-352"));
+}
+
+#[test]
+fn unknown_technical_prohibition_still_aborts() {
+    let line = "Do not scan the staging API with automated tools between 2am and 4am.";
+    let (_policy, unparsed) = agentbug_engagement::roe_classify(line);
+    assert_eq!(unparsed, vec![line.to_string()]);
+}

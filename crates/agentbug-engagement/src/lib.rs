@@ -15,6 +15,7 @@
 
 pub mod domain;
 pub mod handoff;
+pub mod roe_classifier;
 pub mod roles;
 
 pub use domain::{prioritize_targets, BountyDomain};
@@ -142,6 +143,8 @@ pub struct RoePolicy {
     pub allow_fuzzing: bool,
     pub allow_state_change: bool,
     pub allow_disclosure: bool,
+    /// Vulnerability classes the brief explicitly excludes from reporting.
+    pub denied_finding_classes: Vec<String>,
 }
 
 /// Start a new engagement with the built-in compatibility defaults. Prefer
@@ -724,8 +727,7 @@ async fn run_engagement(
     }
     // H-02: parse the full brief into a typed, fail-closed ROE policy and abort
     // on any safety constraint we cannot translate into a field.
-    let roe = parse_roe(&brief_text);
-    let unparsed = unparsed_constraints(&brief_text);
+    let (roe, unparsed) = roe_classify(&brief_text);
     if !unparsed.is_empty() {
         let message = format!(
             "unparsed ROE constraints; refusing to engage (fail-closed): {}",
@@ -807,6 +809,26 @@ async fn run_engagement(
         if !profile.scope.out_of_scope.contains(denied) {
             profile.scope.out_of_scope.push(denied.clone());
         }
+    }
+    // An empty LLM scope is almost always an extraction failure (the model
+    // returned patterns in a shape that does not match our deterministic host
+    // keys), not a deliberate narrowing of the program. Fall back to the
+    // deterministic heuristic profile; both paths still require the
+    // deterministic in-scope set to be non-empty.
+    if profile.scope.in_scope.is_empty() {
+        let heuristic = extract_profile_from_text(&brief_text, program_url);
+        profile.scope.in_scope = heuristic.scope.in_scope;
+        profile
+            .scope
+            .out_of_scope
+            .extend(heuristic.scope.out_of_scope);
+        let _ = store.append_trace(
+            id,
+            id,
+            "llm.scope_extraction_fallback",
+            &json!({"reason": "llm scope intersected to empty; deterministic heuristic restored"})
+                .to_string(),
+        );
     }
     // Fail-closed: without at least one in-scope target nothing may be probed.
     if profile.scope.in_scope.is_empty() {
@@ -1741,6 +1763,44 @@ pub fn roe_unparsed_constraints(text: &str) -> Vec<String> {
     unparsed_constraints(text)
 }
 
+/// Known prohibited-vuln-class rule ids that map to a `RoePolicy` field.
+const RECOGNIZED_DENIED_CLASSES: &[&str] = &["csrf_without_auth", "user_enumeration"];
+
+/// Classify every brief line once and derive both the typed ROE fields and the
+/// list of still-unparsed operational constraints. This is the single source
+/// of truth used by the engagement abort decision.
+pub fn roe_classify(text: &str) -> (RoePolicy, Vec<String>) {
+    let mut policy = parse_roe(text);
+    let mut unparsed = Vec::new();
+    for classified in roe_classifier::classify_brief(text) {
+        // Every vulnerability-class exclusion is a real ROE restriction; map
+        // it to a denied finding class so the verifier enforces it instead of
+        // aborting. Unknown technical rules still fail closed.
+        let is_vuln_class = classified.class == roe_classifier::BriefLineClass::ProhibitedVulnClass;
+        let recognized = is_vuln_class || RECOGNIZED_DENIED_CLASSES.contains(&classified.rule_id);
+        if is_vuln_class {
+            let value = match classified.rule_id {
+                "csrf_without_auth" => "CWE-352",
+                "xss" => "CWE-79",
+                "full_path_disclosure" => "CWE-209",
+                "information_disclosure" => "CWE-200",
+                "user_enumeration" => "CWE-204",
+                "idor" => "CWE-639",
+                "sqli" => "CWE-89",
+                "open_redirect" => "CWE-601",
+                other => other,
+            };
+            if !policy.denied_finding_classes.iter().any(|v| v == value) {
+                policy.denied_finding_classes.push(value.to_string());
+            }
+        }
+        if roe_classifier::is_abortable(classified.class, recognized) {
+            unparsed.push(classified.line.trim().to_string());
+        }
+    }
+    (policy, unparsed)
+}
+
 fn unparsed_constraints(text: &str) -> Vec<String> {
     const NEGATIVE: &[&str] = &[
         "do not",
@@ -2355,6 +2415,22 @@ fn verify_findings(
                     {
                         accepted = false;
                     }
+                    // Brief-derived finding-class exclusions are enforced here,
+                    // never by the model. This can only reduce promotions.
+                    if accepted && !roe.denied_finding_classes.is_empty() {
+                        let verdict = classify_cwe(
+                            &finding.title,
+                            finding.vuln_type.as_deref(),
+                            Some(&finding.description),
+                        );
+                        if roe
+                            .denied_finding_classes
+                            .iter()
+                            .any(|denied| denied == verdict.cwe || denied == verdict.rule)
+                        {
+                            accepted = false;
+                        }
+                    }
                     // Advisory only: note whether the LLM-supplied response
                     // happened to match the captured bytes. Never a verdict.
                     let matches = finding
@@ -2477,6 +2553,9 @@ fn build_canonical_report(
     };
 
     let mut rules = profile.rules.clone();
+    for denied in &roe.denied_finding_classes {
+        rules.push(format!("Excluded finding class: {denied}"));
+    }
     rules.extend(profile.reporting_rules.clone());
     if let Some(marker) = &roe.ua_marker {
         rules.push(format!("User-Agent marker required: {marker}"));

@@ -239,3 +239,24 @@ Exit: only measured claims; baseline vs harness comparison recorded.
 ## 4. Deliverable ownership
 
 Research docs already written by parallel agents; synthesis docs 12–16 by parent session; this master plan is the single source of truth. Future code work must update this file with phase status and evidence links.
+
+
+### R8a — Live monitor engine (COMPLETE, 2026-11-20)
+- ✅ `agentbug-core::monitor`: bounded ring buffers (tool/result/verdict/error/
+  latency), per-key pause/resume, snapshot API, `evaluate()` health report, and
+  a hash-chained JSONL journal under `eval/work/monitor/`.
+- ✅ CLI `engage` starts/stops the monitor automatically, tracks the engagement
+  id, and observes action/result/error events. Journal lines always carry
+  `no_benchmark_claim: true`.
+- ✅ Live evaluation against `security.cake.com`: engagement completed with
+  9/9 playbooks, 0 verified findings, coverage 0, report sha256
+  `2699c0d42d3004cda37f611b07f4d9f3a62de0f546f32a92fe34a606652ba370`;
+  `score.py --strict` reported 0 problems and no effectiveness claim.
+- Fixed during live testing: ROE line classification (reward/report policy no
+  longer aborts, vuln-class exclusions are enforced), provider-safe tool names,
+  empty LLM-scope fallback, and explicit-asset scope precedence over broad
+  out-of-scope wildcards.
+
+### R8b — Measured results (NOT STARTED)
+Await operator-recorded local engagements (N>=3) and a declared baseline lane.
+No effectiveness number may be asserted until those artifacts exist.

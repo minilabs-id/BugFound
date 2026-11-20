@@ -1024,6 +1024,15 @@ path = ".agentbug/agentbug.db"
             brief_only,
         } => {
             let db_path = db.unwrap_or_else(|| cfg.storage.path.clone());
+            let monitor = Arc::new(agentbug_core::Monitor::new(
+                Store::open(&db_path)?,
+                agentbug_core::EventBus::global().clone(),
+                agentbug_core::MonitorConfig {
+                    journal_dir: std::path::Path::new(&cwd).join("eval/work/monitor"),
+                    ..Default::default()
+                },
+            ));
+            monitor.start()?;
             let options = engagement_options(&cfg);
             let (tx, rx) = std::sync::mpsc::channel::<agentbug_engagement::EngagementEvent>();
 
@@ -1077,6 +1086,7 @@ path = ".agentbug/agentbug.db"
                 match rx.recv() {
                     Ok(agentbug_engagement::EngagementEvent::Started { engagement_id: id }) => {
                         println!("engagement started: id={}", redact(&id));
+                        monitor.track(&id);
                         *engagement_id.lock().unwrap() = Some(id);
                     }
                     Ok(agentbug_engagement::EngagementEvent::BriefIngested { .. }) => {
@@ -1093,23 +1103,38 @@ path = ".agentbug/agentbug.db"
                         target,
                         ok,
                         detail,
-                    }) => println!(
-                        "action: tool={} target={} ok={} detail={}",
-                        redact(&tool),
-                        redact(target.as_deref().unwrap_or("-")),
-                        ok,
-                        redact(&detail).replace('\n', " ")
-                    ),
+                    }) => {
+                        if let Some(id) = engagement_id.lock().unwrap().as_ref() {
+                            monitor.observe(
+                                id,
+                                if ok { "action.ok" } else { "action.denied" },
+                                if ok { "info" } else { "warn" },
+                                &format!("tool={tool} detail={detail}"),
+                            );
+                        }
+                        println!(
+                            "action: tool={} target={} ok={} detail={}",
+                            redact(&tool),
+                            redact(target.as_deref().unwrap_or("-")),
+                            ok,
+                            redact(&detail).replace('\n', " ")
+                        )
+                    }
                     Ok(agentbug_engagement::EngagementEvent::Finding {
                         id,
                         title,
                         severity,
-                    }) => println!(
-                        "finding: [{}] {} id={}",
-                        redact(&severity),
-                        redact(&title),
-                        redact(&id)
-                    ),
+                    }) => {
+                        if let Some(id) = engagement_id.lock().unwrap().as_ref() {
+                            monitor.observe(id, "result.saved", "info", &title);
+                        }
+                        println!(
+                            "finding: [{}] {} id={}",
+                            redact(&severity),
+                            redact(&title),
+                            redact(&id)
+                        )
+                    }
                     Ok(agentbug_engagement::EngagementEvent::ReportReady { path }) => {
                         println!("report ready: {}", redact(&path.display().to_string()));
                     }
@@ -1128,6 +1153,16 @@ path = ".agentbug/agentbug.db"
                 }
             };
 
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                if let Ok(runtime) = runtime {
+                    runtime.block_on(async {
+                        let _ = monitor.stop().await;
+                    });
+                }
+            }
             match worker.join() {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {

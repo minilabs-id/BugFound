@@ -1,6 +1,6 @@
 use agentbug_engagement::{
-    cvss_base, extract_profile_from_text, parse_roe, roe_overrides, wstg_playbooks,
-    EngagementOptions,
+    cvss_base, extract_profile_from_text, normalize_scope_pattern, parse_roe, roe_overrides,
+    roe_unparsed_constraints, wstg_playbooks, EngagementOptions,
 };
 use agentbug_policy::Mode;
 
@@ -59,6 +59,26 @@ fn cvss_matches_first_v31_reference_vectors() {
     assert!((cvss_base("CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N") - 1.8).abs() < 0.001);
     assert_eq!(cvss_base(""), 0.0);
     assert_eq!(cvss_base("CVSS:3.1/AV:N/AC:L"), 0.0);
+}
+
+#[test]
+fn llm_scope_annotations_are_stripped() {
+    let raw = "https://play.google.com/store/apps/details?id=com.boursorama.android.clients (Mobile application Android, asset value: High)";
+    assert_eq!(
+        normalize_scope_pattern(raw),
+        "https://play.google.com/store/apps/details?id=com.boursorama.android.clients"
+    );
+}
+
+#[test]
+fn report_eligibility_lines_are_not_unparsed_constraints() {
+    let text = r#"
+- Lack or bypass of rate-limiting, brute force or captcha without compromise or large-scale abuse
+- Exploits that are only possible on Android versions that are not currently supported
+- Exploits that are only possible on iOS versions that are not currently supported
+- Exploits that are only possible on a jailbroken/rooted device
+"#;
+    assert!(roe_unparsed_constraints(text).is_empty());
 }
 
 #[test]

@@ -696,7 +696,17 @@ async fn run_engagement(
     }
     // H-11: never write an empty extraction snapshot. The deterministic scope
     // parse must be non-empty before any planning or tool execution happens.
-    let deterministic_scope = agentbug_policy::parse_scope_brief(&brief_text);
+    let mut deterministic_scope = agentbug_policy::parse_scope_brief(&brief_text);
+    deterministic_scope.in_scope = deterministic_scope
+        .in_scope
+        .iter()
+        .map(|value| normalize_scope_pattern(value))
+        .collect();
+    deterministic_scope.out_of_scope = deterministic_scope
+        .out_of_scope
+        .iter()
+        .map(|value| normalize_scope_pattern(value))
+        .collect();
     if deterministic_scope.in_scope.is_empty() {
         return Err(anyhow!(
             "program brief has no deterministically parseable in-scope targets; refusing to engage (fail-closed)"
@@ -1360,6 +1370,16 @@ pub fn extract_profile_from_text(text: &str, url: &str) -> EngagementProfile {
         text.to_string()
     };
     let mut scope = agentbug_policy::parse_scope_brief(&plain);
+    scope.in_scope = scope
+        .in_scope
+        .iter()
+        .map(|value| normalize_scope_pattern(value))
+        .collect();
+    scope.out_of_scope = scope
+        .out_of_scope
+        .iter()
+        .map(|value| normalize_scope_pattern(value))
+        .collect();
     let engagement = scope
         .engagement
         .clone()
@@ -1483,13 +1503,29 @@ fn json_object(content: &str) -> Option<&str> {
     }
 }
 
+/// Strip LLM-added annotations from a scope pattern. Program pages often list
+/// an asset as `https://host/path (Mobile application, value: High)`; keeping
+/// the annotation would make the in-tool scope matcher reject the real URL.
+pub fn normalize_scope_pattern(value: &str) -> String {
+    let mut pattern = value.trim().trim_matches(['`', '"', '\'']).trim();
+    if let Some(pos) = pattern.find(" (") {
+        pattern = &pattern[..pos];
+    }
+    if let Some(pos) = pattern.find(" —") {
+        pattern = &pattern[..pos];
+    }
+    if pattern.starts_with("http://") || pattern.starts_with("https://") {
+        pattern = pattern.split_whitespace().next().unwrap_or(pattern);
+    }
+    pattern.trim().trim_end_matches([',', ';']).to_string()
+}
+
 fn string_array(values: &[Value]) -> Vec<String> {
     values
         .iter()
         .filter_map(Value::as_str)
-        .map(str::trim)
+        .map(normalize_scope_pattern)
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
         .collect()
 }
 
@@ -1642,6 +1678,10 @@ pub fn parse_roe(text: &str) -> RoePolicy {
 
 /// Constraints that look actionable but could not be mapped to a [`RoePolicy`]
 /// field. The production path aborts when this is non-empty instead of guessing.
+pub fn roe_unparsed_constraints(text: &str) -> Vec<String> {
+    unparsed_constraints(text)
+}
+
 fn unparsed_constraints(text: &str) -> Vec<String> {
     const NEGATIVE: &[&str] = &[
         "do not",
@@ -1678,10 +1718,39 @@ fn unparsed_constraints(text: &str) -> Vec<String> {
         "rate limit",
     ];
 
+    // Report-eligibility and vulnerability-qualifier lines are not operational
+    // constraints on the runner. They describe what the program will/not reward,
+    // not what tools may do, so they must not trip the fail-closed check.
+    const NON_ACTIONABLE: &[&str] = &[
+        "exploits that are only possible",
+        "not currently supported",
+        "jailbroken",
+        "rooted device",
+        "lack or bypass of rate-limiting",
+        "lack or bypass of rate limiting",
+        "brute force or captcha",
+        "without compromise",
+        "large-scale abuse",
+        "large scale abuse",
+        "already been reported",
+        "already reported",
+        "duplicate",
+        "informational",
+        "best practice",
+        "theoretical",
+        "not applicable",
+        "out of scope",
+        "third-party",
+        "third party",
+    ];
+
     text.lines()
         .map(str::trim)
         .filter(|line| {
             let lower = line.to_ascii_lowercase();
+            if NON_ACTIONABLE.iter().any(|phrase| lower.contains(phrase)) {
+                return false;
+            }
             let negative = NEGATIVE.iter().any(|marker| lower.contains(marker));
             let security = SECURITY.iter().any(|keyword| lower.contains(keyword));
             negative && security && !recognised_constraint(&lower)
@@ -1714,6 +1783,9 @@ fn recognised_constraint(lower: &str) -> bool {
             .iter()
             .any(|keyword| lower.contains(keyword))
         || lower.contains("rate limit")
+        || lower.contains("rate-limit")
+        || lower.contains("brute")
+        || lower.contains("captcha")
         || lower.contains("traffic")
 }
 

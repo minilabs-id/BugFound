@@ -124,6 +124,9 @@ pub struct ToolOptions {
     pub allowed_methods: Option<Vec<String>>,
     /// Shared rolling window used by the rate limiter (Clone/Default friendly).
     pub rate_window: Arc<Mutex<VecDeque<Instant>>>,
+    /// Require falsification fields when saving a finding. Enabled by the
+    /// engagement layer; off in generic kernel/tool tests.
+    pub require_falsification: bool,
 }
 
 #[async_trait]
@@ -1607,7 +1610,11 @@ impl Tool for FsWriteTool {
     }
 }
 
-pub struct SaveFindingTool;
+#[derive(Default, Clone)]
+pub struct SaveFindingTool {
+    pub require_falsification: bool,
+}
+
 #[async_trait]
 impl Tool for SaveFindingTool {
     fn spec(&self) -> ToolSpec {
@@ -1629,7 +1636,12 @@ impl Tool for SaveFindingTool {
                     "request":{"type":"string"},
                     "response":{"type":"string"},
                     "cvss":{"type":"string"},
-                    "cwe":{"type":"string"}
+                    "cwe":{"type":"string"},
+                    "counterevidence":{"type":"string"},
+                    "confidence":{"type":"string","enum":["low","medium","high"]},
+                    "confidence_rationale":{"type":"string"},
+                    "severity_change_conditions":{"type":"string"},
+                    "oracle_type":{"type":"string","enum":["canary_echo","differential","state_delta","timing","oob_hit","browser_deferred"]}
                 },
                 "required":["title","severity","description"]
             }),
@@ -1645,6 +1657,52 @@ impl Tool for SaveFindingTool {
             .get("severity")
             .and_then(|v| v.as_str())
             .unwrap_or("info");
+        const FALSIFICATION: &[&str] = &[
+            "counterevidence",
+            "confidence",
+            "confidence_rationale",
+            "severity_change_conditions",
+        ];
+        let missing: Vec<&str> = FALSIFICATION
+            .iter()
+            .copied()
+            .filter(|key| {
+                input
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+            })
+            .collect();
+        if self.require_falsification {
+            if let Some(oracle) = input.get("oracle_type").and_then(|v| v.as_str()) {
+                if !matches!(
+                    oracle,
+                    "canary_echo"
+                        | "differential"
+                        | "state_delta"
+                        | "timing"
+                        | "oob_hit"
+                        | "browser_deferred"
+                ) {
+                    return Ok(ToolResult {
+                        ok: false,
+                        output: "falsification incomplete: invalid oracle_type".to_string(),
+                        structured: Some(
+                            json!({"error": "falsification_incomplete", "paths": ["oracle_type"]}),
+                        ),
+                    });
+                }
+            }
+        }
+        if self.require_falsification && !missing.is_empty() {
+            return Ok(ToolResult {
+                ok: false,
+                output: format!("falsification incomplete: {}", missing.join(", ")),
+                structured: Some(json!({"error": "falsification_incomplete", "paths": missing})),
+            });
+        }
         Ok(ToolResult {
             ok: true,
             output: truncate(&format!(
@@ -2214,7 +2272,12 @@ pub fn try_default_registry_with_options(
     reg.register(Arc::new(ShellExecTool::new(cwd)?));
     reg.register(Arc::new(HttpRequestTool::with_options(options.clone())));
     reg.register(Arc::new(DnsLookupTool::new_with_options(options.clone())));
-    reg.register(Arc::new(SaveFindingTool));
+    reg.register_with_host_risk(
+        Arc::new(SaveFindingTool {
+            require_falsification: options.require_falsification,
+        }),
+        "write",
+    );
     reg.register(Arc::new(RecordAssetTool));
     reg.register(Arc::new(SaveArtifactTool::new(cwd)?));
     reg.register(Arc::new(EchoTool));
@@ -5901,4 +5964,36 @@ mod schema_tests {
         };
         assert!(validate_tool_args(&spec, &json!({})).is_err());
     }
+}
+
+#[tokio::test]
+async fn save_finding_falsification_gate_respects_option() {
+    let minimal = json!({"title":"t","severity":"high","description":"d"});
+    let lenient = SaveFindingTool::default();
+    let result = lenient.run(minimal.clone()).await.unwrap();
+    assert!(result.ok);
+
+    let strict = SaveFindingTool {
+        require_falsification: true,
+    };
+    let result = strict.run(minimal).await.unwrap();
+    assert!(!result.ok);
+    assert_eq!(
+        result
+            .structured
+            .as_ref()
+            .and_then(|v| v.get("error"))
+            .and_then(|v| v.as_str()),
+        Some("falsification_incomplete")
+    );
+
+    let complete = json!({
+        "title":"t","severity":"high","description":"d",
+        "counterevidence":"checked benign control",
+        "confidence":"medium",
+        "confidence_rationale":"static evidence only",
+        "severity_change_conditions":"if auth required",
+        "oracle_type":"canary_echo"
+    });
+    assert!(strict.run(complete).await.unwrap().ok);
 }

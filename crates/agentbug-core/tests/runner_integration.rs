@@ -535,7 +535,7 @@ async fn bounty_tool_results_are_persisted() {
         ],
     ));
     let mut tools = ToolRegistry::new();
-    tools.register(Arc::new(agentbug_tools::SaveFindingTool));
+    tools.register(Arc::new(agentbug_tools::SaveFindingTool::default()));
     tools.register(Arc::new(agentbug_tools::RecordAssetTool));
     tools.register(Arc::new(
         agentbug_tools::SaveArtifactTool::new(".").unwrap(),
@@ -1071,7 +1071,7 @@ async fn finding_evidence_is_persisted_and_deduplicated() {
         ],
     ));
     let mut tools = ToolRegistry::new();
-    tools.register(Arc::new(agentbug_tools::SaveFindingTool));
+    tools.register(Arc::new(agentbug_tools::SaveFindingTool::default()));
     let runner = Runner::new(
         store.clone(),
         llm,

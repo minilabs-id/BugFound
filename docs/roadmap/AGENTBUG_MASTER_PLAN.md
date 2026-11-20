@@ -288,4 +288,11 @@ No effectiveness number may be asserted until those artifacts exist.
   a bounded Verification-role session that must write a complete `role_result`
   verdict; only then is the hypothesis marked `confirmed-candidate`. The
   verdict is advisory — only `verify_findings` may promote to `validated`.
-- Next: per-class oracles + falsification fields (build step 4).
+- ✅ Per-class oracles + falsification fields (COMPLETE): Finding carries
+  counterevidence/confidence/rationale/severity-change-conditions/oracle_type;
+  `SaveFindingTool` enforces them when `ToolOptions.require_falsification` is
+  on (engagement always on, generic tests off). `verify_findings` keeps
+  `canary_echo` byte-identical and routes every other class to
+  `open_proof_gap` with a named missing proof — never confirming from absence.
+  Differential remains rule-out-only (no identity pair exists).
+- Next: authorization snapshot + operator acknowledgement (build step 5).

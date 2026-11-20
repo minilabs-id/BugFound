@@ -2771,6 +2771,53 @@ fn capture_evidence(store: &Store, finding: &agentbug_store::Finding) -> Result<
 /// bytes contain the canary and carry a 2xx status, and the store can still
 /// reproduce the evidence digests. No LLM-supplied request/response, expected
 /// status or marker participates in the decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OracleType {
+    CanaryEcho,
+    Differential,
+    StateDelta,
+    Timing,
+    OobHit,
+    BrowserDeferred,
+}
+
+impl OracleType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CanaryEcho => "canary_echo",
+            Self::Differential => "differential",
+            Self::StateDelta => "state_delta",
+            Self::Timing => "timing",
+            Self::OobHit => "oob_hit",
+            Self::BrowserDeferred => "browser_deferred",
+        }
+    }
+
+    fn missing_proof(self) -> &'static str {
+        match self {
+            Self::CanaryEcho => "tool-canary reflection in a 2xx response",
+            Self::Differential => {
+                "cross-owner differential capture with positive and negative ownership controls"
+            }
+            Self::StateDelta => "pre/post state snapshot plus a reset recipe",
+            Self::Timing => "repeated timing samples with baseline and noise threshold",
+            Self::OobHit => "external DNS/HTTP listener hit bound to the canary",
+            Self::BrowserDeferred => "browser-executed DOM or artifact proof",
+        }
+    }
+}
+
+fn effective_oracle(finding: &agentbug_store::Finding) -> OracleType {
+    match finding.oracle_type.as_deref() {
+        Some("differential") => OracleType::Differential,
+        Some("state_delta") => OracleType::StateDelta,
+        Some("timing") => OracleType::Timing,
+        Some("oob_hit") => OracleType::OobHit,
+        Some("browser_deferred") => OracleType::BrowserDeferred,
+        _ => OracleType::CanaryEcho,
+    }
+}
+
 fn verify_findings(
     store: &Store,
     id: &str,
@@ -2784,6 +2831,34 @@ fn verify_findings(
     }
     let mut promoted = 0usize;
     for finding in store.list_findings(id)? {
+        let oracle = effective_oracle(&finding);
+        // Only canary_echo has a real confirmation oracle today. Every other
+        // class stays unconfirmed and must name the missing proof.
+        if oracle != OracleType::CanaryEcho {
+            let digest = store
+                .get_capture(&finding.id)
+                .ok()
+                .flatten()
+                .map(|capture| capture_digest(&capture, &capture_canary(&capture)));
+            trace.record(
+                store,
+                "verifier",
+                json!({
+                    "candidate": redact(&finding.id),
+                    "verified": false,
+                    "rejected": true,
+                    "oracle_type": oracle.as_str(),
+                    "missing_proof": oracle.missing_proof(),
+                }),
+            );
+            let _ = store.set_finding_verdict(
+                &finding.id,
+                "open_proof_gap",
+                Some(&format!("missing proof: {}", oracle.missing_proof())),
+            );
+            let _ = digest;
+            continue;
+        }
         // A finding without an id, or without a tool capture, can never be
         // replayed regardless of how self-consistent its LLM fields look.
         let (verified, capture_hash, advisory_match) = if finding.id.trim().is_empty() {
@@ -4231,5 +4306,113 @@ mod r10_tests {
         )
         .unwrap();
         assert_eq!(again, 0);
+    }
+}
+
+#[cfg(test)]
+mod r12_tests {
+    use super::tests::{capture_for, temp_db};
+    use super::*;
+
+    #[test]
+    fn non_canary_oracles_are_open_proof_gaps() {
+        let db = temp_db("r12-oracles");
+        let store = Store::open(&db).unwrap();
+        let session = store.create_session("goal").unwrap();
+        let finding = store
+            .add_finding_with_evidence(
+                &session.id,
+                "Finding",
+                "high",
+                Some("example.com"),
+                Some("idor"),
+                "description",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        capture_for(
+            &store,
+            &finding,
+            "HTTP/1.1 200 OK\nagentbug-canary-abc",
+            "agentbug-canary-abc",
+        );
+        for oracle in [
+            "state_delta",
+            "timing",
+            "oob_hit",
+            "browser_deferred",
+            "differential",
+        ] {
+            store
+                .set_finding_falsification(
+                    &finding.id,
+                    Some("benign checked"),
+                    Some("low"),
+                    Some("static"),
+                    Some("if authenticated"),
+                    Some(oracle),
+                )
+                .unwrap();
+            let mut trace = TraceRun::new(&session.id);
+            let promoted =
+                verify_findings(&store, &session.id, &RoePolicy::default(), &mut trace).unwrap();
+            assert_eq!(promoted, 0, "{oracle} must not confirm");
+            let updated = store
+                .list_findings(&session.id)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == finding.id)
+                .unwrap();
+            assert_eq!(updated.verdict.as_deref(), Some("open_proof_gap"));
+            assert!(updated
+                .gap_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("missing proof"));
+            assert!(updated.validated_at.is_none());
+        }
+    }
+
+    #[test]
+    fn falsification_fields_round_trip() {
+        let store = Store::open(":memory:").unwrap();
+        let session = store.create_session("goal").unwrap();
+        let finding = store
+            .add_finding(
+                &session.id,
+                "t",
+                "high",
+                None,
+                None,
+                "d",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(finding.counterevidence.is_none());
+        store
+            .set_finding_falsification(
+                &finding.id,
+                Some("benign checked"),
+                Some("medium"),
+                Some("static only"),
+                Some("if auth required"),
+                Some("canary_echo"),
+            )
+            .unwrap();
+        let rows = store.list_findings(&session.id).unwrap();
+        let updated = rows.iter().find(|r| r.id == finding.id).unwrap();
+        assert_eq!(updated.confidence.as_deref(), Some("medium"));
+        assert_eq!(updated.oracle_type.as_deref(), Some("canary_echo"));
     }
 }

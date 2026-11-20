@@ -101,6 +101,16 @@ pub struct Finding {
     pub verdict: Option<String>,
     #[serde(default)]
     pub gap_reason: Option<String>,
+    #[serde(default)]
+    pub counterevidence: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<String>,
+    #[serde(default)]
+    pub confidence_rationale: Option<String>,
+    #[serde(default)]
+    pub severity_change_conditions: Option<String>,
+    #[serde(default)]
+    pub oracle_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,7 +353,9 @@ impl Store {
                asset TEXT, vuln_type TEXT, description TEXT NOT NULL, reproduction TEXT, impact TEXT,
                remediation TEXT, evidence TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                request TEXT, response TEXT, cvss TEXT, cwe TEXT, dedupe_key TEXT, evidence_hash TEXT,
-               validated_at TEXT, validation_detail TEXT, verdict TEXT, gap_reason TEXT
+               validated_at TEXT, validation_detail TEXT, verdict TEXT, gap_reason TEXT,
+               counterevidence TEXT, confidence TEXT, confidence_rationale TEXT,
+               severity_change_conditions TEXT, oracle_type TEXT
              );
              CREATE TABLE IF NOT EXISTS assets(
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL,
@@ -532,6 +544,17 @@ impl Store {
         let _ = conn.execute("ALTER TABLE findings ADD COLUMN validation_detail TEXT", []);
         let _ = conn.execute("ALTER TABLE findings ADD COLUMN verdict TEXT", []);
         let _ = conn.execute("ALTER TABLE findings ADD COLUMN gap_reason TEXT", []);
+        let _ = conn.execute("ALTER TABLE findings ADD COLUMN counterevidence TEXT", []);
+        let _ = conn.execute("ALTER TABLE findings ADD COLUMN confidence TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE findings ADD COLUMN confidence_rationale TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE findings ADD COLUMN severity_change_conditions TEXT",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE findings ADD COLUMN oracle_type TEXT", []);
         let _ = conn.execute("ALTER TABLE events ADD COLUMN prev_hash TEXT", []);
         let _ = conn.execute("ALTER TABLE events ADD COLUMN hash TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_call_id TEXT", []);
@@ -1141,6 +1164,11 @@ impl Store {
             validation_detail: None,
             verdict: None,
             gap_reason: None,
+            counterevidence: None,
+            confidence: None,
+            confidence_rationale: None,
+            severity_change_conditions: None,
+            oracle_type: None,
         };
         let conn = self.conn.lock().unwrap();
         Self::insert_finding(&conn, &f)?;
@@ -1209,6 +1237,11 @@ impl Store {
             validation_detail: None,
             verdict: None,
             gap_reason: None,
+            counterevidence: None,
+            confidence: None,
+            confidence_rationale: None,
+            severity_change_conditions: None,
+            oracle_type: None,
         };
         Self::insert_finding(&conn, &f)?;
         Ok(Some(f))
@@ -1244,7 +1277,8 @@ impl Store {
     pub fn list_findings(&self, session_id: &str) -> Result<Vec<Finding>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash,validated_at,validation_detail,verdict,gap_reason
+            "SELECT id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash,validated_at,validation_detail,verdict,gap_reason,
+             counterevidence,confidence,confidence_rationale,severity_change_conditions,oracle_type
              FROM findings WHERE session_id=?1 ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
@@ -1273,6 +1307,11 @@ impl Store {
                 validation_detail: r.get(21)?,
                 verdict: r.get(22)?,
                 gap_reason: r.get(23)?,
+                counterevidence: r.get(24)?,
+                confidence: r.get(25)?,
+                confidence_rationale: r.get(26)?,
+                severity_change_conditions: r.get(27)?,
+                oracle_type: r.get(28)?,
             })
         })?;
         let mut out = vec![];
@@ -1459,7 +1498,8 @@ impl Store {
     pub fn list_findings_by_status(&self, session_id: &str, status: &str) -> Result<Vec<Finding>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash,validated_at,validation_detail,verdict,gap_reason
+            "SELECT id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash,validated_at,validation_detail,verdict,gap_reason,
+             counterevidence,confidence,confidence_rationale,severity_change_conditions,oracle_type
              FROM findings WHERE session_id=?1 AND status=?2 ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id, status], |r| {
@@ -1488,6 +1528,11 @@ impl Store {
                 validation_detail: r.get(21)?,
                 verdict: r.get(22)?,
                 gap_reason: r.get(23)?,
+                counterevidence: r.get(24)?,
+                confidence: r.get(25)?,
+                confidence_rationale: r.get(26)?,
+                severity_change_conditions: r.get(27)?,
+                oracle_type: r.get(28)?,
             })
         })?;
         let mut out = vec![];
@@ -1498,6 +1543,32 @@ impl Store {
     }
 
     /// Record the validation outcome of a finding, stamping the time it was checked.
+    pub fn set_finding_falsification(
+        &self,
+        id: &str,
+        counterevidence: Option<&str>,
+        confidence: Option<&str>,
+        confidence_rationale: Option<&str>,
+        severity_change_conditions: Option<&str>,
+        oracle_type: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE findings SET counterevidence=?2, confidence=?3,
+             confidence_rationale=?4, severity_change_conditions=?5, oracle_type=?6
+             WHERE id=?1",
+            params![
+                id,
+                counterevidence,
+                confidence,
+                confidence_rationale,
+                severity_change_conditions,
+                oracle_type
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn set_finding_validation(
         &self,
         id: &str,
@@ -3127,6 +3198,14 @@ pub fn persist_tool_result(
         let response = args.get("response").and_then(|v| v.as_str());
         let cvss = args.get("cvss").and_then(|v| v.as_str());
         let cwe = args.get("cwe").and_then(|v| v.as_str());
+        let falsification = (
+            args.get("counterevidence").and_then(|v| v.as_str()),
+            args.get("confidence").and_then(|v| v.as_str()),
+            args.get("confidence_rationale").and_then(|v| v.as_str()),
+            args.get("severity_change_conditions")
+                .and_then(|v| v.as_str()),
+            args.get("oracle_type").and_then(|v| v.as_str()),
+        );
         match store.add_finding_with_evidence(
             session_id,
             title,
@@ -3144,6 +3223,14 @@ pub fn persist_tool_result(
             cwe,
         ) {
             Ok(Some(finding)) => {
+                let _ = store.set_finding_falsification(
+                    &finding.id,
+                    falsification.0,
+                    falsification.1,
+                    falsification.2,
+                    falsification.3,
+                    falsification.4,
+                );
                 tracing::info!(session=%session_id, title=%title, "finding persisted");
                 // The authoritative bytes come from the tool's capture, never
                 // from the LLM-supplied request/response arguments above.

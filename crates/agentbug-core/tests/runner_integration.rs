@@ -2003,3 +2003,38 @@ async fn run_goal_expires_stale_approvals_before_claim() {
     // run_goal swept the expired row; a second sweep has nothing left to do.
     assert_eq!(store.expire_stale_approvals().unwrap(), 0);
 }
+
+#[tokio::test]
+async fn session_finish_tool_terminates_explicitly() {
+    let store = Store::open(":memory:").unwrap();
+    let llm = Arc::new(MockLlm::new(
+        "mock-model",
+        vec![ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "f1".to_string(),
+                name: "session.finish".to_string(),
+                arguments: json!({"reason": "goal achieved", "state": "completed"}),
+            }],
+            model: "mock-model".to_string(),
+        }],
+    ));
+    let mut tools = ToolRegistry::new();
+    tools.register_with_host_risk(Arc::new(agentbug_tools::SessionFinishTool), "safe");
+
+    let runner = Runner::new(
+        store.clone(),
+        llm,
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            ..Default::default()
+        },
+    );
+    let out = runner.run_goal("finish goal").await.unwrap();
+    assert_eq!(out, "goal achieved");
+    let session = store.list_sessions(10).unwrap().remove(0);
+    assert_eq!(session.state, "completed");
+    assert!(store.verify_event_chain(&session.id).unwrap());
+}

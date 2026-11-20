@@ -2108,12 +2108,47 @@ pub fn try_default_registry(cwd: impl AsRef<Path>) -> Result<ToolRegistry> {
 /// Registry constructor with explicit tool policy. External recon adapters are
 /// only present when `enable_external_tools` is set, and `dnsx` then belongs to
 /// the adapter rather than the built-in DNS alias.
+pub const SESSION_FINISH_TOOL: &str = "session.finish";
+
+/// Explicit terminal tool. The kernel intercepts it; `run` is never called on
+/// the production path, but returning a harmless result keeps the type usable
+/// in isolation.
+pub struct SessionFinishTool;
+
+#[async_trait]
+impl Tool for SessionFinishTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: SESSION_FINISH_TOOL.to_string(),
+            description: "End the current session with an explicit state and reason.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string"},
+                    "state": {"type": "string", "enum": ["completed", "failed"]}
+                },
+                "required": ["reason"]
+            }),
+            risk: "safe".to_string(),
+        }
+    }
+
+    async fn run(&self, _input: Value) -> Result<ToolResult> {
+        Ok(ToolResult {
+            ok: true,
+            output: "finish accepted".to_string(),
+            structured: None,
+        })
+    }
+}
+
 pub fn try_default_registry_with_options(
     cwd: impl AsRef<Path>,
     options: ToolOptions,
 ) -> Result<ToolRegistry> {
     let cwd = cwd.as_ref();
     let mut reg = ToolRegistry::new();
+    reg.register_with_host_risk(Arc::new(SessionFinishTool), "safe");
     reg.register(Arc::new(FsReadTool::new(cwd)?));
     reg.register(Arc::new(FsWriteTool::new(cwd)?));
     reg.register(Arc::new(ShellExecTool::new(cwd)?));

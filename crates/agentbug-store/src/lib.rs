@@ -339,6 +339,14 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS idx_session_inbox_session
                ON session_inbox(session_id, state, enqueued_seq);
+             CREATE TABLE IF NOT EXISTS tool_calls(
+               id TEXT PRIMARY KEY, session_id TEXT NOT NULL, tool_call_id TEXT,
+               name TEXT NOT NULL, args_json TEXT NOT NULL, args_sig TEXT NOT NULL,
+               status TEXT NOT NULL, risk TEXT NOT NULL, ok INTEGER,
+               result_text TEXT, created_at TEXT NOT NULL, settled_at TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_tool_calls_session_sig
+               ON tool_calls(session_id, name, args_sig, created_at);
              CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
              CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
              CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id);
@@ -3131,6 +3139,97 @@ impl Store {
     }
 }
 
+/// Durable lifecycle record for one tool invocation. The risk value is the
+/// host-owned classification, never the tool's self-reported hint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallRow {
+    pub id: String,
+    pub session_id: String,
+    pub tool_call_id: Option<String>,
+    pub name: String,
+    pub args_json: String,
+    pub args_sig: String,
+    pub status: String,
+    pub risk: String,
+    pub ok: Option<bool>,
+    pub result_text: Option<String>,
+    pub created_at: String,
+    pub settled_at: Option<String>,
+}
+
+impl Store {
+    pub fn start_tool_call(
+        &self,
+        session_id: &str,
+        tool_call_id: Option<&str>,
+        name: &str,
+        args_json: &str,
+        args_sig: &str,
+        risk: &str,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tool_calls
+             (id, session_id, tool_call_id, name, args_json, args_sig, status, risk,
+              ok, result_text, created_at, settled_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, NULL, NULL, ?8, NULL)",
+            params![
+                id,
+                session_id,
+                tool_call_id,
+                name,
+                args_json,
+                args_sig,
+                risk,
+                now()
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Idempotent settlement: a second call on a settled row changes nothing.
+    pub fn finish_tool_call(
+        &self,
+        id: &str,
+        status: &str,
+        ok: Option<bool>,
+        result_text: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tool_calls SET status=?2, ok=?3, result_text=?4, settled_at=?5
+             WHERE id=?1 AND status='running'",
+            params![id, status, ok.map(|v| v as i64), result_text, now()],
+        )?;
+        Ok(conn.changes() > 0)
+    }
+
+    /// Successful, executed results for the same signature in this session,
+    /// most recent first. Only these are eligible for repeat echo.
+    pub fn recent_results_for_signature(
+        &self,
+        session_id: &str,
+        name: &str,
+        args_sig: &str,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT result_text FROM tool_calls
+             WHERE session_id=?1 AND name=?2 AND args_sig=?3
+               AND status='ok' AND ok=1 AND result_text IS NOT NULL
+             ORDER BY rowid DESC LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, name, args_sig, limit], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4532,5 +4631,52 @@ mod tests {
             .enqueue_inbox("persist", "s", "user", "queue", "{}")
             .unwrap());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tool_call_lifecycle_is_idempotent_and_queryable() {
+        let store = Store::open(":memory:").unwrap();
+        let id = store
+            .start_tool_call("s", Some("call-1"), "echo", "{}", "echo|{}", "safe")
+            .unwrap();
+        assert_eq!(
+            store
+                .recent_results_for_signature("s", "echo", "echo|{}", 4)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(store
+            .finish_tool_call(&id, "ok", Some(true), Some("done"))
+            .unwrap());
+        assert!(!store
+            .finish_tool_call(&id, "ok", Some(true), Some("again"))
+            .unwrap());
+        let results = store
+            .recent_results_for_signature("s", "echo", "echo|{}", 4)
+            .unwrap();
+        assert_eq!(results, vec!["done".to_string()]);
+    }
+
+    #[test]
+    fn tool_call_results_are_scoped_by_signature_and_host_risk_is_stored() {
+        let store = Store::open(":memory:").unwrap();
+        let a = store
+            .start_tool_call("s", None, "echo", "{}", "sig-a", "network")
+            .unwrap();
+        store
+            .finish_tool_call(&a, "ok", Some(true), Some("A"))
+            .unwrap();
+        assert!(store
+            .recent_results_for_signature("s", "echo", "sig-b", 4)
+            .unwrap()
+            .is_empty());
+        let conn = store.conn.lock().unwrap();
+        let risk: String = conn
+            .query_row("SELECT risk FROM tool_calls WHERE id=?1", params![a], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(risk, "network");
     }
 }

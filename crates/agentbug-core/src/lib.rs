@@ -378,6 +378,81 @@ impl Default for AgentConfig {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TerminalOutcome {
+    NotTerminal,
+    Finished(String),
+    Blocked,
+}
+
+impl Runner {
+    /// Explicit terminal tool. Goal-lock and stop checks still apply; policy,
+    /// budget, cooldown and approval do not, because declaring completion must
+    /// remain possible even when the run is otherwise constrained.
+    fn handle_terminal_tool(
+        &self,
+        session_id: &str,
+        spec: &agentbug_tools::ToolSpec,
+        args: &Value,
+        tool_call_id: Option<&str>,
+    ) -> Result<TerminalOutcome> {
+        if spec.name != agentbug_tools::SESSION_FINISH_TOOL {
+            return Ok(TerminalOutcome::NotTerminal);
+        }
+        let reason = args
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("goal complete")
+            .to_string();
+        let requested = args
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("completed");
+        let state = if requested == "failed" {
+            "failed"
+        } else {
+            "completed"
+        };
+        if self.goal_lock_violation(session_id) {
+            self.report_blocked_call(
+                session_id,
+                spec,
+                tool_call_id,
+                &format!("{GUARD_DENY}goal/scope drift detected"),
+                "",
+            )?;
+            return Ok(TerminalOutcome::Blocked);
+        }
+        if self.stop_requested(session_id)
+            || execution::ExecutionCoordinator::global().is_cancelled(session_id)
+        {
+            self.finish(
+                session_id,
+                "interrupted",
+                "warn",
+                "session.interrupted",
+                "stop requested before finish",
+            );
+            return Ok(TerminalOutcome::Finished("interrupted".to_string()));
+        }
+        self.store.add_message_full(
+            session_id,
+            "tool",
+            "ok=true finish accepted",
+            tool_call_id,
+            None,
+            Some(&spec.name),
+        )?;
+        let (level, kind) = if state == "failed" {
+            ("error", "session.failed")
+        } else {
+            ("info", "session.finish")
+        };
+        self.finish(session_id, state, level, kind, &reason);
+        Ok(TerminalOutcome::Finished(reason))
+    }
+}
+
 pub struct Runner {
     pub store: Store,
     pub llm: Arc<dyn Llm + Send + Sync>,
@@ -594,6 +669,7 @@ impl Runner {
         self.policy.effective_budgets().max_steps.max(1)
     }
 
+    #[cfg(test)]
     fn is_network_tool(spec: &agentbug_tools::ToolSpec) -> bool {
         Self::is_network_tool_with_risk(spec, &spec.risk)
     }
@@ -714,7 +790,8 @@ impl Runner {
             "approval.auto",
             &format!(
                 "tool={} risk={} rule=auto_approve_tools",
-                spec.name, spec.risk
+                spec.name,
+                self.tools.host_risk(&spec.name)
             ),
         );
         true
@@ -847,10 +924,10 @@ impl Runner {
     /// gate reads, so approval/resume cannot reset the counters.
     fn record_call(&self, session_id: &str, spec: &agentbug_tools::ToolSpec) {
         self.tool_calls_used.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = self
-            .store
-            .record_tool_call(session_id, Self::is_network_tool(spec))
-        {
+        if let Err(e) = self.store.record_tool_call(
+            session_id,
+            Self::is_network_tool_with_risk(spec, self.tools.host_risk(&spec.name)),
+        ) {
             warn!(error=%e, session=%session_id, "failed to persist budget usage");
         }
     }
@@ -918,7 +995,7 @@ impl Runner {
         spec: &agentbug_tools::ToolSpec,
         args: &serde_json::Value,
     ) {
-        if !Self::is_network_tool(spec) {
+        if !Self::is_network_tool_with_risk(spec, self.tools.host_risk(&spec.name)) {
             return;
         }
         let Some(target) = extract_policy_target(args) else {
@@ -1350,6 +1427,10 @@ impl Runner {
         let spec = tool.spec();
         let args: serde_json::Value =
             serde_json::from_str(&call.args_json).unwrap_or_else(|_| serde_json::json!({}));
+        match self.handle_terminal_tool(session_id, &spec, &args, call.tool_call_id.as_deref())? {
+            TerminalOutcome::Finished(_) | TerminalOutcome::Blocked => return Ok(()),
+            TerminalOutcome::NotTerminal => {}
+        }
         let target = extract_policy_target(&args);
         // Re-run the full guard chain: approval of an earlier call in the
         // batch must not bypass goal-lock, injection, target, cooldown, budget
@@ -1432,6 +1513,10 @@ impl Runner {
             .or_else(|| self.pending_tool_call_id(session_id, &approval.tool_name));
 
         if approved {
+            match self.handle_terminal_tool(session_id, &spec, &args, tool_call_id.as_deref())? {
+                TerminalOutcome::Finished(text) => return Ok(text),
+                TerminalOutcome::Blocked | TerminalOutcome::NotTerminal => {}
+            }
             let target = extract_policy_target(&args);
             // Re-run the guard chain with current config/scope. A plain policy
             // `Ask` is satisfied by the human approval; every other guard —
@@ -1743,6 +1828,16 @@ impl Runner {
                         continue;
                     };
                     let spec = tool.spec();
+                    match self.handle_terminal_tool(
+                        session_id,
+                        &spec,
+                        &tc.arguments,
+                        Some(&tc.id),
+                    )? {
+                        TerminalOutcome::Finished(text) => return Ok(text),
+                        TerminalOutcome::Blocked => continue,
+                        TerminalOutcome::NotTerminal => {}
+                    }
                     let target = extract_policy_target(&tc.arguments);
                     // One guard chain for every tool call, shared with resume
                     // and deferred calls so parking cannot bypass it.
@@ -1760,7 +1855,11 @@ impl Runner {
                                 session_id,
                                 "info",
                                 "tool.allowed",
-                                &format!("tool={} risk={} reason=allowed", spec.name, spec.risk),
+                                &format!(
+                                    "tool={} risk={} reason=allowed",
+                                    spec.name,
+                                    self.tools.host_risk(&spec.name)
+                                ),
                             );
                             let result = tool.run(tc.arguments.clone()).await;
                             match result {
@@ -1867,13 +1966,21 @@ impl Runner {
                                 .park_with_approval(&approval, &tail, session_id)?;
                             let msg = format!(
                                 "APPROVAL_REQUIRED tool={} risk={} reason={} args={}",
-                                spec.name, spec.risk, reason, args_str
+                                spec.name,
+                                self.tools.host_risk(&spec.name),
+                                reason,
+                                args_str
                             );
                             self.log_event(
                                 session_id,
                                 "info",
                                 "approval.required",
-                                &format!("tool={} risk={} reason={}", spec.name, spec.risk, reason),
+                                &format!(
+                                    "tool={} risk={} reason={}",
+                                    spec.name,
+                                    self.tools.host_risk(&spec.name),
+                                    reason
+                                ),
                             );
                             // The store already parked the session and released
                             // the claim; settle only the in-process side. Do NOT

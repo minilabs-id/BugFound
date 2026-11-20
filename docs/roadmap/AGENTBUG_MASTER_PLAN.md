@@ -74,15 +74,16 @@ Exit evidence: 222 tests green, fmt/clippy `-D warnings` green.
 ### R3c — Remaining core maturity (DEFERRED, each needs its own review)
 1. Capability descriptors + model routing/fallback — adapter-only, needs local
    HTTP fixture tests before core consumes it.
-2. `tool_calls` lifecycle table + sliding-window repeat echo + one-shot schema
-   repair + `session.finish` terminal tool — a single cohesive refactor of the
-   three tool execution paths; do not build an in-process duplicate first.
+2. ✅ (partial) `tool_calls` table, host-risk consistency and explicit
+   `session.finish` terminal tool. Intercepted in deferred, approval-resume and
+   main-loop paths; still checks goal lock and stop before committing; exempt
+   from policy/budget/approval. Remaining: table-backed sliding-window repeat
+   echo and one-shot arg repair (repair deferred: needs typed tool errors and
+   schema validation).
 3. `Scope` doorbell coalescing / re-drain — no production consumer yet.
-4. ✅ (partial) Tool `risk` is now frozen as host-owned registry metadata:
-   `ToolRegistry::register_with_host_risk` / `host_risk`; core gates use the
-   frozen label, so a tool self-labelling `safe` cannot dodge approval or the
-   network budget. JSON Schema validation is still deferred (new dependency +
-   soak period).
+4. ✅ (partial) Tool `risk` is frozen as host-owned registry metadata. JSON
+   Schema validation remains deferred: `jsonschema` is not in the offline cargo
+   cache; adding it needs an explicit dependency/network decision.
 
 Do not start R4 until R3c is completed or explicitly re-scoped.
 

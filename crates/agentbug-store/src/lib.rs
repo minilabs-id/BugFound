@@ -97,6 +97,10 @@ pub struct Finding {
     pub validated_at: Option<String>,
     #[serde(default)]
     pub validation_detail: Option<String>,
+    #[serde(default)]
+    pub verdict: Option<String>,
+    #[serde(default)]
+    pub gap_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +211,20 @@ pub struct ToolCapture {
     pub created_at: String,
 }
 
+/// Authoritative capture for a specific control role in a paired exchange.
+/// The primary capture stays in `tool_captures`; only benign/payload controls
+/// live here so existing `get_capture(finding_id)` callers are unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleCapture {
+    pub finding_id: String,
+    pub role: String,
+    pub request_bytes: Vec<u8>,
+    pub response_bytes: Vec<u8>,
+    pub canary: String,
+    pub marker: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -274,7 +292,7 @@ impl Store {
                asset TEXT, vuln_type TEXT, description TEXT NOT NULL, reproduction TEXT, impact TEXT,
                remediation TEXT, evidence TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                request TEXT, response TEXT, cvss TEXT, cwe TEXT, dedupe_key TEXT, evidence_hash TEXT,
-               validated_at TEXT, validation_detail TEXT
+               validated_at TEXT, validation_detail TEXT, verdict TEXT, gap_reason TEXT
              );
              CREATE TABLE IF NOT EXISTS assets(
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL,
@@ -332,6 +350,15 @@ impl Store {
                finding_id TEXT PRIMARY KEY, request_bytes BLOB NOT NULL,
                response_bytes BLOB NOT NULL, canary TEXT NOT NULL, created_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS finding_captures(
+               id TEXT PRIMARY KEY, finding_id TEXT NOT NULL,
+               role TEXT NOT NULL CHECK(role IN ('primary','paired_benign','paired_payload')),
+               request_bytes BLOB NOT NULL, response_bytes BLOB NOT NULL,
+               canary TEXT NOT NULL, marker TEXT, created_at TEXT NOT NULL,
+               UNIQUE(finding_id, role)
+             );
+             CREATE INDEX IF NOT EXISTS idx_finding_captures_finding
+               ON finding_captures(finding_id, role);
              CREATE TABLE IF NOT EXISTS session_inbox(
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL,
                delivery TEXT NOT NULL, payload_json TEXT NOT NULL,
@@ -431,6 +458,8 @@ impl Store {
         let _ = conn.execute("ALTER TABLE findings ADD COLUMN evidence_hash TEXT", []);
         let _ = conn.execute("ALTER TABLE findings ADD COLUMN validated_at TEXT", []);
         let _ = conn.execute("ALTER TABLE findings ADD COLUMN validation_detail TEXT", []);
+        let _ = conn.execute("ALTER TABLE findings ADD COLUMN verdict TEXT", []);
+        let _ = conn.execute("ALTER TABLE findings ADD COLUMN gap_reason TEXT", []);
         let _ = conn.execute("ALTER TABLE events ADD COLUMN prev_hash TEXT", []);
         let _ = conn.execute("ALTER TABLE events ADD COLUMN hash TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_call_id TEXT", []);
@@ -1038,6 +1067,8 @@ impl Store {
             evidence_hash: None,
             validated_at: None,
             validation_detail: None,
+            verdict: None,
+            gap_reason: None,
         };
         let conn = self.conn.lock().unwrap();
         Self::insert_finding(&conn, &f)?;
@@ -1104,6 +1135,8 @@ impl Store {
             evidence_hash: Some(Self::evidence_hash(evidence, request, response)),
             validated_at: None,
             validation_detail: None,
+            verdict: None,
+            gap_reason: None,
         };
         Self::insert_finding(&conn, &f)?;
         Ok(Some(f))
@@ -1139,7 +1172,7 @@ impl Store {
     pub fn list_findings(&self, session_id: &str) -> Result<Vec<Finding>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash,validated_at,validation_detail
+            "SELECT id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash,validated_at,validation_detail,verdict,gap_reason
              FROM findings WHERE session_id=?1 ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
@@ -1166,6 +1199,8 @@ impl Store {
                 evidence_hash: r.get(19)?,
                 validated_at: r.get(20)?,
                 validation_detail: r.get(21)?,
+                verdict: r.get(22)?,
+                gap_reason: r.get(23)?,
             })
         })?;
         let mut out = vec![];
@@ -1217,11 +1252,88 @@ impl Store {
         Ok(row)
     }
 
+    /// Attach a control capture. Idempotent per `(finding_id, role)` and
+    /// independent of the primary `tool_captures` row.
+    pub fn attach_role_capture(
+        &self,
+        finding_id: &str,
+        role: &str,
+        request: &[u8],
+        response: &[u8],
+        canary: &str,
+        marker: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO finding_captures(id, finding_id, role, request_bytes,
+             response_bytes, canary, marker, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(finding_id, role) DO UPDATE SET
+               request_bytes=excluded.request_bytes,
+               response_bytes=excluded.response_bytes,
+               canary=excluded.canary, marker=excluded.marker,
+               created_at=excluded.created_at",
+            params![
+                Uuid::new_v4().to_string(),
+                finding_id,
+                role,
+                request,
+                response,
+                canary,
+                marker,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_role_capture(&self, finding_id: &str, role: &str) -> Result<Option<RoleCapture>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT finding_id, role, request_bytes, response_bytes, canary, marker, created_at
+             FROM finding_captures WHERE finding_id=?1 AND role=?2",
+                params![finding_id, role],
+                |r| {
+                    Ok(RoleCapture {
+                        finding_id: r.get(0)?,
+                        role: r.get(1)?,
+                        request_bytes: r.get(2)?,
+                        response_bytes: r.get(3)?,
+                        canary: r.get(4)?,
+                        marker: r.get(5)?,
+                        created_at: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Record a ternary closure verdict. Never stamps `validated_at`, so a
+    /// ruled-out or unresolved finding can never satisfy `verified_findings`.
+    pub fn set_finding_verdict(
+        &self,
+        finding_id: &str,
+        verdict: &str,
+        gap_reason: Option<&str>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(verdict, "confirmed" | "ruled_out" | "open_proof_gap"),
+            "unsupported verdict: {verdict}"
+        );
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE findings SET verdict=?2, gap_reason=?3 WHERE id=?1",
+            params![finding_id, verdict, gap_reason],
+        )?;
+        Ok(())
+    }
+
     /// Findings with the given status for a session, oldest first.
     pub fn list_findings_by_status(&self, session_id: &str, status: &str) -> Result<Vec<Finding>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash,validated_at,validation_detail
+            "SELECT id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash,validated_at,validation_detail,verdict,gap_reason
              FROM findings WHERE session_id=?1 AND status=?2 ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id, status], |r| {
@@ -1248,6 +1360,8 @@ impl Store {
                 evidence_hash: r.get(19)?,
                 validated_at: r.get(20)?,
                 validation_detail: r.get(21)?,
+                verdict: r.get(22)?,
+                gap_reason: r.get(23)?,
             })
         })?;
         let mut out = vec![];
@@ -4976,4 +5090,99 @@ mod tests {
         assert_eq!(status, "ok");
         assert!(payload.contains("ruled_out"));
     }
+}
+
+#[test]
+fn role_captures_are_multirow_and_primary_reader_is_unchanged() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("goal").unwrap();
+    let finding = store
+        .add_finding(
+            &session.id,
+            "Candidate",
+            "high",
+            None,
+            None,
+            "description",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    store
+        .attach_capture(&finding.id, b"GET /primary", b"primary body", "canary-p")
+        .unwrap();
+    store
+        .attach_role_capture(
+            &finding.id,
+            "paired_benign",
+            b"GET /safe",
+            b"benign body",
+            "canary-b",
+            Some("marker-b"),
+        )
+        .unwrap();
+    store
+        .attach_role_capture(
+            &finding.id,
+            "paired_payload",
+            b"GET /payload",
+            b"blocked",
+            "canary-x",
+            Some("marker-x"),
+        )
+        .unwrap();
+    let primary = store.get_capture(&finding.id).unwrap().unwrap();
+    assert_eq!(primary.canary, "canary-p");
+    let benign = store
+        .get_role_capture(&finding.id, "paired_benign")
+        .unwrap()
+        .unwrap();
+    assert_eq!(benign.marker.as_deref(), Some("marker-b"));
+    assert_eq!(benign.response_bytes, b"benign body");
+    assert!(store
+        .get_role_capture(&finding.id, "paired_payload")
+        .unwrap()
+        .is_some());
+    assert!(store
+        .get_role_capture(&finding.id, "primary")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn finding_verdict_never_stamps_validation() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("goal").unwrap();
+    let finding = store
+        .add_finding(
+            &session.id,
+            "Candidate",
+            "high",
+            None,
+            None,
+            "description",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(finding.verdict.is_none());
+    store
+        .set_finding_verdict(&finding.id, "ruled_out", Some("paired control available"))
+        .unwrap();
+    let updated = store
+        .list_findings(&session.id)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.id == finding.id)
+        .unwrap();
+    assert_eq!(updated.verdict.as_deref(), Some("ruled_out"));
+    assert!(updated.validated_at.is_none());
+    assert!(store.verified_findings(&session.id).unwrap().is_empty());
+    assert!(store
+        .set_finding_verdict(&finding.id, "bogus", None)
+        .is_err());
 }

@@ -159,6 +159,37 @@ strict CVSS vector validated.
 No effectiveness number is recorded. All artifacts state
 `harness wiring record; not a benchmark result`.
 
+### R7 — Next roadmap (defined 2026-11-20)
+
+#### R7a-1 — Verifier closure storage foundation (COMPLETE)
+- ✅ `finding_captures` multi-role table (`paired_benign` / `paired_payload`)
+  additive to the unchanged primary `tool_captures` row.
+- ✅ `RoleCapture` + `attach_role_capture` / `get_role_capture`; `Finding`
+  gains `verdict` and `gap_reason` with DDL/migration/row-mapping updates.
+- ✅ `set_finding_verdict` never stamps `validated_at`; ruled-out/uncertain
+  findings cannot enter `verified_findings`.
+
+#### R7a-2 — Verifier closure (NOT STARTED, blocked on a real gap)
+Research found there is **no production path** attaching an HTTP tool capture to
+a finding: `persist_tool_result` only reads `structured` from tools whose name
+contains `finding`, while `SaveFindingTool` echoes LLM input. The canary is
+scrubbed from LLM output, so the model cannot supply it. Before `ruled_out` can
+be authoritative, the runner must attach the tool's own capture at the boundary,
+and `ValidatePoCTool` must emit tool-minted benign/payload pairs. Until then any
+closure verdict would be LLM-asserted, which violates ADR-008.
+
+#### R7b — Program intelligence provenance (DESIGNED, NOT STARTED)
+Additive advisory sidecar (`brief_rule_provenance`) with source URL, section
+pointer, verbatim quote + hash, extractor and observed time. Traced sibling
+parsers delegate to current logic; `ScopeConfig`/`RoePolicy`/ROE fail-closed
+behavior stay byte-identical. Typed assets, eligibility flags, freshness gating
+and platform semantics remain deferred (sources unpinned/stale/license-bound).
+
+#### R7c / R8 — Later
+- R7c: JSON Schema validation (offline dependency decision), `Scope` doorbell,
+  one-shot arg repair.
+- R8: measured results from real local engagements N>=3 + baseline lane.
+
 ### R6b — Measured results (NOT STARTED)
 - Golden dataset tiers A-D with reset recipes and negative controls from real
   local lab engagements, N>=3, baseline lane, time-to-first-valid, tier-stratified

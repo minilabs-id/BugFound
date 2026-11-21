@@ -544,6 +544,23 @@ fn scope_entry_matches(entry: &str, target: &str) -> bool {
     ip_match || target == entry || target.ends_with(&format!(".{entry}"))
 }
 
+/// Count host labels in a scope entry, ignoring any path (and a leading `*.`).
+/// Used only to compare how specific two matching entries are.
+fn scope_specificity(entry: &str) -> usize {
+    let host = entry
+        .split("://")
+        .last()
+        .unwrap_or(entry)
+        .split('/')
+        .next()
+        .unwrap_or(entry);
+    host.trim_start_matches("*.")
+        .trim_matches('.')
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .count()
+}
+
 /// Decide whether `target` is permitted by an inclusive/exclusive scope.
 /// Exclusive entries always win. An empty inclusive list allows any target
 /// that is not explicitly excluded.
@@ -558,14 +575,33 @@ pub fn scope_target_allowed(target: &str, in_scope: &[String], out_of_scope: &[S
         .collect();
     let out_matches: Vec<&String> = out_of_scope
         .iter()
+        // A path-scoped exclusion (e.g. "clockify.me/help/*") cannot apply to
+        // a host-only target. Its host portion would otherwise exclude the
+        // entire asset, which is broader than the rule intends.
+        .filter(|entry| {
+            !(entry.contains('/')
+                && entry
+                    .split('/')
+                    .next()
+                    .unwrap_or_default()
+                    .parse::<IpAddr>()
+                    .is_err())
+        })
         .filter(|entry| scope_entry_matches(entry, &target))
         .collect();
-    // A specifically named in-scope asset wins over a broad out-of-scope
-    // wildcard (mirrors agentbug-policy::check_target).
-    if in_matches.iter().any(|entry| !entry.contains('*'))
-        && !out_matches.is_empty()
-        && out_matches.iter().all(|entry| entry.contains('*'))
-    {
+    // A more specific in-scope asset wins over a broad out-of-scope
+    // wildcard (mirrors agentbug-policy::check_target). Specificity is the
+    // number of host labels: `*.api.clockify.me/api/` is more specific than
+    // `*.clockify.me`, and an exact asset is more specific than any wildcard.
+    let in_wins = in_matches.iter().any(|in_entry| {
+        let in_labels = scope_specificity(in_entry);
+        let in_exact = !in_entry.contains('*');
+        !out_matches.is_empty()
+            && out_matches.iter().all(|out_entry| {
+                out_entry.contains('*') && (in_exact || in_labels > scope_specificity(out_entry))
+            })
+    });
+    if in_wins {
         return true;
     }
     if !out_matches.is_empty() {
@@ -4624,6 +4660,21 @@ mod tests {
         let cidr = vec!["10.1.2.0/24".to_string()];
         assert!(scope_target_allowed("10.1.2.3", &cidr, &empty));
         assert!(!scope_target_allowed("11.0.0.1", &cidr, &empty));
+    }
+
+    #[test]
+    fn path_scoped_exclusion_does_not_block_whole_host() {
+        let empty: Vec<String> = vec![];
+        let in_scope = vec!["*.api.clockify.me/api/".to_string()];
+        let out = vec![
+            "clockify.me/help/*".to_string(),
+            "*.clockify.me".to_string(),
+        ];
+        // A path-scoped exclusion must not exclude the host itself, and the
+        // specific in-scope asset still beats the broad wildcard exclusion.
+        assert!(scope_target_allowed("api.clockify.me", &in_scope, &out));
+        // A genuinely excluded host remains excluded.
+        assert!(!scope_target_allowed("nope.clockify.me", &empty, &out));
     }
 
     #[test]

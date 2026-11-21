@@ -3284,9 +3284,16 @@ fn build_canonical_report(
             )
         })
         .collect();
-    let timeline = store
-        .list_events(context.engagement_id, 500)
+    let engagement_marker = format!("engagement_id={}", context.engagement_id);
+    let mut timeline_events = store
+        .list_sessions(500)
         .unwrap_or_default()
+        .into_iter()
+        .filter(|session| session.goal.contains(&engagement_marker))
+        .flat_map(|session| store.list_events(&session.id, 500).unwrap_or_default())
+        .collect::<Vec<_>>();
+    timeline_events.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    let timeline = timeline_events
         .into_iter()
         .map(|event| {
             (

@@ -16,6 +16,10 @@ const { chromium } = require('playwright');
     console.log(JSON.stringify({ ok: false, reason: 'url is required' }));
     process.exit(0);
   }
+  if (!['navigate', 'click', 'screenshot'].includes(action)) {
+    console.log(JSON.stringify({ ok: false, reason: 'unsupported action' }));
+    process.exit(0);
+  }
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage();

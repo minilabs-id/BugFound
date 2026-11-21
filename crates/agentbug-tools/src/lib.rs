@@ -2469,8 +2469,7 @@ pub fn build_external_args(template: &[String], input: &Value) -> Vec<String> {
 /// Every placeholder key that can carry a target. Each value substituted into
 /// one of these must be checked against the engagement scope before spawn.
 const SCOPE_PLACEHOLDER_KEYS: &[&str] = &[
-    "target", "host", "url", "word", "domain", "ports", "param", "marker", "action", "selector",
-    "script", "match",
+    "target", "host", "url", "word", "domain", "ports", "param", "marker", "script", "match",
 ];
 
 /// Collect all non-empty values that would be substituted into scope-bearing
@@ -5779,6 +5778,16 @@ struct ExternalBackedTool {
 /// template (`{target}`, `{host}`, `{url}`, `{word}`, ...) can be satisfied.
 fn enrich_external_input(input: &Value) -> Value {
     let mut map = input.as_object().cloned().unwrap_or_default();
+    // Providers sometimes emit a single-element array for a string field.
+    // Normalise target-like keys so the policy gate sees a clean URL/host
+    // instead of a JSON array literal.
+    for key in ["target", "host", "domain", "url", "word"] {
+        if let Some(Value::Array(items)) = map.get(key) {
+            if let Some(first) = items.first().and_then(Value::as_str) {
+                map.insert(key.to_string(), Value::String(first.to_string()));
+            }
+        }
+    }
     let host = input
         .get("host")
         .and_then(Value::as_str)

@@ -254,6 +254,7 @@ pub fn parse_scope_brief_traced(text: &str) -> (ScopeConfig, Vec<ScopeRuleTrace>
     let mut traces = Vec::new();
     let mut out_section = false;
     let mut notes = Vec::new();
+    let mut prose_in_scope: Vec<String> = Vec::new();
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() {
@@ -306,7 +307,34 @@ pub fn parse_scope_brief_traced(text: &str) -> (ScopeConfig, Vec<ScopeRuleTrace>
             });
             continue;
         }
+        if !out_section {
+            prose_in_scope.push(line.to_string());
+        }
         notes.push(line.to_string());
+    }
+    // Some disclosure policies state scope inside prose instead of a list,
+    // e.g. "Any website served from the *.ada.com, *.ada.health domains".
+    // Only use this fallback when no explicit in-scope entry was found, and
+    // never draw it from the out-of-scope part of the brief.
+    if scope.in_scope.is_empty() {
+        for line in &prose_in_scope {
+            for token in line.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+                let candidate = token.trim_matches(['`', '"', '\'', '(', ')', '.']);
+                if candidate.starts_with("*.")
+                    && candidate.len() > 3
+                    && candidate[2..].contains('.')
+                    && !scope.in_scope.iter().any(|value| value == candidate)
+                {
+                    scope.in_scope.push(candidate.to_string());
+                    traces.push(ScopeRuleTrace {
+                        kind: "scope_in",
+                        value: candidate.to_string(),
+                        quote: line.clone(),
+                        section: "In scope (prose)".to_string(),
+                    });
+                }
+            }
+        }
     }
     if !notes.is_empty() {
         scope.notes = Some(notes.join(" | "));
@@ -769,6 +797,17 @@ mod provenance_tests {
         assert_eq!(traces[0].value, "example.com");
         assert_eq!(traces[2].kind, "scope_out");
         assert!(traces[0].quote.contains("example.com"));
+    }
+
+    #[test]
+    fn prose_wildcard_scope_is_detected() {
+        let brief = "Security Policy\nAny website or service served from the *.ada.com, *.ada.health domains.\nOut of scope: third-party applications only.\n";
+        let (scope, traces) = parse_scope_brief_traced(brief);
+        assert!(scope.in_scope.iter().any(|v| v == "*.ada.com"));
+        assert!(scope.in_scope.iter().any(|v| v == "*.ada.health"));
+        assert!(traces
+            .iter()
+            .any(|t| t.section == "In scope (prose)" && t.value == "*.ada.com"));
     }
 
     #[test]

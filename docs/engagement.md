@@ -325,10 +325,23 @@ enabled = true
 auto_detect = false
 
 [external_tools.commands]
-playwright = "npx -y playwright"
+playwright = "node /path/to/agentbug/eval/fixtures/browser/playwright-wrapper.js {action} {url} {selector}"
 ffuf = "/usr/local/bin/ffuf"
 katana = "/usr/local/bin/katana"
 ```
+
+The Playwright adapter is a tracked dependency under `eval/fixtures/browser/`.
+Install it and its Chromium binary once:
+
+```sh
+npm install eval/fixtures/browser
+npx --prefix eval/fixtures/browser playwright install chromium
+```
+
+`playwright-wrapper.js` accepts `navigate`, `click` and `screenshot` and emits
+bounded JSON (status, title, body excerpt). The engagement reads these command
+mappings from config as well as from `AGENTBUG_EXTERNAL_TOOLS`; config entries
+win. All adapter arguments are still scope-checked before the process spawns.
 
 `register_command_adapters` supports `nmap`, `naabu`, `nuclei`, `playwright`,
 `ffuf` and `katana`. A mapped command is still subject to scope, method and

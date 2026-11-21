@@ -123,6 +123,8 @@ pub struct EngagementOptions {
     pub oob_endpoint: Option<String>,
     /// Loopback hosts explicitly trusted by the operator (offline lab only).
     pub trusted_local_targets: Vec<String>,
+    /// Operator-configured external command adapters (name -> command line).
+    pub external_commands: BTreeMap<String, String>,
 }
 
 impl Default for EngagementOptions {
@@ -139,6 +141,7 @@ impl Default for EngagementOptions {
             auto_approve_all: false,
             oob_endpoint: None,
             trusted_local_targets: Vec::new(),
+            external_commands: BTreeMap::new(),
         }
     }
 }
@@ -3923,7 +3926,7 @@ fn build_tools(
     roe: &RoePolicy,
     options: &EngagementOptions,
 ) -> Result<agentbug_tools::ToolRegistry> {
-    let external_commands: BTreeMap<String, String> = std::env::var("AGENTBUG_EXTERNAL_TOOLS")
+    let mut external_commands: BTreeMap<String, String> = std::env::var("AGENTBUG_EXTERNAL_TOOLS")
         .unwrap_or_default()
         .split(',')
         .filter_map(|entry| {
@@ -3936,6 +3939,13 @@ fn build_tools(
             }
         })
         .collect();
+    // Operator config is authoritative; environment entries are additive and
+    // never override a configured command.
+    for (name, command) in &options.external_commands {
+        external_commands
+            .entry(name.clone())
+            .or_insert_with(|| command.clone());
+    }
     let enable_external_tools = !external_commands.is_empty()
         || std::env::var_os("AGENTBUG_ENABLE_EXTERNAL_TOOLS").is_some();
     // Production call site for the compatibility parser (regression coverage).
@@ -4242,6 +4252,7 @@ Fuzzing is authorized.
             auto_approve_all: false,
             oob_endpoint: None,
             trusted_local_targets: Vec::new(),
+            external_commands: BTreeMap::new(),
         };
         let config = agent_config(
             &options,

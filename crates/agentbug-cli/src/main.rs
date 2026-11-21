@@ -766,6 +766,7 @@ fn engagement_options(cfg: &FileConfig) -> agentbug_engagement::EngagementOption
         auto_approve_all: cfg.agent.auto_approve_all,
         oob_endpoint: cfg.oob.endpoint.clone(),
         trusted_local_targets: cfg.network.trusted_local_targets.clone(),
+        external_commands: cfg.external_tools.commands.clone(),
     }
 }
 
@@ -864,6 +865,13 @@ allow_intrusive = false
 
 [storage]
 path = ".agentbug/agentbug.db"
+
+# Optional gated browser adapter. Install with:
+#   npm install eval/fixtures/browser && npx playwright install chromium
+# [external_tools]
+# enabled = true
+# [external_tools.commands]
+# playwright = "node /path/to/agentbug/eval/fixtures/browser/playwright-wrapper.js {action} {url} {selector}"
 "#;
 
 #[tokio::main]

@@ -14,3 +14,6 @@ __pycache__/
 
 # Evidence artifacts are generated under the engagement workspace, never in source.
 **/evidence/*.bin
+
+# Node dependencies for local browser adapters.
+node_modules/

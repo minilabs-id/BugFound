@@ -311,6 +311,7 @@ fn engagement_options(
         auto_approve_all: config.agent.auto_approve_all,
         oob_endpoint: None,
         trusted_local_targets: Vec::new(),
+        external_commands: std::collections::BTreeMap::new(),
     }
 }
 

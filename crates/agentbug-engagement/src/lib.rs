@@ -3424,6 +3424,23 @@ struct ReportContext<'a> {
     engagement_id: &'a str,
 }
 
+/// Coverage is recorded by the kernel on each runner session, not on the
+/// engagement id. Aggregate it from every session carrying this engagement's
+/// marker so reports and status reflect the work actually performed.
+fn engagement_coverage(
+    store: &agentbug_store::Store,
+    engagement_id: &str,
+) -> Vec<agentbug_store::Coverage> {
+    let marker = format!("engagement_id={engagement_id}");
+    let mut rows = store.list_coverage(engagement_id).unwrap_or_default();
+    for session in store.list_sessions(500).unwrap_or_default() {
+        if session.goal.contains(&marker) {
+            rows.extend(store.list_coverage(&session.id).unwrap_or_default());
+        }
+    }
+    rows
+}
+
 fn build_canonical_report(
     store: &Store,
     context: ReportContext<'_>,
@@ -3551,9 +3568,7 @@ fn build_canonical_report(
         })
         .collect();
 
-    let coverage = store
-        .list_coverage(context.engagement_id)
-        .unwrap_or_default()
+    let coverage = engagement_coverage(store, context.engagement_id)
         .into_iter()
         .map(|row| {
             (

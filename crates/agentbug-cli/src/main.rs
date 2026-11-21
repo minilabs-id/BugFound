@@ -872,7 +872,7 @@ path = ".agentbug/agentbug.db"
 # [external_tools]
 # enabled = true
 # [external_tools.commands]
-# chrome_mcp = "cmd /c /path/to/agentbug/eval/fixtures/chrome-mcp/chrome-mcp-wrapper.cmd {action} {url} {selector}"
+# chrome_mcp = "node /path/to/agentbug/eval/fixtures/chrome-mcp/chrome-mcp-wrapper.js {action} {url} {selector}"
 # Playwright fallback (also supported):
 #   npm install eval/fixtures/browser && npx playwright install chromium
 # playwright = "node /path/to/agentbug/eval/fixtures/browser/playwright-wrapper.js {action} {url} {selector}"

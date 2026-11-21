@@ -20,6 +20,9 @@ pub const ROLE_RESULT_TOOL: &str = "role_result";
 pub const MEMORY_RECALL_TOOL: &str = "memory_recall";
 pub const HANDOFF_PARENT_MARKER: &str = "handoff_parent=";
 const HANDOFF_NONCE_MARKER: &str = "handoff_nonce=";
+pub const HANDOFF_DEPTH_MARKER: &str = "handoff_depth=";
+const MAX_HANDOFF_DEPTH: u32 = 1;
+const MAX_HANDOFF_CHILDREN: usize = 9;
 const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
 
 const DELEGABLE: &[RoleId] = &[
@@ -111,8 +114,31 @@ impl Tool for HandoffTool {
             Ok(session) => session,
             Err(e) => return Ok(reject(&e.to_string())),
         };
-        if parent.goal.contains(HANDOFF_PARENT_MARKER) {
-            return Ok(reject("nested handoff is not allowed"));
+        let depth = parent
+            .goal
+            .lines()
+            .find_map(|line| line.strip_prefix(HANDOFF_DEPTH_MARKER))
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        if depth >= MAX_HANDOFF_DEPTH {
+            return Ok(reject("depth_limit"));
+        }
+        let child_count = self
+            .store
+            .list_sessions(500)
+            .map(|sessions| {
+                sessions
+                    .iter()
+                    .filter(|session| {
+                        session
+                            .goal
+                            .contains(&format!("{HANDOFF_PARENT_MARKER}{}", parent.id))
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        if child_count >= MAX_HANDOFF_CHILDREN {
+            return Ok(reject("max_children"));
         }
 
         let profile = role_profile(role);
@@ -126,12 +152,14 @@ impl Tool for HandoffTool {
 
         let nonce = uuid::Uuid::new_v4().to_string();
         let child_goal = format!(
-            "{}\n{}{}\n{}{}\nRole={}. Task: {}",
+            "{}\n{}{}\n{}{}\n{}{}\nRole={}. Task: {}",
             self.engagement_marker,
             HANDOFF_PARENT_MARKER,
             parent.id,
             HANDOFF_NONCE_MARKER,
             nonce,
+            HANDOFF_DEPTH_MARKER,
+            depth + 1,
             role.as_str(),
             agentbug_store::redact(task)
         );

@@ -2383,3 +2383,42 @@ async fn args_error_hints_next_step_without_extra_model_call() {
         .join("\n");
     assert!(text.contains("attempt-2"));
 }
+
+#[tokio::test]
+async fn graceful_termination_precedes_step_cap() {
+    let store = Store::open(":memory:").unwrap();
+    let llm = Arc::new(MockLlm::new(
+        "m",
+        (0..12)
+            .map(|i| ChatResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: format!("c{i}"),
+                    name: "echo".to_string(),
+                    arguments: json!({"text": "x"}),
+                }],
+                model: "m".to_string(),
+            })
+            .collect(),
+    ));
+    let mut tools = ToolRegistry::new();
+    tools.register_with_host_risk(Arc::new(agentbug_tools::EchoTool), "safe");
+    let runner = Runner::new(
+        store.clone(),
+        llm,
+        tools,
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            max_steps: 3,
+            auto_approve_all: true,
+            ..Default::default()
+        },
+    );
+    let result = runner.run_goal("grace");
+    assert!(result.await.is_err());
+    let session = &store.list_sessions(10).unwrap()[0].id;
+    let events = store.list_events(session, 100).unwrap();
+    assert!(events.iter().any(|e| e.kind == "runner.limit_approaching"));
+    assert!(events.iter().any(|e| e.kind == "session.max_steps"));
+}

@@ -35,6 +35,7 @@ pub struct RoleProfile {
     pub allow_tools: &'static [&'static str],
     pub max_steps: usize,
     pub max_tool_calls: usize,
+    pub max_tools: usize,
 }
 
 /// Deterministic role selection for a WSTG playbook. No LLM choice.
@@ -54,6 +55,7 @@ pub fn role_profile(id: RoleId) -> RoleProfile {
             allow_tools: &[], // empty means: inherit the whole ROE-filtered base
             max_steps: 20,
             max_tool_calls: 0,
+            max_tools: 5,
         },
         RoleId::ProgramIntel => RoleProfile {
             id,
@@ -73,6 +75,7 @@ pub fn role_profile(id: RoleId) -> RoleProfile {
             ],
             max_steps: 8,
             max_tool_calls: 8,
+            max_tools: 5,
         },
         RoleId::Recon => RoleProfile {
             id,
@@ -91,6 +94,7 @@ pub fn role_profile(id: RoleId) -> RoleProfile {
             ],
             max_steps: 12,
             max_tool_calls: 16,
+            max_tools: 5,
         },
         RoleId::Research => RoleProfile {
             id,
@@ -104,6 +108,7 @@ pub fn role_profile(id: RoleId) -> RoleProfile {
             ],
             max_steps: 8,
             max_tool_calls: 8,
+            max_tools: 5,
         },
         RoleId::Testing => RoleProfile {
             id,
@@ -112,6 +117,7 @@ pub fn role_profile(id: RoleId) -> RoleProfile {
             allow_tools: &[], // inherit the ROE-filtered base; no new privilege
             max_steps: 24,
             max_tool_calls: 0,
+            max_tools: 5,
         },
         RoleId::Verification => RoleProfile {
             id,
@@ -128,6 +134,7 @@ pub fn role_profile(id: RoleId) -> RoleProfile {
             ],
             max_steps: 10,
             max_tool_calls: 10,
+            max_tools: 5,
         },
         RoleId::Report => RoleProfile {
             id,
@@ -136,6 +143,7 @@ pub fn role_profile(id: RoleId) -> RoleProfile {
             allow_tools: &[SESSION_FINISH_TOOL],
             max_steps: 4,
             max_tool_calls: 0,
+            max_tools: 5,
         },
     }
 }
@@ -145,11 +153,18 @@ pub fn role_profile(id: RoleId) -> RoleProfile {
 pub fn build_role_tools(base: &ToolRegistry, role: RoleId) -> ToolRegistry {
     let profile = role_profile(role);
     let mut scoped = ToolRegistry::new();
+    let mut non_terminal = 0usize;
     for spec in base.specs() {
         if !profile.allow_tools.is_empty()
             && !profile.allow_tools.iter().any(|name| *name == spec.name)
         {
             continue;
+        }
+        if spec.name != SESSION_FINISH_TOOL {
+            if non_terminal >= profile.max_tools {
+                continue;
+            }
+            non_terminal += 1;
         }
         let Some(tool) = base.get(&spec.name) else {
             continue;
@@ -198,4 +213,24 @@ fn playbook_role_mapping_is_total_and_deterministic() {
     assert!(role_profile(RoleId::Verification)
         .allow_tools
         .contains(&"role_result"));
+}
+
+#[test]
+fn role_tool_cap_excludes_terminal_tool() {
+    let base = ToolRegistry::new();
+    for role in [
+        RoleId::General,
+        RoleId::Recon,
+        RoleId::Research,
+        RoleId::Testing,
+        RoleId::Verification,
+    ] {
+        let scoped = build_role_tools(&base, role);
+        let non_terminal = scoped
+            .specs()
+            .into_iter()
+            .filter(|spec| spec.name != SESSION_FINISH_TOOL)
+            .count();
+        assert!(non_terminal <= role_profile(role).max_tools);
+    }
 }

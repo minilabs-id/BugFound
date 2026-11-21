@@ -27,6 +27,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Record an out-of-band operator acknowledgement for an unparsed ROE rule (offline)
+    Authorize {
+        /// Exact program URL passed to engage --url
+        #[arg(long)]
+        url: String,
+        /// sha256 hex of the extracted brief text
+        #[arg(long)]
+        content_hash: String,
+        /// Verbatim unparsed ROE line
+        #[arg(long, required_unless_present = "version", conflicts_with = "version")]
+        rule: Option<String>,
+        /// Acknowledge a whole brief version by its content hash
+        #[arg(long, required_unless_present = "rule", conflicts_with = "rule")]
+        version: Option<String>,
+        /// Operator identity recorded in the audit trail
+        #[arg(long)]
+        operator: String,
+        /// Reason for the acknowledgement
+        #[arg(long, default_value = "")]
+        note: String,
+        /// Database path (defaults to configured storage path)
+        #[arg(long)]
+        db: Option<String>,
+    },
     /// Initialize a sample config in the current directory
     Init {
         /// Overwrite if exists
@@ -1016,6 +1040,56 @@ path = ".agentbug/agentbug.db"
             if !valid {
                 std::process::exit(1);
             }
+        }
+        Commands::Authorize {
+            url,
+            content_hash,
+            rule,
+            version,
+            operator,
+            note,
+            db,
+        } => {
+            if content_hash.len() != 64 || !content_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                eprintln!("content_hash must be 64 lowercase hex characters");
+                std::process::exit(1);
+            }
+            if operator.trim().is_empty() {
+                eprintln!("operator is required");
+                std::process::exit(1);
+            }
+            let db_path = db.unwrap_or_else(|| cfg.storage.path.clone());
+            let store = Store::open(&db_path)?;
+            let (subject_kind, subject_hash, subject_text) = if let Some(rule) = rule {
+                let trimmed = rule.trim();
+                let digest = format!(
+                    "{:x}",
+                    <sha2::Sha256 as sha2::Digest>::digest(trimmed.as_bytes())
+                );
+                ("unparsed_roe", digest, trimmed.to_string())
+            } else {
+                ("brief_version", version.unwrap(), content_hash.clone())
+            };
+            let ack = agentbug_store::AuthorizationAck {
+                program_url: url,
+                content_hash,
+                subject_kind: subject_kind.to_string(),
+                subject_hash,
+                subject_text,
+                decision: "acknowledged".to_string(),
+                operator,
+                note,
+                created_at: String::new(),
+            };
+            let inserted = store.save_authorization_ack(&ack)?;
+            println!(
+                "{}",
+                if inserted {
+                    "acknowledgement recorded"
+                } else {
+                    "acknowledgement already present (idempotent)"
+                }
+            );
         }
         Commands::Engage {
             url,

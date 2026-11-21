@@ -700,6 +700,7 @@ async fn run_engagement(
     brief_only: bool,
     options: EngagementOptions,
 ) -> Result<EngagementProfile> {
+    let mut ack_applied = false;
     // 1. BriefReader â€” no proxy, no redirects, private hosts rejected,
     //    non-2xx rejected, 1 MB body cap (H-02/H-11).
     let (raw_html, brief_text) = fetch_brief(program_url).await?;
@@ -792,14 +793,32 @@ async fn run_engagement(
             "unparsed ROE constraints; refusing to engage (fail-closed): {}",
             unparsed.join(" | ")
         );
-        emit(
-            tx,
-            Some(replay),
-            EngagementEvent::Error {
-                message: message.clone(),
-            },
+        // Proceed only when EVERY unmapped line has a hash-scoped operator
+        // acknowledgement. DB errors fail closed. This can never be created by
+        // the LLM, tool approval, or auto_approve_all.
+        let all_acknowledged = unparsed.iter().all(|line| {
+            let rule_hash = hex_digest(line.trim().as_bytes());
+            store
+                .has_authorization_ack(program_url, &content_hash, "unparsed_roe", &rule_hash)
+                .unwrap_or(false)
+        });
+        if !all_acknowledged {
+            emit(
+                tx,
+                Some(replay),
+                EngagementEvent::Error {
+                    message: message.clone(),
+                },
+            );
+            return Err(anyhow!(message));
+        }
+        ack_applied = true;
+        let _ = store.append_trace(
+            id,
+            id,
+            "authorization.ack_applied",
+            &json!({"content_hash": content_hash, "count": unparsed.len()}).to_string(),
         );
-        return Err(anyhow!(message));
     }
     let _ = store.append_trace(
         id,
@@ -1367,7 +1386,11 @@ async fn run_engagement(
     let coverage = status.coverage;
     let outcome = if aborted {
         "aborted"
-    } else if status.tasks_done < status.tasks_total || coverage == 0 || open_hypotheses > 0 {
+    } else if ack_applied
+        || status.tasks_done < status.tasks_total
+        || coverage == 0
+        || open_hypotheses > 0
+    {
         "incomplete"
     } else {
         "completed"
@@ -1383,7 +1406,9 @@ async fn run_engagement(
             "coverage": coverage,
             "verified": verified_count,
             "open_hypotheses": open_hypotheses,
-            "reason": if outcome == "incomplete" {
+            "reason": if ack_applied {
+                "operator acknowledgement applied to unparsed ROE constraint(s)"
+            } else if outcome == "incomplete" {
                 "playbooks or hypotheses unresolved"
             } else { "all playbooks evidenced and hypotheses resolved" }
         })

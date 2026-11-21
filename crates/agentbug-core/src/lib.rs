@@ -1880,6 +1880,23 @@ impl Runner {
         let mut last_evidence = self.domain.progress_count(&self.store, session_id);
         let mut stalled_steps = 0usize;
         while step < self.effective_max_steps() {
+            // Graceful termination: announce the approaching cap so the model
+            // can choose a terminal action. No extra LLM call is made.
+            if step + 3 >= self.effective_max_steps()
+                && !self
+                    .store
+                    .has_session_flag(session_id, "limit_announced")
+                    .unwrap_or(false)
+            {
+                let _ = self.store.set_session_flag(session_id, "limit_announced");
+                let text = format!(
+                    "Approaching step limit ({}/{}); conclude with a terminal decision now.",
+                    step,
+                    self.effective_max_steps()
+                );
+                self.log_event(session_id, "warn", "runner.limit_approaching", &text);
+                self.store.add_message(session_id, "assistant", &text)?;
+            }
             let evidence_now = self.domain.progress_count(&self.store, session_id);
             if evidence_now > last_evidence {
                 stalled_steps = 0;

@@ -314,3 +314,18 @@ No effectiveness number may be asserted until those artifacts exist.
 - ✅ Canary scrubbed from redacted views; `inline_view` prevents captured bodies
   from creating fake headings. Renderer lines are additive and guarded.
 - Deferred: step 7 budgets/fan-out and ack-driven bypass (ROE decision).
+
+
+### R15/R16 — Bounded fan-out + operator authorization (COMPLETE)
+- ✅ Handoff depth counter (`handoff_depth=N`, max 1) and children cap (9);
+  role-scoped non-terminal tool caps; graceful step-limit announcement event
+  `runner.limit_approaching` without an extra LLM call.
+- ✅ Ack-driven ROE bypass: proceeds only when EVERY unmapped line has a
+  hash-scoped operator ack; same abort text/shape otherwise; `denied_finding_classes`
+  unchanged; outcome forced `incomplete` and trace `authorization.ack_applied`.
+- ✅ Offline CLI `agentbug authorize --url --content-hash --rule|--version
+  --operator [--note]` writes hash-scoped acks only; no LLM/tool path can create one.
+- Deferred: budget-offset inheritance parent→child, revalidation-on-resume,
+  platform adapters, safe-harbor typing, auto-submit.
+
+All results remain construction evidence. No benchmark claim is asserted.

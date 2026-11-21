@@ -4087,6 +4087,7 @@ fn register_command_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &ToolO
         "nuclei",
         "playwright",
         "chrome",
+        "chrome_mcp",
         "ffuf",
         "katana",
     ] {

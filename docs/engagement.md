@@ -91,6 +91,62 @@ A new engagement row is created in state `idle`, then transitions through `runni
 to `completed`, `paused`, or `aborted`. The engagement ID is printed at start; save it
 for control commands.
 
+### Read-only platform brief adapters
+
+```sh
+# Public page (default): identical to the existing plain fetch
+agentbug engage --url https://example.com/program --platform generic
+
+# Token-gated brief ingestion (READ-ONLY; never submits anything)
+agentbug engage --url https://hackerone.com/acme --platform hackerone --api-key-env H1_API_TOKEN
+agentbug engage --url https://bugcrowd.com/acme --platform bugcrowd --api-key-env BC_API_TOKEN
+agentbug engage --url https://intigriti.com/program/acme --platform intigriti --api-key-env INTIGRITI_TOKEN
+```
+
+`--api-key-env` takes the **name** of an environment variable, never the token
+itself. The CLI does not read, log, or write the token to config; the
+engagement reads the environment variable only at fetch time. Do not put a
+token in `agentbug.toml`, a report, or the workspace. For any non-`generic`
+platform with no `--api-key-env` (or an unset/empty variable), the engagement
+fails closed with an error — it never silently retries unauthenticated. Only
+`http`/`https` URLs are accepted, redirects and private hosts are refused, and
+extracted brief text is capped at 256 KiB. All scope/ROE parsing and fail-closed
+gating is unchanged: an adapter only supplies the text to read.
+
+**API contract caveat:** platform API endpoints, response shapes, and token
+header conventions vary by API version and can be program-specific. The
+`Authorization` header name and per-platform schemes are isolated constants in
+`agentbug-engagement/src/platform.rs`; verify them against the program you are
+reading. An unexpected response is an error, not permission. There is no
+submission, publish, or write method in the adapter.
+
+### Safe-harbor receipts (offline, advisory)
+
+Safe-harbor receipts are typed, offline audit records bound to one program URL
+and one exact brief hash. They are **advisory only**: they cannot be created by
+an LLM or tool flag, cannot bypass a ROE abort, and never submit anything.
+
+```sh
+# Record (hash arguments must be 64 hex characters; decision is always "acknowledged")
+agentbug receipt add \
+  --program-url https://hackerone.com/acme \
+  --brief-content-hash <sha256-hex-of-extracted-brief-text> \
+  --scope-version v1 \
+  --terms-hash <sha256-hex-of-terms> \
+  --operator alice \
+  --expires-at 2027-01-01T00:00:00Z \
+  --note "out-of-band confirmation" \
+  --db .agentbug/agentbug.db
+
+agentbug receipt list --program-url https://hackerone.com/acme --db .agentbug/agentbug.db
+```
+
+Re-running the same `add` is idempotent. A receipt only appears as an additive
+line `Safe-harbor receipt: <id> (operator ..., expires ...)` in
+`agentbug engagement --id <id> --status` and in the local report when it is
+acknowledged, unexpired, and matches the engagement's latest brief hash. It has
+no effect on `final_state`, verification, or outcome.
+
 ### Desktop
 
 Open `start-desktop.bat` and select the **Engagement** tab. Paste the program URL,

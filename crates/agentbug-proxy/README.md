@@ -12,6 +12,7 @@ agentbug-proxy \
   --scope-out '*.internal.example.com' \
   --require-ack \
   --max-requests 50 \
+  --ca-dir ./agentbug-proxy-ca \
   --out proxy-history.jsonl
 ```
 
@@ -30,10 +31,23 @@ Only absolute-form HTTP requests are accepted (standard proxy requests).
 - Redirects are never followed by the proxy itself; header bytes are bounded,
   hop-by-hop headers are stripped, and one request is handled per connection.
 
+## HTTPS / TLS MITM
+
+HTTPS is supported through operator-controlled MITM. On the first run a
+self-signed CA is generated in `--ca-dir` (default `./agentbug-proxy-ca`) and
+written as `ca-cert.pem` / `ca-key.pem`. The operator must explicitly trust
+`ca-cert.pem` in the client, otherwise HTTPS interception will fail with a
+certificate error. Per-host leaf certificates are cached in memory.
+
+`CONNECT` targets pass through the SAME fail-closed scope gate as plain HTTP.
+With `--require-ack`, an explicit `y` is required before a tunnel is allowed.
+Pass `--no-mitm` to disable HTTPS interception; `CONNECT` then returns 403 with
+reason `mitm_disabled`. The private key is never printed or logged.
+
 ## Limitations (deliberate)
 
-- Plain HTTP only. HTTPS/CONNECT MITM would require certificate generation and
-  is intentionally not included.
+- Plain HTTP and HTTPS/1.1 are supported; HTTP/2, QUIC/HTTP/3 and HSTS-bypass
+  tricks are out of scope. Certificate generation is local and operator-trusted.
 - This is an operator-controlled interception point, not an authorization
   bypass. Scope entries still come from the operator/engagement, never from
   the model or a tool flag.

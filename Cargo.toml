@@ -11,6 +11,7 @@ members = [
   "crates/agentbug-desktop",
   "crates/agentbug-engagement",
   "crates/agentbug-proxy",
+  "crates/agentbug-collaborator",
 ]
 
 [workspace.package]

@@ -146,6 +146,15 @@ pub struct ToolOptions {
     /// Local-only Collaborator simulation store: token -> recorded interactions.
     /// Server metadata is stored under a reserved `__server__` prefixed key.
     pub oob_interactions: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    /// Base URL of a self-hosted external OOB oracle's loopback admin listener
+    /// (e.g. `http://127.0.0.1:8082`). When set, the `collaborator` tool mints
+    /// tokens and reads interactions from that server instead of the loopback
+    /// simulation. When `None`, the loopback fallback is used unchanged.
+    pub oob_endpoint: Option<String>,
+    /// Optional operator-provisioned token. When an external endpoint is set,
+    /// this overrides the token returned by `POST /token` and is also used as
+    /// the default token for `fetch` when the call omits one.
+    pub oob_token: Option<String>,
 }
 
 #[async_trait]
@@ -2841,6 +2850,75 @@ impl CollaboratorTool {
     pub fn with_options(options: ToolOptions) -> Self {
         Self { options }
     }
+
+    /// Route operations to the external self-hosted oracle. Every failure is
+    /// reported as a structured `ok:false` result so callers fail closed.
+    async fn run_external(&self, operation: &str, input: &Value) -> Result<ToolResult> {
+        match operation {
+            "start" => match oob_external_start(&self.options).await {
+                Ok(started) => {
+                    let out = json!({
+                        "ok": true,
+                        "token": started.token,
+                        "payload": started.payload,
+                        "server_location": started.server_location,
+                        "domain_suffix": started.domain_suffix,
+                        "local_only": false,
+                        "external": true,
+                    });
+                    Ok(ToolResult {
+                        ok: true,
+                        output: truncate(&out.to_string()),
+                        structured: Some(out),
+                    })
+                }
+                Err(err) => Ok(denial_result(
+                    "oob_start_failed",
+                    json!({"reason": redact(&err.to_string())}),
+                )),
+            },
+            "fetch" => {
+                let token = input
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .or(self.options.oob_token.as_deref())
+                    .unwrap_or("")
+                    .to_string();
+                if token.is_empty() {
+                    return Ok(denial_result(
+                        "token_required",
+                        json!({"operation": "fetch"}),
+                    ));
+                }
+                match oob_external_fetch(&self.options, &token).await {
+                    Ok(interactions) => {
+                        let count = interactions.as_array().map(Vec::len).unwrap_or(0);
+                        let out = json!({
+                            "ok": true,
+                            "token": token,
+                            "interactions": interactions,
+                            "interaction_count": count,
+                            "server_location": self.options.oob_endpoint,
+                            "cleared": false,
+                            "local_only": false,
+                            "external": true,
+                        });
+                        Ok(ToolResult {
+                            ok: true,
+                            output: truncate(&out.to_string()),
+                            structured: Some(out),
+                        })
+                    }
+                    Err(err) => Ok(denial_result(
+                        "oob_fetch_failed",
+                        json!({"reason": redact(&err.to_string())}),
+                    )),
+                }
+            }
+            other => Err(anyhow!("unsupported collaborator operation: {other}")),
+        }
+    }
 }
 
 impl Default for CollaboratorTool {
@@ -2849,12 +2927,160 @@ impl Default for CollaboratorTool {
     }
 }
 
+/// Short-lived client for the oracle's loopback admin API. Proxying is disabled
+/// so an environment proxy cannot reroute admin traffic off the host.
+fn oob_admin_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .no_proxy()
+                .build()
+                .expect("oob admin client")
+        })
+}
+
+/// Extract the OOB domain suffix from a `server_location` value, which may be a
+/// bare domain, a `host:port`, or a full URL (optionally including the token as
+/// its leftmost label).
+fn oob_domain_from_location(location: &str, token: &str) -> Option<String> {
+    let location = location.trim();
+    if location.is_empty() {
+        return None;
+    }
+    let host = if location.contains("://") {
+        url::Url::parse(location).ok()?.host_str()?.to_string()
+    } else {
+        location.split('/').next().unwrap_or(location).to_string()
+    };
+    let mut host = host
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if let Some((name, _port)) = host.split_once(':') {
+        host = name.to_string();
+    }
+    if !token.is_empty() {
+        if let Some(rest) = host.strip_prefix(&format!("{token}.")) {
+            host = rest.to_string();
+        }
+    }
+    if host.is_empty() {
+        return None;
+    }
+    Some(host)
+}
+
+/// Result of a successful external `start`: everything the model needs to use
+/// the payload, but nothing that is written to disk or logged.
+struct ExternalStart {
+    token: String,
+    payload: String,
+    domain_suffix: String,
+    server_location: String,
+}
+
+async fn oob_external_start(options: &ToolOptions) -> Result<ExternalStart> {
+    let endpoint = options
+        .oob_endpoint
+        .as_deref()
+        .context("oob_endpoint is not configured")?
+        .trim_end_matches('/');
+    let response = oob_admin_client()
+        .post(format!("{endpoint}/token"))
+        .send()
+        .await
+        .context("oob token request failed")?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "oob token request returned HTTP {}",
+            response.status().as_u16()
+        );
+    }
+    let payload_json: Value = response
+        .json()
+        .await
+        .context("oob token response is not JSON")?;
+
+    let server_token = payload_json
+        .get("token")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let token = options
+        .oob_token
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&server_token)
+        .to_string();
+    if token.is_empty() {
+        anyhow::bail!("oob token response contained no token");
+    }
+
+    let domain_suffix = payload_json
+        .get("domain_suffix")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            payload_json
+                .get("server_location")
+                .and_then(Value::as_str)
+                .and_then(|location| oob_domain_from_location(location, &token))
+        })
+        .context("oob token response contained no domain_suffix")?;
+
+    let server_location = payload_json
+        .get("server_location")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&domain_suffix)
+        .to_string();
+    Ok(ExternalStart {
+        payload: format!("http://{token}.{domain_suffix}/"),
+        token,
+        domain_suffix,
+        server_location,
+    })
+}
+
+async fn oob_external_fetch(options: &ToolOptions, token: &str) -> Result<Value> {
+    let endpoint = options
+        .oob_endpoint
+        .as_deref()
+        .context("oob_endpoint is not configured")?
+        .trim_end_matches('/');
+    let response = oob_admin_client()
+        .get(format!("{endpoint}/interactions"))
+        .query(&[("token", token)])
+        .send()
+        .await
+        .context("oob interactions request failed")?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "oob interactions request returned HTTP {}",
+            response.status().as_u16()
+        );
+    }
+    let interactions: Value = response
+        .json()
+        .await
+        .context("oob interactions response is not JSON")?;
+    if !interactions.is_array() {
+        anyhow::bail!("oob interactions response was not an array");
+    }
+    Ok(interactions)
+}
+
 #[async_trait]
 impl Tool for CollaboratorTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "collaborator".into(),
-            description: "LOCAL-ONLY out-of-band (OOB) interaction simulation (Burp Collaborator equivalent). `start` binds a loopback TCP listener on 127.0.0.1:0 and returns an http://<token>.localhost:<port>/ payload; `fetch` polls interactions recorded by that listener (interactions are KEPT, so polling is non-destructive) and caps at 32 hits per context. This is a simulation only: an external target cannot reach a loopback listener, so no external DNS, public listener or network egress is used and it is not registered as a production default OOB oracle.".into(),
+            description: "Out-of-band (OOB) interaction oracle (Burp Collaborator equivalent). With no configured endpoint it is a LOCAL-ONLY simulation: `start` binds a loopback TCP listener on 127.0.0.1:0 and returns an http://<token>.localhost:<port>/ payload; `fetch` polls interactions (KEPT, so polling is non-destructive) and caps at 32 hits. When an external self-hosted oracle endpoint is configured, `start` mints a token there and returns an http://<token>.<domain-suffix>/ payload, and `fetch` reads that token's recorded HTTP/DNS interactions. External errors fail closed. No auto-submit and no report transmission.".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -2868,6 +3094,9 @@ impl Tool for CollaboratorTool {
     }
     async fn run(&self, input: Value) -> Result<ToolResult> {
         let operation = input.get("operation").and_then(Value::as_str).unwrap_or("");
+        if self.options.oob_endpoint.is_some() {
+            return self.run_external(operation, &input).await;
+        }
         match operation {
             "start" => {
                 let nanos = SystemTime::now()
@@ -7508,6 +7737,155 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.structured.unwrap()["interaction_count"], 0);
+    }
+
+    // ---- external OOB oracle wiring ----------------------------------------
+
+    /// Minimal admin-API stub: each queued response is served on one accepted
+    /// connection, and the raw request lines are returned for assertions.
+    async fn serve_oob_admin(
+        responses: Vec<(&'static str, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                seen.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            seen
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn collaborator_external_start_and_fetch_round_trip() {
+        let interactions = json!([
+            {"type":"http","token":"tok-1","protocol":"HTTP/1.1"},
+            {"type":"dns","token":"tok-1","query_type":1}
+        ])
+        .to_string();
+        let (endpoint, server) = serve_oob_admin(vec![
+            (
+                "200 OK",
+                json!({"token":"tok-1","domain_suffix":"oob.example.com"}).to_string(),
+            ),
+            ("200 OK", interactions.clone()),
+        ])
+        .await;
+        let tool = CollaboratorTool::with_options(ToolOptions {
+            oob_endpoint: Some(endpoint),
+            ..ToolOptions::default()
+        });
+
+        let started = tool.run(json!({"operation":"start"})).await.unwrap();
+        assert!(started.ok, "{}", started.output);
+        let data = started.structured.unwrap();
+        assert_eq!(data["token"], json!("tok-1"));
+        assert_eq!(data["payload"], json!("http://tok-1.oob.example.com/"));
+        assert_eq!(data["local_only"], json!(false));
+
+        let fetched = tool
+            .run(json!({"operation":"fetch","token":"tok-1"}))
+            .await
+            .unwrap();
+        assert!(fetched.ok, "{}", fetched.output);
+        let data = fetched.structured.unwrap();
+        assert_eq!(data["interaction_count"], json!(2));
+        assert_eq!(
+            data["interactions"],
+            serde_json::from_str::<Value>(&interactions).unwrap()
+        );
+        assert_eq!(data["local_only"], json!(false));
+
+        let seen = server.await.unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].starts_with("POST /token "), "{}", seen[0]);
+        assert!(
+            seen[1].starts_with("GET /interactions?token=tok-1 "),
+            "{}",
+            seen[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn collaborator_external_accepts_server_location_and_configured_token() {
+        let (endpoint, server) = serve_oob_admin(vec![
+            (
+                "200 OK",
+                json!({"token":"server-token","server_location":"http://oob.example.com/"})
+                    .to_string(),
+            ),
+            ("200 OK", "[]".to_string()),
+        ])
+        .await;
+        let tool = CollaboratorTool::with_options(ToolOptions {
+            oob_endpoint: Some(endpoint),
+            oob_token: Some("operator-token".to_string()),
+            ..ToolOptions::default()
+        });
+
+        let started = tool.run(json!({"operation":"start"})).await.unwrap();
+        assert!(started.ok, "{}", started.output);
+        let data = started.structured.unwrap();
+        // The operator-provisioned token wins over the server-issued one.
+        assert_eq!(data["token"], json!("operator-token"));
+        assert_eq!(
+            data["payload"],
+            json!("http://operator-token.oob.example.com/")
+        );
+
+        // `fetch` falls back to the configured token when none is supplied.
+        let fetched = tool.run(json!({"operation":"fetch"})).await.unwrap();
+        assert!(fetched.ok, "{}", fetched.output);
+        assert_eq!(fetched.structured.unwrap()["interaction_count"], json!(0));
+
+        let seen = server.await.unwrap();
+        assert!(seen[1].contains("token=operator-token"), "{}", seen[1]);
+    }
+
+    #[tokio::test]
+    async fn collaborator_external_fails_closed_on_admin_error() {
+        let (endpoint, server) = serve_oob_admin(vec![(
+            "500 Internal Server Error",
+            "{\"error\":\"boom\"}".to_string(),
+        )])
+        .await;
+        let tool = CollaboratorTool::with_options(ToolOptions {
+            oob_endpoint: Some(endpoint),
+            ..ToolOptions::default()
+        });
+        let started = tool.run(json!({"operation":"start"})).await.unwrap();
+        assert!(!started.ok);
+        assert_eq!(
+            started.structured.unwrap()["error"],
+            json!("oob_start_failed")
+        );
+        server.await.unwrap();
+
+        // A configured endpoint that is unreachable also fails closed on fetch.
+        let tool = CollaboratorTool::with_options(ToolOptions {
+            oob_endpoint: Some("http://127.0.0.1:1".to_string()),
+            ..ToolOptions::default()
+        });
+        let fetched = tool
+            .run(json!({"operation":"fetch","token":"x"}))
+            .await
+            .unwrap();
+        assert!(!fetched.ok);
+        assert_eq!(
+            fetched.structured.unwrap()["error"],
+            json!("oob_fetch_failed")
+        );
     }
 
     #[tokio::test]

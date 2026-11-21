@@ -392,3 +392,25 @@ All results remain construction evidence. No benchmark claim is asserted.
   by design invariant and requires a new ADR), external Collaborator server /
   DNS listener, TLS MITM certificate generation, platform adapters, typed
   safe-harbor model. No benchmark claim; all results are construction evidence.
+
+
+### R19 — External OOB, TLS MITM, safe harbor, platform adapters (COMPLETE)
+- New `agentbug-collaborator` binary: HTTP + UDP DNS + loopback-only admin
+  listeners, token minting, capped interactions, JSONL history; `collaborator`
+  tool now talks to a real external endpoint via `ToolOptions.oob_endpoint`
+  while retaining the loopback simulation fallback. DNS requires a delegated
+  zone and UDP 53 (or port-forward); HTTP payloads are plain HTTP.
+- `agentbug-proxy`: HTTPS/CONNECT interception with locally generated CA and
+  cached per-host leaf certs; CONNECT passes the same fail-closed scope gate
+  and operator ack; `--no-mitm` refuses tunnels with reason `mitm_disabled`.
+  History records `scheme` and decision per request.
+- Typed safe-harbor: `safe_harbor_receipts` table + idempotent hash-scoped CRUD
+  + offline `agentbug receipt add|list`. Advisory only — never a ROE bypass and
+  never changes outcome/final_state.
+- Read-only platform adapters (`generic|hackerone|bugcrowd|intigriti`) with
+  `--platform` and `--api-key-env`; missing token is a hard error, API contract
+  caveats documented in code. No submission path of any kind.
+- Verification: 338 tests green, clippy clean, ADR-001 boundary clean, exactly
+  one `chat_full` in core.
+- Still forbidden by design (requires a new ADR): auto-submit / report
+  transmission. All numbers remain construction evidence, no benchmark claim.

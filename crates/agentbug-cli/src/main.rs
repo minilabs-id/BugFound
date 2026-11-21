@@ -1,8 +1,9 @@
 use agentbug_core::{AgentConfig, Runner};
+use agentbug_engagement::platform::Platform;
 use agentbug_engagement::prioritize_targets;
 use agentbug_llm::{Llm, LlmConfig};
 use agentbug_policy::{parse_scope_brief, Mode};
-use agentbug_store::{redact, Store};
+use agentbug_store::{redact, SafeHarborReceipt, Store};
 use agentbug_tools::{try_default_registry_with_options, ToolOptions};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -27,6 +28,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Record or list offline safe-harbor receipts (advisory only; never authorizes action)
+    Receipt {
+        #[command(subcommand)]
+        action: ReceiptCommands,
+        /// Database path (defaults to configured storage path)
+        #[arg(long, global = true)]
+        db: Option<String>,
+    },
     /// Record an out-of-band operator acknowledgement for an unparsed ROE rule (offline)
     Authorize {
         /// Exact program URL passed to engage --url
@@ -204,6 +213,13 @@ enum Commands {
         /// Only ingest the public brief and plan; never execute tools against the target
         #[arg(long)]
         brief_only: bool,
+        /// Read-only brief source (generic uses the existing public-page fetch)
+        #[arg(long, value_enum, default_value_t = PlatformArg::Generic)]
+        platform: PlatformArg,
+        /// NAME of the environment variable holding the platform API token.
+        /// The token value is never read by the CLI, written to config, or logged.
+        #[arg(long)]
+        api_key_env: Option<String>,
     },
     /// Inspect/control a running engagement
     Engagement {
@@ -223,6 +239,59 @@ enum Commands {
         #[arg(long, requires = "resume")]
         revalidate_brief: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ReceiptCommands {
+    /// Record a safe-harbor receipt. Decision is always "acknowledged"; there
+    /// is no flag to bypass ROE or approve a tool.
+    Add {
+        /// Exact program URL passed to engage --url
+        #[arg(long)]
+        program_url: String,
+        /// sha256 hex of the extracted brief text (64 hex characters)
+        #[arg(long)]
+        brief_content_hash: String,
+        /// Scope version the receipt covers
+        #[arg(long)]
+        scope_version: String,
+        /// sha256 hex of the acknowledged terms (64 hex characters)
+        #[arg(long)]
+        terms_hash: String,
+        /// Operator identity recorded in the audit trail
+        #[arg(long)]
+        operator: String,
+        /// Expiry as ISO-8601, e.g. 2027-01-01T00:00:00Z
+        #[arg(long)]
+        expires_at: String,
+        /// Optional operator note
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// List safe-harbor receipts recorded for a program
+    List {
+        #[arg(long)]
+        program_url: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PlatformArg {
+    Generic,
+    HackerOne,
+    Bugcrowd,
+    Intigriti,
+}
+
+impl From<PlatformArg> for Platform {
+    fn from(value: PlatformArg) -> Self {
+        match value {
+            PlatformArg::Generic => Platform::Generic,
+            PlatformArg::HackerOne => Platform::HackerOne,
+            PlatformArg::Bugcrowd => Platform::Bugcrowd,
+            PlatformArg::Intigriti => Platform::Intigriti,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -651,6 +720,10 @@ fn engagement_options(cfg: &FileConfig) -> agentbug_engagement::EngagementOption
     }
 }
 
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn print_engagement_status(db: &std::path::Path, id: &str) -> Result<()> {
     let status = agentbug_engagement::status_at(db, id).context("query engagement status")?;
     println!("engagement={} state={}", redact(id), redact(&status.state));
@@ -667,6 +740,11 @@ fn print_engagement_status(db: &std::path::Path, id: &str) -> Result<()> {
                 .unwrap_or_else(|| "-".into())
         )
     );
+    // Additive advisory line only. It cannot change state, ROE or outcome.
+    let store = Store::open(db)?;
+    if let Some(line) = agentbug_engagement::valid_safe_harbor_receipt_line(&store, id)? {
+        println!("{line}");
+    }
     Ok(())
 }
 
@@ -1044,6 +1122,99 @@ path = ".agentbug/agentbug.db"
                 std::process::exit(1);
             }
         }
+        Commands::Receipt { action, db } => {
+            let db_path = db.unwrap_or_else(|| cfg.storage.path.clone());
+            let store = Store::open(&db_path)?;
+            match action {
+                ReceiptCommands::Add {
+                    program_url,
+                    brief_content_hash,
+                    scope_version,
+                    terms_hash,
+                    operator,
+                    expires_at,
+                    note,
+                } => {
+                    if !is_sha256_hex(&brief_content_hash) {
+                        eprintln!("brief_content_hash must be 64 hex characters");
+                        std::process::exit(1);
+                    }
+                    if !is_sha256_hex(&terms_hash) {
+                        eprintln!("terms_hash must be 64 hex characters");
+                        std::process::exit(1);
+                    }
+                    if program_url.trim().is_empty()
+                        || scope_version.trim().is_empty()
+                        || operator.trim().is_empty()
+                    {
+                        eprintln!("program_url, scope_version and operator are required");
+                        std::process::exit(1);
+                    }
+                    if chrono::DateTime::parse_from_rfc3339(&expires_at).is_err() {
+                        eprintln!("expires_at must be ISO-8601, e.g. 2027-01-01T00:00:00Z");
+                        std::process::exit(1);
+                    }
+                    // Deterministic id makes re-running the same add idempotent.
+                    let id = format!(
+                        "{:x}",
+                        <sha2::Sha256 as sha2::Digest>::digest(
+                            format!(
+                                "{}|{}|{}|{}|{}|{}|{}",
+                                program_url,
+                                brief_content_hash,
+                                scope_version,
+                                terms_hash,
+                                operator,
+                                expires_at,
+                                note
+                            )
+                            .as_bytes()
+                        )
+                    );
+                    let receipt = SafeHarborReceipt {
+                        id,
+                        program_url,
+                        brief_content_hash,
+                        scope_version,
+                        terms_hash,
+                        operator,
+                        acquired_at: chrono::Utc::now().to_rfc3339(),
+                        expires_at,
+                        // Hardcoded: no flag may create a bypass or different decision.
+                        decision: "acknowledged".to_string(),
+                        note,
+                    };
+                    let inserted = store.save_safe_harbor_receipt(&receipt)?;
+                    println!(
+                        "{} receipt_id={}",
+                        if inserted {
+                            "safe-harbor receipt recorded"
+                        } else {
+                            "safe-harbor receipt already present (idempotent)"
+                        },
+                        receipt.id
+                    );
+                }
+                ReceiptCommands::List { program_url } => {
+                    let receipts = store.list_safe_harbor_receipts(&program_url)?;
+                    if receipts.is_empty() {
+                        println!("(no safe-harbor receipts)");
+                    }
+                    for receipt in receipts {
+                        println!(
+                            "{} scope={} operator={} acquired={} expires={} decision={} note={}",
+                            receipt.id,
+                            redact(&receipt.scope_version),
+                            redact(&receipt.operator),
+                            receipt.acquired_at,
+                            receipt.expires_at,
+                            receipt.decision,
+                            redact(&receipt.note)
+                        );
+                    }
+                }
+            }
+        }
         Commands::Authorize {
             url,
             content_hash,
@@ -1053,7 +1224,7 @@ path = ".agentbug/agentbug.db"
             note,
             db,
         } => {
-            if content_hash.len() != 64 || !content_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if !is_sha256_hex(&content_hash) {
                 eprintln!("content_hash must be 64 lowercase hex characters");
                 std::process::exit(1);
             }
@@ -1099,7 +1270,15 @@ path = ".agentbug/agentbug.db"
             cwd,
             db,
             brief_only,
+            platform,
+            api_key_env,
         } => {
+            // Only the environment-variable NAME is passed down. The CLI never
+            // reads, prints or stores the token value.
+            let platform_options = agentbug_engagement::EngagementPlatformOptions {
+                platform: platform.into(),
+                api_key_env,
+            };
             let db_path = db.unwrap_or_else(|| cfg.storage.path.clone());
             let monitor = Arc::new(agentbug_core::Monitor::new(
                 Store::open(&db_path)?,
@@ -1141,19 +1320,21 @@ path = ".agentbug/agentbug.db"
             let worker_db = db_path.clone();
             let worker = std::thread::spawn(move || {
                 if brief_only {
-                    agentbug_engagement::engage_brief_only_with_options(
+                    agentbug_engagement::engage_brief_only_with_platform(
                         &worker_url,
                         Path::new(&worker_cwd),
                         Path::new(&worker_db),
                         options,
+                        platform_options,
                         tx,
                     )
                 } else {
-                    agentbug_engagement::engage_with_options(
+                    agentbug_engagement::engage_with_platform(
                         &worker_url,
                         Path::new(&worker_cwd),
                         Path::new(&worker_db),
                         options,
+                        platform_options,
                         tx,
                     )
                 }

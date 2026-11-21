@@ -520,6 +520,14 @@ impl Store {
                created_at TEXT NOT NULL,
                UNIQUE(engagement_id, snapshot_hash, rule_hash)
              );
+             CREATE TABLE IF NOT EXISTS safe_harbor_receipts(
+               id TEXT PRIMARY KEY, program_url TEXT NOT NULL, brief_content_hash TEXT NOT NULL,
+               scope_version TEXT NOT NULL, terms_hash TEXT NOT NULL, operator TEXT NOT NULL,
+               acquired_at TEXT NOT NULL, expires_at TEXT NOT NULL, decision TEXT NOT NULL,
+               note TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_safe_harbor_receipts_program_hash
+               ON safe_harbor_receipts(program_url, brief_content_hash);
              CREATE TABLE IF NOT EXISTS tasks(
                id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, statement TEXT NOT NULL,
                playbook_id TEXT NOT NULL DEFAULT '', target TEXT, priority INTEGER NOT NULL DEFAULT 0,
@@ -3235,6 +3243,25 @@ pub struct AuthorizationAck {
     pub created_at: String,
 }
 
+/// Advisory, operator-supplied safe-harbor receipt for a specific brief version.
+/// This is a typed audit record only: it is never consulted by scope or ROE
+/// gating, cannot be created by an LLM or tool flag, and never authorizes an
+/// action. All timestamps are ISO-8601 strings so expiry can be compared
+/// lexicographically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafeHarborReceipt {
+    pub id: String,
+    pub program_url: String,
+    pub brief_content_hash: String,
+    pub scope_version: String,
+    pub terms_hash: String,
+    pub operator: String,
+    pub acquired_at: String,
+    pub expires_at: String,
+    pub decision: String,
+    pub note: String,
+}
+
 /// An unmapped ROE rule kept visible (never silently dropped).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAuthorizationRule {
@@ -3410,6 +3437,101 @@ impl Store {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// Idempotent insert of an operator-supplied safe-harbor receipt. The
+    /// receipt is advisory metadata only; no caller may use it to authorize a
+    /// tool call or relax a scope/ROE decision. Returns true only when a new
+    /// row was inserted.
+    pub fn save_safe_harbor_receipt(&self, receipt: &SafeHarborReceipt) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO safe_harbor_receipts(
+              id, program_url, brief_content_hash, scope_version, terms_hash,
+              operator, acquired_at, expires_at, decision, note)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                receipt.id,
+                receipt.program_url,
+                receipt.brief_content_hash,
+                receipt.scope_version,
+                receipt.terms_hash,
+                receipt.operator,
+                receipt.acquired_at,
+                receipt.expires_at,
+                receipt.decision,
+                receipt.note,
+            ],
+        )?;
+        Ok(conn.changes() > 0)
+    }
+
+    /// All receipts recorded for a program, newest acquisition first.
+    pub fn list_safe_harbor_receipts(&self, program_url: &str) -> Result<Vec<SafeHarborReceipt>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, program_url, brief_content_hash, scope_version, terms_hash,
+                    operator, acquired_at, expires_at, decision, note
+             FROM safe_harbor_receipts WHERE program_url=?1
+             ORDER BY acquired_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![program_url], |r| {
+            Ok(SafeHarborReceipt {
+                id: r.get(0)?,
+                program_url: r.get(1)?,
+                brief_content_hash: r.get(2)?,
+                scope_version: r.get(3)?,
+                terms_hash: r.get(4)?,
+                operator: r.get(5)?,
+                acquired_at: r.get(6)?,
+                expires_at: r.get(7)?,
+                decision: r.get(8)?,
+                note: r.get(9)?,
+            })
+        })?;
+        let mut out = vec![];
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Return the newest acknowledged, unexpired receipt for one exact brief
+    /// hash. `now` and `expires_at` are ISO-8601 strings, so a lexical compare
+    /// is sufficient. A receipt is never an authorization decision: callers
+    /// may only surface it as advisory provenance.
+    pub fn valid_safe_harbor_receipt(
+        &self,
+        program_url: &str,
+        brief_content_hash: &str,
+        now: &str,
+    ) -> Result<Option<SafeHarborReceipt>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, program_url, brief_content_hash, scope_version, terms_hash,
+                    operator, acquired_at, expires_at, decision, note
+             FROM safe_harbor_receipts
+             WHERE program_url=?1 AND brief_content_hash=?2
+               AND decision='acknowledged' AND expires_at > ?3
+             ORDER BY acquired_at DESC, id DESC LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row(params![program_url, brief_content_hash, now], |r| {
+                Ok(SafeHarborReceipt {
+                    id: r.get(0)?,
+                    program_url: r.get(1)?,
+                    brief_content_hash: r.get(2)?,
+                    scope_version: r.get(3)?,
+                    terms_hash: r.get(4)?,
+                    operator: r.get(5)?,
+                    acquired_at: r.get(6)?,
+                    expires_at: r.get(7)?,
+                    decision: r.get(8)?,
+                    note: r.get(9)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
     }
 
     pub fn save_open_authorization_rule(&self, rule: &OpenAuthorizationRule) -> Result<()> {
@@ -4400,6 +4522,95 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_harbor_receipt_is_idempotent_hash_scoped_and_expires() {
+        let store = Store::open(":memory:").unwrap();
+        let receipt = SafeHarborReceipt {
+            id: "receipt-1".to_string(),
+            program_url: "https://hackerone.com/acme".to_string(),
+            brief_content_hash: "hash-1".to_string(),
+            scope_version: "v1".to_string(),
+            terms_hash: "terms-1".to_string(),
+            operator: "operator".to_string(),
+            acquired_at: "2026-01-01T00:00:00Z".to_string(),
+            expires_at: "2026-12-31T00:00:00Z".to_string(),
+            decision: "acknowledged".to_string(),
+            note: "out of band".to_string(),
+        };
+        assert!(store.save_safe_harbor_receipt(&receipt).unwrap());
+        // Idempotent by id.
+        assert!(!store.save_safe_harbor_receipt(&receipt).unwrap());
+        assert_eq!(
+            store
+                .list_safe_harbor_receipts(&receipt.program_url)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let now = "2026-06-01T00:00:00Z";
+        let valid = store
+            .valid_safe_harbor_receipt(&receipt.program_url, &receipt.brief_content_hash, now)
+            .unwrap()
+            .expect("valid receipt");
+        assert_eq!(valid.id, receipt.id);
+        // Scoped to the exact brief hash and program URL.
+        assert!(store
+            .valid_safe_harbor_receipt(&receipt.program_url, "hash-2", now)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .valid_safe_harbor_receipt("https://hackerone.com/other", "hash-1", now)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .list_safe_harbor_receipts("https://hackerone.com/other")
+                .unwrap()
+                .len(),
+            0
+        );
+        // Expired at the boundary.
+        assert!(store
+            .valid_safe_harbor_receipt(
+                &receipt.program_url,
+                &receipt.brief_content_hash,
+                "2027-01-01T00:00:00Z"
+            )
+            .unwrap()
+            .is_none());
+
+        // A non-acknowledged receipt is never "valid" and cannot be promoted
+        // into a permission by a flag.
+        let mut denied = receipt.clone();
+        denied.id = "receipt-2".to_string();
+        denied.decision = "observed".to_string();
+        assert!(store.save_safe_harbor_receipt(&denied).unwrap());
+        assert!(store
+            .valid_safe_harbor_receipt(
+                &denied.program_url,
+                &denied.brief_content_hash,
+                "2026-02-01T00:00:00Z"
+            )
+            .unwrap()
+            .is_some()); // the still-valid acknowledged receipt wins
+        assert_eq!(
+            store
+                .list_safe_harbor_receipts(&receipt.program_url)
+                .unwrap()
+                .len(),
+            2
+        );
+        let mut observed = denied.clone();
+        observed.id = "receipt-3".to_string();
+        observed.brief_content_hash = "hash-3".to_string();
+        assert!(store.save_safe_harbor_receipt(&observed).unwrap());
+        assert!(store
+            .valid_safe_harbor_receipt(&observed.program_url, "hash-3", now)
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn create_session_and_messages() {

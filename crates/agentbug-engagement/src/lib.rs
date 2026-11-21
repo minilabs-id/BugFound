@@ -15,18 +15,21 @@
 
 pub mod domain;
 pub mod handoff;
+pub mod platform;
 pub mod roe_classifier;
 pub mod roles;
 
 pub use domain::{prioritize_targets, BountyDomain};
 pub use handoff::{HandoffTool, MemoryRecallTool, RoleResultTool};
+pub use platform::{Platform, ProgramBrief};
 pub use roles::{build_role_tools, role_for_playbook, role_profile, RoleId};
 
 use agentbug_core::{build_policy_config, AgentConfig, Runner};
 use agentbug_llm::{ChatMessage, ChatResponse, Llm, LlmClient, LlmConfig};
 use agentbug_policy::{BudgetConfig, Mode, PolicyConfig, ScopeConfig};
 use agentbug_store::{
-    redact, AuthorizationSnapshot, OpenAuthorizationRule, RuleProvenance, Store, ToolCapture,
+    redact, AuthorizationSnapshot, OpenAuthorizationRule, RuleProvenance, SafeHarborReceipt, Store,
+    ToolCapture,
 };
 use agentbug_tools::{try_default_registry_with_options, write_evidence_artifact, ToolOptions};
 use anyhow::{anyhow, Context, Result};
@@ -134,6 +137,17 @@ impl Default for EngagementOptions {
     }
 }
 
+/// Platform brief-source settings. Kept separate from [`EngagementOptions`] so
+/// existing callers that construct `EngagementOptions` exhaustively (desktop)
+/// keep compiling. `api_key_env` is the *name* of an environment variable; the
+/// token value is read by the engagement at use time and is never logged or
+/// persisted.
+#[derive(Debug, Clone, Default)]
+pub struct EngagementPlatformOptions {
+    pub platform: Platform,
+    pub api_key_env: Option<String>,
+}
+
 /// Typed rules of engagement parsed from the *full* brief text. Every flag is
 /// fail-closed: fuzzing, state changes and disclosure are denied unless the
 /// brief explicitly authorises them.
@@ -189,6 +203,7 @@ pub fn engage_with_options(
         tx,
         false,
         options,
+        EngagementPlatformOptions::default(),
     ))
 }
 
@@ -228,6 +243,58 @@ pub fn engage_brief_only_with_options(
         tx,
         true,
         options,
+        EngagementPlatformOptions::default(),
+    ))
+}
+
+/// Start a new engagement using an explicit read-only platform brief adapter.
+///
+/// The adapter only *reads* a program brief. It cannot submit, publish or
+/// modify anything on the platform, and a missing token is a hard error.
+pub fn engage_with_platform(
+    program_url: &str,
+    workspace: &Path,
+    db_path: &Path,
+    options: EngagementOptions,
+    platform_options: EngagementPlatformOptions,
+    tx: Sender<EngagementEvent>,
+) -> Result<EngagementProfile> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for platform engagement")?;
+    runtime.block_on(engage_async(
+        program_url,
+        workspace,
+        db_path,
+        tx,
+        false,
+        options,
+        platform_options,
+    ))
+}
+
+/// Brief-only variant of [`engage_with_platform`]: no tools are executed.
+pub fn engage_brief_only_with_platform(
+    program_url: &str,
+    workspace: &Path,
+    db_path: &Path,
+    options: EngagementOptions,
+    platform_options: EngagementPlatformOptions,
+    tx: Sender<EngagementEvent>,
+) -> Result<EngagementProfile> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for platform brief-only engagement")?;
+    runtime.block_on(engage_async(
+        program_url,
+        workspace,
+        db_path,
+        tx,
+        true,
+        options,
+        platform_options,
     ))
 }
 
@@ -408,6 +475,34 @@ pub fn status_at(db: &Path, engagement_id: &str) -> Result<EngagementStatus> {
         coverage: store.coverage_count(engagement_id)?,
         report_path: store.latest_report_path(engagement_id)?.map(PathBuf::from),
     })
+}
+
+/// Format the advisory safe-harbor line shown in engagement status/reports.
+/// Purely additive: the string is provenance, never a permission or state
+/// transition.
+pub fn safe_harbor_receipt_line(receipt: &SafeHarborReceipt) -> String {
+    format!(
+        "Safe-harbor receipt: {} (operator {}, expires {})",
+        receipt.id, receipt.operator, receipt.expires_at
+    )
+}
+
+/// Look up a currently valid receipt for the engagement's latest brief hash.
+/// A receipt never gates, changes or relaxes ROE; it is only surfaced for audit.
+pub fn valid_safe_harbor_receipt_line(
+    store: &Store,
+    engagement_id: &str,
+) -> Result<Option<String>> {
+    let Some(engagement) = store.get_engagement(engagement_id)? else {
+        return Ok(None);
+    };
+    let Some(snapshot) = store.latest_authorization_snapshot(engagement_id)? else {
+        return Ok(None);
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let receipt =
+        store.valid_safe_harbor_receipt(&engagement.program_url, &snapshot.content_hash, &now)?;
+    Ok(receipt.as_ref().map(safe_harbor_receipt_line))
 }
 
 // ---------------------------------------------------------------------------
@@ -610,6 +705,7 @@ async fn engage_async(
     tx: Sender<EngagementEvent>,
     brief_only: bool,
     options: EngagementOptions,
+    platform_options: EngagementPlatformOptions,
 ) -> Result<EngagementProfile> {
     std::fs::create_dir_all(workspace)
         .with_context(|| format!("create workspace {}", workspace.display()))?;
@@ -682,6 +778,7 @@ async fn engage_async(
         &mut trace,
         brief_only,
         options,
+        platform_options,
     )
     .await;
     match outcome {
@@ -719,11 +816,18 @@ async fn run_engagement(
     trace: &mut TraceRun,
     brief_only: bool,
     options: EngagementOptions,
+    platform_options: EngagementPlatformOptions,
 ) -> Result<EngagementProfile> {
     let mut ack_applied = false;
     // 1. BriefReader â€” no proxy, no redirects, private hosts rejected,
-    //    non-2xx rejected, 1 MB body cap (H-02/H-11).
-    let (raw_html, brief_text) = fetch_brief(program_url).await?;
+    //    non-2xx rejected, 1 MB body cap (H-02/H-11). Platform adapters are
+    //    strictly read-only and fail closed when a required token is absent.
+    let (raw_html, brief_text) = fetch_engagement_brief(
+        platform_options.platform,
+        platform_options.api_key_env.as_deref(),
+        program_url,
+    )
+    .await?;
     if brief_text.trim().is_empty() {
         return Err(anyhow!(
             "program brief contains no readable text; refusing to engage (fail-closed)"
@@ -1060,7 +1164,12 @@ async fn run_engagement(
         // request row created by `resume_at_with_revalidation(.., true)`.
         if let Some(revalidation) = store.get_authorization_revalidation(id)? {
             if revalidation.state == "requested" {
-                let (_refetched_html, refetched_text) = fetch_brief(program_url).await?;
+                let (_refetched_html, refetched_text) = fetch_engagement_brief(
+                    platform_options.platform,
+                    platform_options.api_key_env.as_deref(),
+                    program_url,
+                )
+                .await?;
                 let observed_hash = hex_digest(refetched_text.as_bytes());
                 let latest = store.latest_authorization_snapshot(id)?;
                 let baseline_hash = latest
@@ -1888,6 +1997,49 @@ fn observe_session(
 // BriefReader
 // ---------------------------------------------------------------------------
 
+/// Read-only brief dispatch. `Generic` keeps the existing public-page fetch;
+/// every other platform goes through the token-bearing adapter. A missing or
+/// empty token is a hard error: there is deliberately no unauthenticated
+/// fallback path.
+async fn fetch_engagement_brief(
+    platform: Platform,
+    api_key_env: Option<&str>,
+    url: &str,
+) -> Result<(String, String)> {
+    if platform == Platform::Generic {
+        return fetch_brief(url).await;
+    }
+    let var = api_key_env
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "platform '{platform}' requires --api-key-env naming an environment variable with the API token; refusing unauthenticated brief fetch (fail-closed)"
+            )
+        })?;
+    let key = std::env::var(var).with_context(|| {
+        format!(
+            "environment variable '{var}' required by --api-key-env is not set; platform '{platform}' requires a token; refusing unauthenticated brief fetch"
+        )
+    })?;
+    if key.trim().is_empty() {
+        return Err(anyhow!(
+            "environment variable '{var}' is empty; platform '{platform}' requires a token; refusing unauthenticated brief fetch"
+        ));
+    }
+    let brief = platform::fetch_platform_brief(platform, url, Some(key.trim()))
+        .await
+        .with_context(|| format!("read-only brief fetch from {platform} failed"))?;
+    if brief.text.trim().is_empty() {
+        return Err(anyhow!(
+            "platform brief contains no readable text; refusing to engage (fail-closed)"
+        ));
+    }
+    // The adapter returns plain text; keep it as the snapshot body so every
+    // downstream scope/ROE parse consumes exactly the bytes we fetched.
+    Ok((brief.title, brief.text))
+}
+
 async fn fetch_brief(url: &str) -> Result<(String, String)> {
     // H-02/H-11: no redirects (a public brief must not bounce to a private or
     // login endpoint), and reject any host that resolves to a private address.
@@ -1946,7 +2098,7 @@ fn is_non_public_ip(ip: IpAddr) -> bool {
     }
 }
 
-async fn reject_private_brief_host(url: &str) -> Result<()> {
+pub(crate) async fn reject_private_brief_host(url: &str) -> Result<()> {
     let parsed = url::Url::parse(url).context("invalid program brief URL")?;
     let host = parsed
         .host_str()
@@ -1989,7 +2141,7 @@ async fn reject_private_brief_host(url: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_login_page(requested: &str, final_url: &str) -> bool {
+pub(crate) fn is_login_page(requested: &str, final_url: &str) -> bool {
     let lower = final_url.to_ascii_lowercase();
     let requested_host = host_from_url(requested).unwrap_or_default();
     let final_host = host_from_url(final_url).unwrap_or_default();
@@ -2001,7 +2153,7 @@ fn is_login_page(requested: &str, final_url: &str) -> bool {
 
 /// Strip HTML to readable text while keeping list/bullet boundaries so the
 /// scope heuristic can still recognise `-` and `*.` lines.
-fn html_to_text(html: &str) -> String {
+pub(crate) fn html_to_text(html: &str) -> String {
     let clean =
         Regex::new(r"(?is)<(?:script|style|noscript)\b[^>]*>.*?</(?:script|style|noscript)\s*>")
             .unwrap()
@@ -2023,7 +2175,7 @@ fn html_to_text(html: &str) -> String {
         .join("\n")
 }
 
-fn decode_entities(input: &str) -> String {
+pub(crate) fn decode_entities(input: &str) -> String {
     input
         .replace("&nbsp;", " ")
         .replace("&amp;", "&")
@@ -3419,7 +3571,7 @@ fn build_canonical_report(
         .collect();
 
     let _ = status;
-    render_canonical_report(&ReportInput {
+    let mut report = render_canonical_report(&ReportInput {
         program: redact(&profile.program_url),
         platform,
         engagement: redact(&profile.engagement),
@@ -3440,7 +3592,14 @@ fn build_canonical_report(
         coverage,
         timeline,
         report_id: redact(context.engagement_id),
-    })
+    });
+    // Additive audit line only. It never affects verification, outcome or state.
+    if let Ok(Some(line)) = valid_safe_harbor_receipt_line(store, context.engagement_id) {
+        report.push('\n');
+        report.push_str(&line);
+        report.push('\n');
+    }
+    report
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -3661,6 +3820,98 @@ No DoS testing. Do not modify data. No disclosure.
         assert!(!options.allow_network_write);
         assert!(!options.allow_intrusive);
         assert!(!options.auto_approve_all);
+    }
+
+    #[test]
+    fn safe_harbor_receipt_line_is_additive_provenance_only() {
+        let receipt = SafeHarborReceipt {
+            id: "receipt-1".to_string(),
+            program_url: "https://hackerone.com/acme".to_string(),
+            brief_content_hash: "hash-1".to_string(),
+            scope_version: "v1".to_string(),
+            terms_hash: "terms-1".to_string(),
+            operator: "alice".to_string(),
+            acquired_at: "2026-01-01T00:00:00Z".to_string(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+            decision: "acknowledged".to_string(),
+            note: String::new(),
+        };
+        assert_eq!(
+            safe_harbor_receipt_line(&receipt),
+            "Safe-harbor receipt: receipt-1 (operator alice, expires 2099-01-01T00:00:00Z)"
+        );
+
+        // The store-backed helper only surfaces a valid receipt; it never
+        // changes engagement state or ROE classification.
+        let db = temp_db("safe-harbor-line");
+        let store = Store::open(&db).unwrap();
+        let engagement = store.create_engagement(&receipt.program_url).unwrap();
+        assert!(valid_safe_harbor_receipt_line(&store, &engagement.id)
+            .unwrap()
+            .is_none());
+        store
+            .save_authorization_snapshot(&AuthorizationSnapshot {
+                engagement_id: engagement.id.clone(),
+                version: 1,
+                source_url: receipt.program_url.clone(),
+                content_hash: receipt.brief_content_hash.clone(),
+                scope_hash: "scope".to_string(),
+                roe_hash: "roe".to_string(),
+                observed_at: "1".to_string(),
+                state: "ingested".to_string(),
+                created_at: "1".to_string(),
+            })
+            .unwrap();
+        assert!(valid_safe_harbor_receipt_line(&store, &engagement.id)
+            .unwrap()
+            .is_none());
+        assert!(store.save_safe_harbor_receipt(&receipt).unwrap());
+        assert_eq!(
+            valid_safe_harbor_receipt_line(&store, &engagement.id)
+                .unwrap()
+                .as_deref(),
+            Some("Safe-harbor receipt: receipt-1 (operator alice, expires 2099-01-01T00:00:00Z)")
+        );
+        assert_eq!(
+            store.get_engagement(&engagement.id).unwrap().unwrap().state,
+            "idle"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn platform_missing_key_is_an_engagement_error_not_a_fallback() {
+        let db = temp_db("platform-missing-key");
+        let workspace = std::env::temp_dir().join(format!(
+            "agentbug-platform-workspace-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&workspace);
+        let (tx, rx) = std::sync::mpsc::channel::<EngagementEvent>();
+        let result = engage_with_platform(
+            "https://example.test/program",
+            &workspace,
+            &db,
+            EngagementOptions::default(),
+            EngagementPlatformOptions {
+                platform: Platform::HackerOne,
+                api_key_env: None,
+            },
+            tx,
+        );
+        let error = result.expect_err("missing platform token must fail closed");
+        assert!(error.to_string().contains("--api-key-env"), "{error:#}");
+        let events: Vec<EngagementEvent> = rx.try_iter().collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngagementEvent::Error { message } if message.contains("--api-key-env")
+        )));
+        let store = Store::open(&db).unwrap();
+        let engagements = store.list_engagements(10).unwrap();
+        assert_eq!(engagements.len(), 1);
+        assert_eq!(engagements[0].state, "aborted");
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_file(&db);
     }
 
     #[test]

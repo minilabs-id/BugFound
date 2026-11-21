@@ -5093,7 +5093,7 @@ pub fn render_canonical_report(input: &ReportInput) -> String {
             let method = if method.is_empty() { "ANY" } else { method };
             let status = if status.is_empty() { "covered" } else { status };
             out.push_str(&format!(
-                "- `{method} {target}{path}` — **{status}**{}",
+                "- `{method} {target}{path}` — **{status}**{}\n",
                 if rationale.is_empty() {
                     String::new()
                 } else {

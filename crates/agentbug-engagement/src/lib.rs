@@ -1746,6 +1746,10 @@ async fn run_engagement(
              responses. decode(operation,input) handles url/base64/hex. sequencer(tokens) assesses token \
              randomness. collaborator start/fetch provides an OOB oracle (external only when configured). \
              Every network tool call with an explicit target records coverage automatically. \
+             If you observe a concrete anomaly worth reporting, call validate_finding FIRST with the five \
+             falsification fields (counterevidence, confidence, confidence_rationale, \
+             severity_change_conditions, oracle_type), fix anything it reports, then call save_finding \
+             with the SAME fields - otherwise no finding can be verified. Never guess the canary. \
              Use session_finish when the playbook is done. Return findings and evidence in your final answer. \
              Do not submit anything to any external system.{discovered}",
             task.statement

@@ -122,7 +122,17 @@ impl ScopeConfig {
             return true;
         }
         if p.contains('/') {
-            return Self::cidr_matches(&p, target);
+            let network = p.split('/').next().unwrap_or_default();
+            if network.parse::<IpAddr>().is_ok() {
+                return Self::cidr_matches(&p, target);
+            }
+            // Host-oriented pattern with a path: match the host component only.
+            let host = network.trim_end_matches('.');
+            let t_host = Self::norm_host(target);
+            if let Some(suffix) = host.strip_prefix("*.") {
+                return t_host == suffix || t_host.ends_with(&format!(".{suffix}"));
+            }
+            return t_host == host || t_host.ends_with(&format!(".{host}"));
         }
         let t_raw = target.trim().to_ascii_lowercase();
         let t_host = Self::norm_host(target);
@@ -724,5 +734,26 @@ mod provenance_tests {
         assert_eq!(traces[0].value, "example.com");
         assert_eq!(traces[2].kind, "scope_out");
         assert!(traces[0].quote.contains("example.com"));
+    }
+
+    #[test]
+    fn scope_matches_host_of_path_bearing_pattern() {
+        // Wildcard host pattern with a path matches the bare host and subdomains.
+        assert!(ScopeConfig::matches(
+            "*.api.clockify.me/api/",
+            "api.clockify.me"
+        ));
+        assert!(ScopeConfig::matches(
+            "*.api.clockify.me/api/",
+            "sub.api.clockify.me"
+        ));
+        // Exact host pattern with a path matches the bare host.
+        assert!(ScopeConfig::matches(
+            "account.cake.com/api/",
+            "account.cake.com"
+        ));
+        // A real CIDR still behaves as a CIDR.
+        assert!(ScopeConfig::matches("10.1.2.0/24", "10.1.2.3"));
+        assert!(!ScopeConfig::matches("10.1.2.0/24", "11.0.0.1"));
     }
 }

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -505,14 +505,29 @@ fn scope_entry_matches(entry: &str, target: &str) -> bool {
     if entry.is_empty() {
         return false;
     }
+    if entry.contains('/') {
+        let network = entry.split('/').next().unwrap_or_default();
+        if network.parse::<Ipv4Addr>().is_ok() || network.parse::<Ipv6Addr>().is_ok() {
+            return target
+                .parse::<Ipv4Addr>()
+                .map(|ip| ipv4_in_cidr(ip, entry))
+                .unwrap_or(false);
+        }
+        // Host-oriented pattern with a path (e.g. "*.api.clockify.me/api/"):
+        // match on the host component only; the full pattern stays in reports.
+        let host = entry
+            .split('/')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('.');
+        if let Some(suffix) = host.strip_prefix("*.") {
+            return !suffix.is_empty()
+                && (target == suffix || target.ends_with(&format!(".{suffix}")));
+        }
+        return target == host || target.ends_with(&format!(".{host}"));
+    }
     if let Some(suffix) = entry.strip_prefix("*.") {
         return !suffix.is_empty() && target != suffix && target.ends_with(&format!(".{suffix}"));
-    }
-    if entry.contains('/') {
-        return target
-            .parse::<Ipv4Addr>()
-            .map(|ip| ipv4_in_cidr(ip, entry))
-            .unwrap_or(false);
     }
     if let Some(suffix) = entry.strip_prefix('.') {
         return !suffix.is_empty() && (target == suffix || target.ends_with(&format!(".{suffix}")));
@@ -4589,6 +4604,26 @@ mod tests {
             &empty,
             &all_subdomains
         ));
+    }
+
+    #[test]
+    fn scope_target_matches_host_of_path_bearing_pattern() {
+        let empty: Vec<String> = vec![];
+        // Wildcard host pattern carrying a path must match the bare host.
+        let wildcard = vec!["*.api.clockify.me/api/".to_string()];
+        assert!(scope_target_allowed("api.clockify.me", &wildcard, &empty));
+        assert!(scope_target_allowed(
+            "sub.api.clockify.me",
+            &wildcard,
+            &empty
+        ));
+        // Exact host pattern carrying a path must match the bare host.
+        let exact = vec!["account.cake.com/api/".to_string()];
+        assert!(scope_target_allowed("account.cake.com", &exact, &empty));
+        // Real CIDRs still work.
+        let cidr = vec!["10.1.2.0/24".to_string()];
+        assert!(scope_target_allowed("10.1.2.3", &cidr, &empty));
+        assert!(!scope_target_allowed("11.0.0.1", &cidr, &empty));
     }
 
     #[test]

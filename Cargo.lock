@@ -244,6 +244,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentbug-proxy"
+version = "0.1.0"
+dependencies = [
+ "agentbug-tools",
+ "anyhow",
+ "clap",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "agentbug-store"
 version = "0.1.0"
 dependencies = [

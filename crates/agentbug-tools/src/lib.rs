@@ -6,10 +6,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
@@ -26,6 +27,14 @@ const MAX_READ_BYTES: u64 = 512 * 1024;
 const MAX_FUZZ_WORDLIST: usize = 200;
 const MAX_FUZZ_REQUESTS: usize = 200;
 const FUZZ_METHODS: &[&str] = &["GET", "HEAD", "POST"];
+/// Hard caps for the active-scan wrapper. Defaults stay conservative.
+const MAX_SCAN_PAYLOADS: usize = 200;
+const MAX_SCAN_REQUESTS: usize = 200;
+/// Local Collaborator simulation never records more than this many hits.
+const MAX_OOB_INTERACTIONS: usize = 32;
+/// Unit separator used to combine `(domain, name)` into one jar key. Neither
+/// component may legally contain this character.
+const COOKIE_JAR_KEY_SEP: char = '\u{1f}';
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -97,6 +106,9 @@ pub fn capture_from_structured(v: &Value) -> Option<(String, String, String)> {
     Some((request, response, canary))
 }
 
+/// Shared cookie jar: `(domain, name)` -> `(value, path, expires)`.
+pub type CookieJar = Arc<Mutex<BTreeMap<String, (String, String, String)>>>;
+
 /// Operator-supplied policy for tool construction. Defaults keep the runner
 /// locked down (no proxy, no trusted local targets, no external tools).
 #[derive(Clone, Default)]
@@ -127,6 +139,13 @@ pub struct ToolOptions {
     /// Require falsification fields when saving a finding. Enabled by the
     /// engagement layer; off in generic kernel/tool tests.
     pub require_falsification: bool,
+    /// Shared cookie jar keyed by `(domain, name)` encoded as
+    /// `"domain<US>name"`, value `(cookie_value, path, expires)`. `Arc` keeps
+    /// the jar identical across every `HttpRequestTool` clone in a registry.
+    pub cookie_jar: CookieJar,
+    /// Local-only Collaborator simulation store: token -> recorded interactions.
+    /// Server metadata is stored under a reserved `__server__` prefixed key.
+    pub oob_interactions: Arc<Mutex<HashMap<String, Vec<Value>>>>,
 }
 
 #[async_trait]
@@ -1075,6 +1094,143 @@ fn build_capture(request: String, response: String, canary: String) -> HttpCaptu
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cookie jar. Keys are `(domain, name)` joined with a unit separator; values
+// are `(value, path, expires)`. Everything here is local and deterministic.
+// ---------------------------------------------------------------------------
+
+fn cookie_jar_key(domain: &str, name: &str) -> String {
+    format!("{domain}{COOKIE_JAR_KEY_SEP}{name}")
+}
+
+/// Parse `Cookie` input supplied either as a JSON object or a raw
+/// `a=1; b=2` header string.
+fn parse_cookie_pairs(value: Option<&Value>) -> Vec<(String, String)> {
+    match value {
+        Some(Value::Object(map)) => map
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .as_str()
+                    .map(|value| (name.clone(), value.to_string()))
+            })
+            .collect(),
+        Some(Value::String(raw)) => raw
+            .split(';')
+            .filter_map(|pair| {
+                let (name, value) = pair.trim().split_once('=')?;
+                Some((name.trim().to_string(), value.trim().to_string()))
+            })
+            .filter(|(name, _)| !name.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedSetCookie {
+    name: String,
+    value: String,
+    domain: Option<String>,
+    path: Option<String>,
+    expires: String,
+}
+
+fn parse_set_cookie_line(line: &str) -> Option<ParsedSetCookie> {
+    let (pair, attrs) = line.split_once(';').unwrap_or((line, ""));
+    let (name, value) = pair.trim().split_once('=')?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let value = value.trim().to_string();
+    let mut domain = None;
+    let mut path = None;
+    let mut expires = String::new();
+    for attr in attrs.split(';') {
+        let (key, val) = attr.trim().split_once('=').unwrap_or((attr.trim(), ""));
+        if key.eq_ignore_ascii_case("domain") {
+            domain = Some(val.trim().trim_start_matches('.').to_ascii_lowercase());
+        } else if key.eq_ignore_ascii_case("path") {
+            path = Some(val.trim().to_string());
+        } else if key.eq_ignore_ascii_case("expires") {
+            expires = val.trim().to_string();
+        }
+    }
+    Some(ParsedSetCookie {
+        name,
+        value,
+        domain,
+        path,
+        expires,
+    })
+}
+
+/// Read `Set-Cookie:` lines out of a synthesized HTTP response representation.
+fn set_cookies_from_repr(repr: &str) -> Vec<ParsedSetCookie> {
+    repr.lines()
+        .filter_map(|line| {
+            let value = line
+                .trim()
+                .strip_prefix("set-cookie:")
+                .or_else(|| line.trim().strip_prefix("Set-Cookie:"))?;
+            parse_set_cookie_line(value.trim())
+        })
+        .collect()
+}
+
+/// Only numeric epoch-seconds expiry is enforced. HTTP-date strings are kept
+/// verbatim in the jar (they cannot be parsed without a date dependency).
+fn cookie_expired(expires: &str) -> bool {
+    let Ok(secs) = expires.parse::<i64>() else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    secs <= now
+}
+
+fn cookie_jar_store(jar: &CookieJar, cookies: &[ParsedSetCookie], default_domain: &str) {
+    let mut guard = jar.lock().unwrap();
+    for cookie in cookies {
+        let domain = cookie
+            .domain
+            .clone()
+            .unwrap_or_else(|| normalize_host(default_domain));
+        if domain.is_empty() {
+            continue;
+        }
+        let path = cookie.path.clone().unwrap_or_else(|| "/".to_string());
+        guard.insert(
+            cookie_jar_key(&domain, &cookie.name),
+            (cookie.value.clone(), path, cookie.expires.clone()),
+        );
+    }
+}
+
+/// Jar cookies whose domain is a host suffix and whose path covers `path`.
+fn cookies_for_url(jar: &CookieJar, host: &str, path: &str) -> Vec<(String, String)> {
+    let host = normalize_host(host);
+    let guard = jar.lock().unwrap();
+    let mut out: Vec<(String, String)> = guard
+        .iter()
+        .filter_map(|(key, (value, cookie_path, expires))| {
+            let (domain, name) = key.split_once(COOKIE_JAR_KEY_SEP)?;
+            let domain_match = host == domain || host.ends_with(&format!(".{domain}"));
+            let path_match =
+                cookie_path.is_empty() || cookie_path == "/" || path.starts_with(cookie_path);
+            if !domain_match || !path_match || cookie_expired(expires) {
+                return None;
+            }
+            Some((name.to_string(), value.clone()))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 impl HttpRequestTool {
     pub fn new() -> Self {
         Self::with_options(ToolOptions::default())
@@ -1084,13 +1240,62 @@ impl HttpRequestTool {
         let client = build_http_client(&options);
         Self { client, options }
     }
+
+    /// Render the final hop's outcome. The canary is scrubbed from the
+    /// LLM-visible view while the authoritative bytes stay in `capture`.
+    #[allow(clippy::too_many_arguments)]
+    fn finalize(
+        ok: bool,
+        current: &url::Url,
+        status: u16,
+        headers: &serde_json::Map<String, Value>,
+        body_text: &str,
+        truncated: bool,
+        body_len: usize,
+        canary: &str,
+        request_repr: String,
+        redirect_chain: Vec<Value>,
+    ) -> ToolResult {
+        let scrub = |value: &str| value.replace(canary, "<redacted-canary>");
+        let out_headers: serde_json::Map<String, Value> = headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    Value::String(scrub(value.as_str().unwrap_or(""))),
+                )
+            })
+            .collect();
+        let out = json!({
+            "ok": ok,
+            "url": current.to_string(),
+            "status": status,
+            "headers": out_headers,
+            "body": scrub(body_text),
+            "body_truncated": truncated,
+            "body_bytes": body_len,
+            "redirect_chain": redirect_chain
+        });
+        let capture = build_capture(
+            request_repr,
+            build_response_repr(status, headers, body_text),
+            canary.to_string(),
+        );
+        let mut structured = out.clone();
+        structured["capture"] = capture.as_value();
+        ToolResult {
+            ok,
+            output: truncate(&out.to_string()),
+            structured: Some(structured),
+        }
+    }
 }
 #[async_trait]
 impl Tool for HttpRequestTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "http_request".into(),
-            description: "Perform an HTTP request to an in-scope target for reconnaissance/validation. Returns status, selected headers, a truncated body, and a byte-authoritative capture (request/response/canary). An unguessable X-AgentBug-Canary header is injected into the real request and scrubbed from the model-visible output; the verifier requires the target to reflect it. Localhost/.local/metadata targets are blocked; engagement scope and allowed_methods are enforced in code. A configured proxy is a trusted egress boundary where DNS pinning does not apply, so scope and host validation still run before any request.".into(),
+            description: "Perform an HTTP request to an in-scope target for reconnaissance/validation. Returns status, selected headers, a truncated body, and a byte-authoritative capture (request/response/canary). An unguessable X-AgentBug-Canary header is injected into the real request and scrubbed from the model-visible output; the verifier requires the target to reflect it. Localhost/.local/metadata targets are blocked; engagement scope and allowed_methods are enforced in code. A configured proxy is a trusted egress boundary where DNS pinning does not apply, so scope and host validation still run before any request. Optional cookie jar (Set-Cookie upserts, host/path matching) and manual redirects: every hop is revalidated against scope, host policy and DNS pin, POST is rewritten to GET for 301/302/303, and the full scope decision is recorded in `redirect_chain`; redirects are off by default.".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -1098,7 +1303,11 @@ impl Tool for HttpRequestTool {
                     "method":{"type":"string","enum":["GET","HEAD","POST","PUT","DELETE","OPTIONS"],"default":"GET"},
                     "headers":{"type":"object","additionalProperties":{"type":"string"}},
                     "body":{"type":"string"},
-                    "timeout_ms":{"type":"integer","default":15000}
+                    "timeout_ms":{"type":"integer","default":15000},
+                    "cookies":{"description":"Cookie pairs as an object or a raw `a=1; b=2` string", "oneOf":[{"type":"object","additionalProperties":{"type":"string"}},{"type":"string"}]},
+                    "use_cookie_jar":{"type":"boolean","default":false,"description":"Attach matching cookies from the shared jar and store Set-Cookie responses"},
+                    "follow_redirects":{"type":"boolean","default":false,"description":"Manually follow 301/302/303/307/308 after revalidating every hop"},
+                    "max_redirects":{"type":"integer","minimum":0,"maximum":100,"default":0}
                 },
                 "required":["url"]
             }),
@@ -1134,179 +1343,381 @@ impl Tool for HttpRequestTool {
         // network work. Scope is enforced in code even when a proxy is in use,
         // because the DNS pin below does not apply to proxied requests.
         validate_proxy_url(&self.options)?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow!("url has no host"))?;
-        if !scope_target_allowed(host, &self.options.scope_in, &self.options.scope_out) {
-            anyhow::bail!("target '{host}' is not permitted by scope policy");
-        }
-        validate_host_with_options(host, &self.options)?;
-        let pinned_ip = if host.parse::<IpAddr>().is_ok() {
-            None
-        } else if host_is_trusted(host, &self.options.trusted_local_targets) {
-            Some(resolve_trusted_host(host, &self.options).await?)
-        } else {
-            Some(resolve_public_ip(host).await?)
-        };
-        // Pin the connection to the IP we validated; the TLS SNI and Host header
-        // still use the original hostname.
-        let client = if let Some(ip) = pinned_ip {
-            apply_proxy(
-                reqwest::Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .redirect(reqwest::redirect::Policy::none())
-                    .user_agent(self.options.user_agent.as_deref().unwrap_or("agentbug/0.1"))
-                    .resolve(host, ip),
-                &self.options,
-            )
-            .build()
-            .context("build pinned http client")?
-        } else {
-            self.client.clone()
-        };
         let timeout_ms = input
             .get("timeout_ms")
             .and_then(|v| v.as_u64())
             .unwrap_or(15_000)
             .min(30_000);
-        let mut req = match method.as_str() {
-            "GET" => client.get(parsed.clone()),
-            "HEAD" => client.head(parsed.clone()),
-            "POST" => client.post(parsed.clone()),
-            "PUT" => client.put(parsed.clone()),
-            "DELETE" => client.delete(parsed.clone()),
-            "OPTIONS" => client.request(reqwest::Method::OPTIONS, parsed.clone()),
-            _ => {
+        let explicit_cookies = parse_cookie_pairs(input.get("cookies"));
+        let use_cookie_jar = input
+            .get("use_cookie_jar")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let follow_redirects = input
+            .get("follow_redirects")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let max_redirects = input
+            .get("max_redirects")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(100) as usize;
+
+        let mut current = parsed.clone();
+        let mut current_method = method.clone();
+        let mut current_body = input
+            .get("body")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let mut redirect_chain: Vec<Value> = Vec::new();
+        let mut redirects_followed = 0usize;
+
+        // The reqwest client keeps `Policy::none()`: redirects are performed
+        // here so every hop is revalidated against scope, host policy and DNS
+        // before a single byte leaves the runner.
+        loop {
+            let is_first = redirects_followed == 0 && redirect_chain.is_empty();
+            let host = current
+                .host_str()
+                .ok_or_else(|| anyhow!("url has no host"))?
+                .to_string();
+            if !scope_target_allowed(&host, &self.options.scope_in, &self.options.scope_out) {
+                if is_first {
+                    anyhow::bail!("target '{host}' is not permitted by scope policy");
+                }
                 return Ok(denial_result(
-                    "unsupported_method",
-                    json!({"method": method}),
-                ))
+                    "redirect_out_of_scope",
+                    json!({"url": current.as_str(), "redirect_chain": redirect_chain}),
+                ));
             }
-        };
-        if let Some(hs) = input.get("headers").and_then(|v| v.as_object()) {
-            for (k, v) in hs {
-                if let Some(vs) = v.as_str() {
-                    req = req.header(k, vs);
+            if let Err(err) = validate_host_with_options(&host, &self.options) {
+                if is_first {
+                    return Err(err);
+                }
+                return Ok(denial_result(
+                    "redirect_host_not_allowed",
+                    json!({
+                        "url": current.as_str(),
+                        "reason": redact(&err.to_string()),
+                        "redirect_chain": redirect_chain
+                    }),
+                ));
+            }
+            let pinned_ip = if host.parse::<IpAddr>().is_ok() {
+                None
+            } else if host_is_trusted(&host, &self.options.trusted_local_targets) {
+                match resolve_trusted_host(&host, &self.options).await {
+                    Ok(ip) => Some(ip),
+                    Err(err) => {
+                        if is_first {
+                            return Err(err);
+                        }
+                        return Ok(denial_result(
+                            "redirect_resolution_failed",
+                            json!({"url": current.as_str(), "reason": redact(&err.to_string())}),
+                        ));
+                    }
+                }
+            } else {
+                match resolve_public_ip(&host).await {
+                    Ok(ip) => Some(ip),
+                    Err(err) => {
+                        if is_first {
+                            return Err(err);
+                        }
+                        return Ok(denial_result(
+                            "redirect_resolution_failed",
+                            json!({"url": current.as_str(), "reason": redact(&err.to_string())}),
+                        ));
+                    }
+                }
+            };
+            // Pin the connection to the IP we validated; TLS SNI and Host still
+            // use the original hostname.
+            let client = if let Some(ip) = pinned_ip {
+                match apply_proxy(
+                    reqwest::Client::builder()
+                        .timeout(Duration::from_secs(30))
+                        .redirect(reqwest::redirect::Policy::none())
+                        .user_agent(self.options.user_agent.as_deref().unwrap_or("agentbug/0.1"))
+                        .resolve(&host, ip),
+                    &self.options,
+                )
+                .build()
+                {
+                    Ok(client) => client,
+                    Err(err) => {
+                        if is_first {
+                            return Err(err).context("build pinned http client");
+                        }
+                        return Ok(denial_result(
+                            "redirect_client_error",
+                            json!({"url": current.as_str(), "reason": redact(&err.to_string())}),
+                        ));
+                    }
+                }
+            } else {
+                self.client.clone()
+            };
+
+            // Jar cookies attach first; explicit cookies override by name. Both
+            // are rendered into the authoritative bytes so the canary covers
+            // them.
+            let mut effective_headers = input
+                .get("headers")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let mut cookie_pairs: Vec<(String, String)> = Vec::new();
+            if use_cookie_jar {
+                cookie_pairs.extend(cookies_for_url(
+                    &self.options.cookie_jar,
+                    &host,
+                    current.path(),
+                ));
+            }
+            for (name, value) in &explicit_cookies {
+                cookie_pairs.retain(|(existing, _)| existing != name);
+                cookie_pairs.push((name.clone(), value.clone()));
+            }
+            if !cookie_pairs.is_empty() {
+                let header = cookie_pairs
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                effective_headers.insert("Cookie".to_string(), Value::String(header));
+            }
+
+            let mut req = match current_method.as_str() {
+                "GET" => client.get(current.clone()),
+                "HEAD" => client.head(current.clone()),
+                "POST" => client.post(current.clone()),
+                "PUT" => client.put(current.clone()),
+                "DELETE" => client.delete(current.clone()),
+                "OPTIONS" => client.request(reqwest::Method::OPTIONS, current.clone()),
+                _ => {
+                    return Ok(denial_result(
+                        "unsupported_method",
+                        json!({"method": current_method}),
+                    ))
+                }
+            };
+            for (name, value) in &effective_headers {
+                if let Some(value) = value.as_str() {
+                    req = req.header(name, value);
                 }
             }
-        }
-        if let Some(body) = input.get("body").and_then(|v| v.as_str()) {
-            req = req.body(body.to_string());
-        }
-        // Build the authoritative request bytes before the send so both the
-        // success and error paths can pin the same evidence.
-        let mut request_repr = build_request_repr(
-            &method,
-            &parsed,
-            &self.options,
-            input.get("headers").and_then(|v| v.as_object()),
-            input.get("body").and_then(|v| v.as_str()),
-        );
-        // Mint once and actually transmit the canary. The verifier requires the
-        // target to reflect it, so a token that is only stored as evidence can
-        // never be satisfied by a real response. Keep it out of the LLM-visible
-        // output; it lives only in the outbound request and the capture.
-        let canary = canary_for(&request_repr);
-        request_repr = request_repr.replacen(
-            "\r\n\r\n",
-            &format!("\r\nX-AgentBug-Canary: {canary}\r\n\r\n"),
-            1,
-        );
-        req = req.header("X-AgentBug-Canary", &canary);
-        obey_rate_limit(&self.options).await;
-        let mut resp = match timeout(Duration::from_millis(timeout_ms), req.send()).await {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(err)) => {
-                let message = redact(&err.to_string());
-                let capture =
-                    build_capture(request_repr, format!("(no response) {message}"), canary);
-                let mut structured = json!({"ok": false, "error": message});
-                structured["capture"] = capture.as_value();
-                return Ok(ToolResult {
-                    ok: false,
-                    output: truncate(&format!("http request failed: {message}")),
-                    structured: Some(structured),
-                });
+            if let Some(body) = &current_body {
+                req = req.body(body.clone());
             }
-            Err(_) => {
-                let capture =
-                    build_capture(request_repr, "(no response) http timeout".into(), canary);
-                let mut structured = json!({"ok": false, "error": "http timeout"});
-                structured["capture"] = capture.as_value();
-                return Ok(ToolResult {
-                    ok: false,
-                    output: "http timeout".into(),
-                    structured: Some(structured),
-                });
-            }
-        };
-        let status = resp.status().as_u16();
-        let mut headers = serde_json::Map::new();
-        for (k, v) in resp.headers().iter().take(40) {
-            let value = v
-                .to_str()
-                .unwrap_or("<binary>")
-                .chars()
-                .take(200)
-                .collect::<String>();
-            headers.insert(k.to_string(), Value::String(redact(&value)));
-        }
-        let (bytes, truncated) =
-            match read_body_capped(&mut resp, Duration::from_millis(timeout_ms)).await {
-                Ok(value) => value,
-                Err(err) => {
+            // Build the authoritative request bytes before the send so both the
+            // success and error paths can pin the same evidence.
+            let mut request_repr = build_request_repr(
+                &current_method,
+                &current,
+                &self.options,
+                Some(&effective_headers),
+                current_body.as_deref(),
+            );
+            // Mint once and actually transmit the canary. The verifier requires
+            // the target to reflect it, so a token that is only stored as
+            // evidence can never be satisfied by a real response. Keep it out
+            // of the LLM-visible output; it lives only in the outbound request
+            // and the capture.
+            let canary = canary_for(&request_repr);
+            request_repr = request_repr.replacen(
+                "\r\n\r\n",
+                &format!("\r\nX-AgentBug-Canary: {canary}\r\n\r\n"),
+                1,
+            );
+            req = req.header("X-AgentBug-Canary", &canary);
+            obey_rate_limit(&self.options).await;
+            let mut resp = match timeout(Duration::from_millis(timeout_ms), req.send()).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(err)) => {
                     let message = redact(&err.to_string());
-                    let capture = build_capture(
-                        request_repr,
-                        build_response_repr(status, &headers, &format!("(read error) {message}")),
-                        canary,
-                    );
-                    let mut structured = json!({"ok": false, "status": status, "error": message});
+                    let capture =
+                        build_capture(request_repr, format!("(no response) {message}"), canary);
+                    let mut structured = json!({"ok": false, "error": message});
                     structured["capture"] = capture.as_value();
+                    structured["redirect_chain"] = json!(redirect_chain);
                     return Ok(ToolResult {
                         ok: false,
-                        output: truncate(&format!("http read failed: {message}")),
+                        output: truncate(&format!("http request failed: {message}")),
+                        structured: Some(structured),
+                    });
+                }
+                Err(_) => {
+                    let capture =
+                        build_capture(request_repr, "(no response) http timeout".into(), canary);
+                    let mut structured = json!({"ok": false, "error": "http timeout"});
+                    structured["capture"] = capture.as_value();
+                    structured["redirect_chain"] = json!(redirect_chain);
+                    return Ok(ToolResult {
+                        ok: false,
+                        output: "http timeout".into(),
                         structured: Some(structured),
                     });
                 }
             };
-        let slice = &bytes[..bytes.len().min(MAX_HTTP_BODY_BYTES)];
-        let body_text = redact(&String::from_utf8_lossy(slice));
-        let ok = (200..400).contains(&status);
-        // A reflecting target echoes the injected canary into headers/body.
-        // Keep the real bytes in `capture` for the verifier, but scrub the
-        // token from the LLM-visible output so the model never learns it.
-        let scrub = |value: &str| value.replace(&canary, "<redacted-canary>");
-        let out_headers: serde_json::Map<String, Value> = headers
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.clone(),
-                    Value::String(scrub(value.as_str().unwrap_or(""))),
-                )
-            })
-            .collect();
-        let out = json!({
-            "ok": ok,
-            "url": parsed.to_string(),
-            "status": status,
-            "headers": out_headers,
-            "body": scrub(&body_text),
-            "body_truncated": truncated,
-            "body_bytes": bytes.len()
-        });
-        let capture = build_capture(
-            request_repr,
-            build_response_repr(status, &headers, &body_text),
-            canary,
-        );
-        let mut structured = out.clone();
-        structured["capture"] = capture.as_value();
-        Ok(ToolResult {
-            ok,
-            output: truncate(&out.to_string()),
-            structured: Some(structured),
-        })
+            let status = resp.status().as_u16();
+            let mut headers = serde_json::Map::new();
+            for (k, v) in resp.headers().iter().take(40) {
+                let value = v
+                    .to_str()
+                    .unwrap_or("<binary>")
+                    .chars()
+                    .take(200)
+                    .collect::<String>();
+                headers.insert(k.to_string(), Value::String(redact(&value)));
+            }
+            let (bytes, truncated) =
+                match read_body_capped(&mut resp, Duration::from_millis(timeout_ms)).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        let message = redact(&err.to_string());
+                        let capture = build_capture(
+                            request_repr,
+                            build_response_repr(
+                                status,
+                                &headers,
+                                &format!("(read error) {message}"),
+                            ),
+                            canary,
+                        );
+                        let mut structured =
+                            json!({"ok": false, "status": status, "error": message});
+                        structured["capture"] = capture.as_value();
+                        structured["redirect_chain"] = json!(redirect_chain);
+                        return Ok(ToolResult {
+                            ok: false,
+                            output: truncate(&format!("http read failed: {message}")),
+                            structured: Some(structured),
+                        });
+                    }
+                };
+            let slice = &bytes[..bytes.len().min(MAX_HTTP_BODY_BYTES)];
+            let body_text = redact(&String::from_utf8_lossy(slice));
+            let ok = (200..400).contains(&status);
+
+            // Parse Set-Cookie from a synthesized, unredacted response repr
+            // before credential redaction can mask cookie values. Keeping the
+            // raw header lines (rather than a name-keyed map) preserves every
+            // Set-Cookie in a multi-cookie response.
+            if use_cookie_jar {
+                let mut repr = format!("HTTP/1.1 {status}\r\n");
+                for (name, value) in resp.headers().iter().take(40) {
+                    if let Ok(value) = value.to_str() {
+                        repr.push_str(&format!("{name}: {value}\r\n"));
+                    }
+                }
+                repr.push_str("\r\n");
+                repr.push_str(&body_text);
+                let set_cookies = set_cookies_from_repr(&repr);
+                cookie_jar_store(&self.options.cookie_jar, &set_cookies, &host);
+            }
+
+            // Manual redirect handling. Every Location is resolved against the
+            // current URL and scope/host validated before it is requested.
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let is_redirect = matches!(status, 301 | 302 | 303 | 307 | 308) && location.is_some();
+            if is_redirect && follow_redirects && redirects_followed < max_redirects {
+                let location = location.unwrap_or_default();
+                let next = match current.join(&location) {
+                    Ok(next) => next,
+                    Err(_) => {
+                        // A malformed Location is not an out-of-scope target;
+                        // report the redirect response itself instead.
+                        return Ok(Self::finalize(
+                            ok,
+                            &current,
+                            status,
+                            &headers,
+                            &body_text,
+                            truncated,
+                            bytes.len(),
+                            &canary,
+                            request_repr,
+                            redirect_chain,
+                        ));
+                    }
+                };
+                // 301/302/303 from POST become GET, matching ZAP and browsers.
+                let next_method = if (301..=303).contains(&status) && current_method == "POST" {
+                    "GET".to_string()
+                } else {
+                    current_method.clone()
+                };
+                let next_body = if next_method == "GET" {
+                    None
+                } else {
+                    current_body.clone()
+                };
+                if !matches!(next.scheme(), "http" | "https") {
+                    redirect_chain.push(json!({
+                        "from": current.as_str(),
+                        "to": next.as_str(),
+                        "status": status,
+                        "in_scope": false,
+                        "host_allowed": false
+                    }));
+                    return Ok(denial_result(
+                        "redirect_scheme_not_allowed",
+                        json!({"url": next.as_str(), "redirect_chain": redirect_chain}),
+                    ));
+                }
+                let next_host = next.host_str().unwrap_or("").to_string();
+                let in_scope = scope_target_allowed(
+                    &next_host,
+                    &self.options.scope_in,
+                    &self.options.scope_out,
+                );
+                let host_allowed = validate_host_with_options(&next_host, &self.options).is_ok();
+                redirect_chain.push(json!({
+                    "from": current.as_str(),
+                    "to": next.as_str(),
+                    "status": status,
+                    "method": next_method,
+                    "in_scope": in_scope,
+                    "host_allowed": host_allowed
+                }));
+                if !in_scope {
+                    return Ok(denial_result(
+                        "redirect_out_of_scope",
+                        json!({"url": next.as_str(), "redirect_chain": redirect_chain}),
+                    ));
+                }
+                if !host_allowed {
+                    return Ok(denial_result(
+                        "redirect_host_not_allowed",
+                        json!({"url": next.as_str(), "redirect_chain": redirect_chain}),
+                    ));
+                }
+                redirects_followed += 1;
+                current = next;
+                current_method = next_method;
+                current_body = next_body;
+                continue;
+            }
+
+            return Ok(Self::finalize(
+                ok,
+                &current,
+                status,
+                &headers,
+                &body_text,
+                truncated,
+                bytes.len(),
+                &canary,
+                request_repr,
+                redirect_chain,
+            ));
+        }
     }
 }
 
@@ -2251,6 +2662,545 @@ impl Tool for ExternalCommandTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Burp Sequencer equivalent. Pure computation: no network, no gate.
+// ---------------------------------------------------------------------------
+
+/// Longest common byte prefix of every sample, in bytes.
+fn longest_common_prefix(samples: &[&str]) -> usize {
+    let Some(first) = samples.first() else {
+        return 0;
+    };
+    samples.iter().skip(1).fold(first.len(), |common, sample| {
+        let bytes = first.as_bytes();
+        let other = sample.as_bytes();
+        let mut shared = 0;
+        while shared < common && shared < other.len() && bytes[shared] == other[shared] {
+            shared += 1;
+        }
+        shared
+    })
+}
+
+/// Analyze the randomness quality of a token sample (Burp Sequencer analogue).
+#[derive(Default)]
+pub struct SequencerTool;
+
+#[async_trait]
+impl Tool for SequencerTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "sequencer".into(),
+            description: "Analyze a sample of tokens for randomness quality (Burp Sequencer equivalent). Reports sample/distinct counts, per-position byte entropy, 0/1 bit balance, longest common prefix and an approximate chi-square statistic against a uniform byte distribution, plus a verdict. Pure local computation: no network and no gate.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "tokens":{"type":"array","items":{"type":"string"},"description":"Sampled token strings"},
+                    "min_samples":{"type":"integer","default":8}
+                },
+                "required":["tokens"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let tokens = input
+            .get("tokens")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("tokens required"))?;
+        let samples: Vec<&str> = tokens.iter().filter_map(Value::as_str).collect();
+        let min_samples = input
+            .get("min_samples")
+            .and_then(Value::as_u64)
+            .unwrap_or(8) as usize;
+        let sample_count = samples.len();
+        let distinct_count: usize = samples.iter().copied().collect::<BTreeSet<_>>().len();
+        let longest_common_prefix = longest_common_prefix(&samples);
+
+        // Shannon entropy (bits) at each byte position across the samples.
+        let max_len = samples.iter().map(|sample| sample.len()).max().unwrap_or(0);
+        let mut position_entropy: Vec<f64> = Vec::with_capacity(max_len);
+        for position in 0..max_len {
+            let mut counts: BTreeMap<u8, usize> = BTreeMap::new();
+            for sample in &samples {
+                if let Some(&byte) = sample.as_bytes().get(position) {
+                    *counts.entry(byte).or_default() += 1;
+                }
+            }
+            let total: usize = counts.values().sum();
+            let entropy = if total == 0 {
+                0.0
+            } else {
+                counts
+                    .values()
+                    .map(|&count| {
+                        let p = count as f64 / total as f64;
+                        -p * p.log2()
+                    })
+                    .sum::<f64>()
+            };
+            position_entropy.push((entropy * 1000.0).round() / 1000.0);
+        }
+
+        // 0/1 bit balance across every byte of every sample, in [-1.0, 1.0].
+        let (mut ones, mut zeros) = (0usize, 0usize);
+        for sample in &samples {
+            for byte in sample.bytes() {
+                for bit in 0..8 {
+                    if (byte >> bit) & 1 == 1 {
+                        ones += 1;
+                    } else {
+                        zeros += 1;
+                    }
+                }
+            }
+        }
+        let total_bits = ones + zeros;
+        let bit_balance = if total_bits == 0 {
+            0.0
+        } else {
+            ((ones as f64 - zeros as f64) / total_bits as f64 * 1000.0).round() / 1000.0
+        };
+
+        // Approximate chi-square against a uniform byte distribution.
+        let mut char_counts: BTreeMap<u8, usize> = BTreeMap::new();
+        for sample in &samples {
+            for byte in sample.bytes() {
+                *char_counts.entry(byte).or_default() += 1;
+            }
+        }
+        let char_total: usize = char_counts.values().sum();
+        let bins = char_counts.len();
+        let chi_square = if bins == 0 {
+            0.0
+        } else {
+            let expected = char_total as f64 / bins as f64;
+            char_counts
+                .values()
+                .map(|&count| {
+                    let delta = count as f64 - expected;
+                    delta * delta / expected
+                })
+                .sum::<f64>()
+        };
+
+        let average_entropy = if position_entropy.is_empty() {
+            0.0
+        } else {
+            position_entropy.iter().sum::<f64>() / position_entropy.len() as f64
+        };
+        let verdict = if sample_count < min_samples {
+            "insufficient_samples"
+        } else if distinct_count < 2
+            || longest_common_prefix >= 4
+            || bit_balance.abs() > 0.25
+            || (!position_entropy.is_empty() && average_entropy < 1.0)
+        {
+            "suspicious"
+        } else {
+            "plausible"
+        };
+
+        let out = json!({
+            "verdict": verdict,
+            "sample_count": sample_count,
+            "distinct_count": distinct_count,
+            "position_entropy": position_entropy,
+            "average_position_entropy": (average_entropy * 1000.0).round() / 1000.0,
+            "bit_balance": bit_balance,
+            "ones": ones,
+            "zeros": zeros,
+            "longest_common_prefix": longest_common_prefix,
+            "chi_square": (chi_square * 1000.0).round() / 1000.0
+        });
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&out.to_string()),
+            structured: Some(out),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Local Collaborator simulation. This is deliberately loopback-only: there is
+// no external DNS, no public listener and no egress, so a real external target
+// cannot reach it.
+// ---------------------------------------------------------------------------
+
+static OOB_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub struct CollaboratorTool {
+    options: ToolOptions,
+}
+
+impl CollaboratorTool {
+    pub fn new() -> Self {
+        Self::with_options(ToolOptions::default())
+    }
+
+    pub fn with_options(options: ToolOptions) -> Self {
+        Self { options }
+    }
+}
+
+impl Default for CollaboratorTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for CollaboratorTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "collaborator".into(),
+            description: "LOCAL-ONLY out-of-band (OOB) interaction simulation (Burp Collaborator equivalent). `start` binds a loopback TCP listener on 127.0.0.1:0 and returns an http://<token>.localhost:<port>/ payload; `fetch` polls interactions recorded by that listener (interactions are KEPT, so polling is non-destructive) and caps at 32 hits per context. This is a simulation only: an external target cannot reach a loopback listener, so no external DNS, public listener or network egress is used and it is not registered as a production default OOB oracle.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "operation":{"type":"string","enum":["start","fetch"]},
+                    "token":{"type":"string","description":"Token returned by a previous start call"}
+                },
+                "required":["operation"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let operation = input.get("operation").and_then(Value::as_str).unwrap_or("");
+        match operation {
+            "start" => {
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let counter = OOB_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let mut seed = nanos.to_be_bytes().to_vec();
+                seed.extend_from_slice(&counter.to_be_bytes());
+                let token = hex_encode(&Sha256::digest(&seed)[..16]);
+
+                let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        let reason = redact(&err.to_string());
+                        return Ok(ToolResult {
+                            ok: false,
+                            output: truncate(&format!("collaborator bind failed: {reason}")),
+                            structured: Some(json!({
+                                "ok": false,
+                                "error": "bind_failed",
+                                "reason": reason
+                            })),
+                        });
+                    }
+                };
+                let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
+                let server_location = format!("127.0.0.1:{port}");
+                let payload = format!("http://{token}.localhost:{port}/");
+                {
+                    let mut map = self.options.oob_interactions.lock().unwrap();
+                    map.insert(token.clone(), Vec::new());
+                    map.insert(
+                        format!("__server__{token}"),
+                        vec![json!({
+                            "server_location": server_location,
+                            "payload": payload
+                        })],
+                    );
+                }
+                let interactions = self.options.oob_interactions.clone();
+                let recorded_token = token.clone();
+                tokio::spawn(async move {
+                    use base64::Engine;
+                    use tokio::io::AsyncReadExt;
+                    let engine = base64::engine::general_purpose::STANDARD;
+                    let mut count = 0usize;
+                    while count < MAX_OOB_INTERACTIONS {
+                        let Ok((mut socket, peer)) = listener.accept().await else {
+                            break;
+                        };
+                        let mut buffer = [0u8; 4096];
+                        let read = socket.read(&mut buffer).await.unwrap_or(0);
+                        let timestamp = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64;
+                        let interaction = json!({
+                            "type": "http",
+                            "client_ip": peer.ip().to_string(),
+                            "time_stamp": timestamp,
+                            "request_b64": engine.encode(&buffer[..read])
+                        });
+                        if let Ok(mut map) = interactions.lock() {
+                            if let Some(list) = map.get_mut(&recorded_token) {
+                                list.push(interaction);
+                            }
+                        }
+                        count += 1;
+                    }
+                });
+                let out = json!({
+                    "ok": true,
+                    "token": token,
+                    "payload": payload,
+                    "server_location": server_location,
+                    "local_only": true
+                });
+                Ok(ToolResult {
+                    ok: true,
+                    output: truncate(&out.to_string()),
+                    structured: Some(out),
+                })
+            }
+            "fetch" => {
+                let token = input.get("token").and_then(Value::as_str).unwrap_or("");
+                if token.is_empty() {
+                    return Ok(denial_result(
+                        "token_required",
+                        json!({"operation": "fetch"}),
+                    ));
+                }
+                let map = self.options.oob_interactions.lock().unwrap();
+                let interactions = map.get(token).cloned().unwrap_or_default();
+                let meta = map
+                    .get(&format!("__server__{token}"))
+                    .and_then(|entries| entries.first())
+                    .cloned();
+                drop(map);
+                let out = json!({
+                    "ok": true,
+                    "token": token,
+                    "interactions": interactions,
+                    "interaction_count": interactions.len(),
+                    "server_location": meta.as_ref()
+                        .and_then(|value| value.get("server_location"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    "cleared": false,
+                    "local_only": true
+                });
+                Ok(ToolResult {
+                    ok: true,
+                    output: truncate(&out.to_string()),
+                    structured: Some(out),
+                })
+            }
+            other => Err(anyhow!("unsupported collaborator operation: {other}")),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded active scan. All network work goes through HttpRequestTool, so scope,
+// allowed_methods, rate limiting, DNS pinning and the canary are inherited.
+// ---------------------------------------------------------------------------
+
+pub struct ActiveScanTool {
+    http: HttpRequestTool,
+}
+
+impl ActiveScanTool {
+    pub fn new() -> Self {
+        Self::with_options(ToolOptions::default())
+    }
+
+    pub fn with_options(options: ToolOptions) -> Self {
+        Self {
+            http: HttpRequestTool::with_options(options),
+        }
+    }
+}
+
+impl Default for ActiveScanTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for ActiveScanTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "active_scan".into(),
+            description: "Bounded active scan over parameter positions and payloads using the scoped HTTP client. Substitutes `§name§` markers in the URL and optional body template, records status and length_delta per payload via http_diff, and stops gracefully at max_requests. Every request inherits scope, allowed_methods, rate limiting, DNS pinning and the canary; no LLM call is made.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "url":{"type":"string","description":"Absolute http/https URL with optional §name§ markers; top-level url is used for policy extraction"},
+                    "positions":{"type":"array","items":{"type":"string"}},
+                    "payloads":{"type":"array","items":{"type":"string"}},
+                    "max_requests":{"type":"integer","default":20,"minimum":1,"maximum":200},
+                    "method":{"type":"string","enum":FUZZ_METHODS,"default":"GET"},
+                    "body_template":{"type":"string"}
+                },
+                "required":["url","positions","payloads"]
+            }),
+            risk: "network-write".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let raw_url = input
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("url required"))?;
+        let base = url::Url::parse(raw_url).context("invalid url")?;
+        let positions: Vec<&str> = input
+            .get("positions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("positions required"))?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let payloads = input
+            .get("payloads")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("payloads required"))?;
+        let method = input
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("GET")
+            .to_ascii_uppercase();
+        if !FUZZ_METHODS.contains(&method.as_str()) {
+            anyhow::bail!("method '{method}' is not allowed for active_scan (only GET/HEAD/POST)");
+        }
+        let max_requests = input
+            .get("max_requests")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, MAX_SCAN_REQUESTS as u64) as usize;
+        let body_template = input.get("body_template").and_then(Value::as_str);
+        let capped_payloads = payloads.len() > MAX_SCAN_PAYLOADS;
+
+        let mut requests = 0usize;
+        // One unmodified baseline gives `length_delta` a reference point. It is
+        // counted toward the hard cap so the cap is never exceeded.
+        let mut baseline_call = json!({"url": raw_url, "method": method});
+        for key in ["headers", "cookies", "use_cookie_jar"] {
+            if let Some(value) = input.get(key) {
+                baseline_call[key] = value.clone();
+            }
+        }
+        if let Some(template) = body_template {
+            baseline_call["body"] = json!(template);
+        }
+        let baseline = if requests < max_requests {
+            requests += 1;
+            self.http.run(baseline_call).await.ok()
+        } else {
+            None
+        };
+        let baseline_body = baseline
+            .as_ref()
+            .and_then(|result| result.structured.as_ref())
+            .and_then(|value| value.get("body"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        let diff = HttpDiffTool;
+        let mut results: Vec<Value> = Vec::new();
+        let mut stopped_at_cap = false;
+        'outer: for position in &positions {
+            let marker = format!("§{position}§");
+            for payload in payloads
+                .iter()
+                .filter_map(Value::as_str)
+                .take(MAX_SCAN_PAYLOADS)
+            {
+                if requests >= max_requests {
+                    stopped_at_cap = true;
+                    break 'outer;
+                }
+                requests += 1;
+                let candidate_url = if raw_url.contains(&marker) {
+                    raw_url.replace(&marker, payload)
+                } else {
+                    fuzz_candidate(&base, &marker, Some(position), payload)
+                        .map(|url| url.to_string())
+                        .unwrap_or_else(|| raw_url.to_string())
+                };
+                let mut call = json!({"url": candidate_url, "method": method});
+                if let Some(template) = body_template {
+                    call["body"] = json!(template.replace(&marker, payload));
+                }
+                for key in [
+                    "headers",
+                    "cookies",
+                    "use_cookie_jar",
+                    "follow_redirects",
+                    "max_redirects",
+                ] {
+                    if let Some(value) = input.get(key) {
+                        call[key] = value.clone();
+                    }
+                }
+                let mut entry = serde_json::Map::new();
+                entry.insert("payload".into(), Value::String(payload.to_string()));
+                entry.insert("position".into(), Value::String((*position).to_string()));
+                match self.http.run(call).await {
+                    Ok(response) => {
+                        let data = response.structured.unwrap_or_else(|| json!({}));
+                        let status = data.get("status").and_then(Value::as_u64).unwrap_or(0);
+                        let body = data.get("body").and_then(Value::as_str).unwrap_or("");
+                        let length_delta = match &baseline_body {
+                            Some(baseline) => diff
+                                .run(json!({"a": baseline, "b": body}))
+                                .await
+                                .ok()
+                                .and_then(|result| result.structured)
+                                .and_then(|value| value.get("length_delta").and_then(Value::as_i64))
+                                .unwrap_or(0),
+                            None => 0,
+                        };
+                        entry.insert("ok".into(), Value::Bool(response.ok));
+                        entry.insert("status".into(), json!(status));
+                        entry.insert("length_delta".into(), json!(length_delta));
+                        if let Some(capture) = data.get("capture") {
+                            entry.insert("capture".into(), capture.clone());
+                        }
+                        if let Some(error) = data.get("error") {
+                            entry.insert("error".into(), error.clone());
+                        }
+                    }
+                    Err(err) => {
+                        entry.insert("ok".into(), Value::Bool(false));
+                        entry.insert("status".into(), json!(0));
+                        entry.insert("length_delta".into(), json!(0));
+                        entry.insert("error".into(), Value::String(redact(&err.to_string())));
+                    }
+                }
+                results.push(Value::Object(entry));
+            }
+        }
+        let any_ok = results
+            .iter()
+            .any(|result| result.get("ok").and_then(Value::as_bool).unwrap_or(false));
+        let structured = json!({
+            "ok": any_ok,
+            "url": raw_url,
+            "method": method,
+            "positions": positions,
+            "payload_total": payloads.len(),
+            "max_requests": max_requests,
+            "requests": requests,
+            "stopped_at_cap": stopped_at_cap,
+            "capped_payloads": capped_payloads,
+            "results": results
+        });
+        Ok(ToolResult {
+            ok: any_ok,
+            output: truncate(&format!(
+                "active_scan: {requests} request(s), {}",
+                if stopped_at_cap {
+                    "stopped at cap"
+                } else {
+                    "complete"
+                }
+            )),
+            structured: Some(structured),
+        })
+    }
+}
+
 /// Non-panicking registry constructor for untrusted CLI input.
 pub fn try_default_registry(cwd: impl AsRef<Path>) -> Result<ToolRegistry> {
     try_default_registry_with_options(cwd, ToolOptions::default())
@@ -2727,6 +3677,13 @@ pub fn try_default_registry_with_options(
     reg.register(Arc::new(DecodeTool));
     reg.register(Arc::new(InsertionPointsTool));
     reg.register(Arc::new(HttpDiffTool));
+    reg.register(Arc::new(SequencerTool));
+    // LOCAL-ONLY Collaborator simulation: loopback listener, never an external
+    // OOB oracle. Risk is "safe" but no production egress is added.
+    reg.register(Arc::new(CollaboratorTool::with_options(options.clone())));
+    // Active scan wraps the scoped HTTP client; the host still decides whether
+    // a network-write tool is exposed.
+    reg.register(Arc::new(ActiveScanTool::with_options(options.clone())));
     reg.register(Arc::new(ReportWriterTool));
     reg.register(Arc::new(TaskPutTool));
     reg.register(Arc::new(CluePutTool));
@@ -6101,6 +7058,591 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         )
+    }
+
+    // ---- Burp tool mechanisms: cookie jar, redirects, sequencer, OOB, scan ----
+
+    type ServeStep = (u16, Vec<(String, String)>, String);
+
+    async fn serve_steps(steps: Vec<ServeStep>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for (status, extra, body) in steps {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let header_end = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break raw.len();
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = find_subslice(&raw, b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&raw[..header_end]);
+                let content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                while raw.len() < header_end + content_length {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                }
+                seen.push(String::from_utf8_lossy(&raw).into_owned());
+                let mut response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    body.len()
+                );
+                for (name, value) in extra {
+                    response.push_str(&format!("{name}: {value}\r\n"));
+                }
+                response.push_str("\r\n");
+                response.push_str(&body);
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            seen
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    #[test]
+    fn cookie_helpers_parse_object_string_and_set_cookie() {
+        let object = parse_cookie_pairs(Some(&json!({"a": "1", "b": "two"})));
+        assert_eq!(
+            object,
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "two".to_string())
+            ]
+        );
+        let raw = parse_cookie_pairs(Some(&json!("sid=abc; theme=dark")));
+        assert_eq!(
+            raw,
+            vec![
+                ("sid".to_string(), "abc".to_string()),
+                ("theme".to_string(), "dark".to_string())
+            ]
+        );
+        assert!(parse_cookie_pairs(None).is_empty());
+
+        let parsed =
+            parse_set_cookie_line("sid=abc; Path=/app; Domain=.example.com; Expires=1; HttpOnly")
+                .expect("parse set-cookie");
+        assert_eq!(parsed.name, "sid");
+        assert_eq!(parsed.value, "abc");
+        assert_eq!(parsed.path.as_deref(), Some("/app"));
+        assert_eq!(parsed.domain.as_deref(), Some("example.com"));
+        assert_eq!(parsed.expires, "1");
+
+        let repr = "HTTP/1.1 200 OK\r\nset-cookie: a=1; Path=/\r\nSet-Cookie: b=2\r\n\r\nbody";
+        let cookies = set_cookies_from_repr(repr);
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(cookies[0].name, "a");
+        assert_eq!(cookies[1].name, "b");
+    }
+
+    #[test]
+    fn cookie_jar_matches_domain_suffix_path_and_expiry() {
+        let jar: CookieJar = Arc::new(Mutex::new(BTreeMap::new()));
+        let cookies = vec![
+            parse_set_cookie_line("sid=abc; Path=/app; Domain=.example.com").unwrap(),
+            parse_set_cookie_line("root=r; Path=/; Domain=example.com").unwrap(),
+            parse_set_cookie_line("dead=x; Path=/; Expires=1").unwrap(),
+        ];
+        cookie_jar_store(&jar, &cookies, "fallback.test");
+        let matched = cookies_for_url(&jar, "api.example.com", "/app/page");
+        assert!(matched.contains(&("sid".to_string(), "abc".to_string())));
+        assert!(matched.contains(&("root".to_string(), "r".to_string())));
+        assert!(!matched.iter().any(|(name, _)| name == "dead"));
+        let wrong_path = cookies_for_url(&jar, "api.example.com", "/other");
+        assert!(wrong_path.iter().any(|(name, _)| name == "root"));
+        assert!(!wrong_path.iter().any(|(name, _)| name == "sid"));
+        assert!(cookies_for_url(&jar, "evil-example.com", "/app").is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_cookie_jar_round_trip_and_explicit_override() {
+        let (url, server) = serve_steps(vec![
+            (
+                200,
+                vec![
+                    ("set-cookie".to_string(), "sid=abc; Path=/".to_string()),
+                    ("set-cookie".to_string(), "theme=dark; Path=/".to_string()),
+                ],
+                "first".to_string(),
+            ),
+            (200, vec![], "second".to_string()),
+            (200, vec![], "third".to_string()),
+        ])
+        .await;
+        let options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+        let first = tool
+            .run(json!({"url": url, "use_cookie_jar": true}))
+            .await
+            .unwrap();
+        assert!(first.ok);
+        assert_eq!(tool.options.cookie_jar.lock().unwrap().len(), 2);
+        let second = tool
+            .run(json!({"url": url, "use_cookie_jar": true}))
+            .await
+            .unwrap();
+        assert!(second.ok);
+        let third = tool
+            .run(json!({
+                "url": url,
+                "use_cookie_jar": true,
+                "cookies": {"sid": "override"}
+            }))
+            .await
+            .unwrap();
+        assert!(third.ok);
+        let seen = server.await.unwrap();
+        assert!(!seen[0].to_ascii_lowercase().contains("cookie: sid=abc"));
+        assert!(
+            seen[1].to_ascii_lowercase().contains("cookie: sid=abc"),
+            "{}",
+            seen[1]
+        );
+        assert!(
+            seen[2].to_ascii_lowercase().contains("sid=override"),
+            "{}",
+            seen[2]
+        );
+        assert!(
+            seen[2].to_ascii_lowercase().contains("theme=dark"),
+            "{}",
+            seen[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn http_explicit_cookies_are_attached_and_captured() {
+        let (url, server) = serve_steps(vec![(200, vec![], "ok".to_string())]).await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({"url": url, "cookies": "a=1; b=2"}))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let seen = server.await.unwrap();
+        assert!(
+            seen[0].to_ascii_lowercase().contains("cookie: a=1; b=2"),
+            "{}",
+            seen[0]
+        );
+        let (request, _, _) = capture_from_structured(result.structured.as_ref().unwrap()).unwrap();
+        assert!(request.to_ascii_lowercase().contains("cookie: a=1; b=2"));
+    }
+
+    #[tokio::test]
+    async fn http_manual_redirect_records_chain_and_rewrites_post() {
+        let (url, server) = serve_steps(vec![
+            (
+                302,
+                vec![("location".to_string(), "/final".to_string())],
+                "redirecting".to_string(),
+            ),
+            (200, vec![], "done".to_string()),
+        ])
+        .await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": url,
+                "method": "POST",
+                "body": "k=v",
+                "follow_redirects": true,
+                "max_redirects": 3
+            }))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["status"], 200);
+        let chain = data["redirect_chain"].as_array().unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0]["status"], 302);
+        assert!(chain[0]["to"].as_str().unwrap().ends_with("/final"));
+        assert_eq!(chain[0]["method"], "GET");
+        assert_eq!(chain[0]["in_scope"], true);
+        assert_eq!(chain[0]["host_allowed"], true);
+        let seen = server.await.unwrap();
+        assert!(seen[0].starts_with("POST / HTTP/1.1"), "{}", seen[0]);
+        assert!(seen[0].to_ascii_lowercase().contains("k=v"));
+        assert!(seen[1].starts_with("GET /final HTTP/1.1"), "{}", seen[1]);
+        assert!(!seen[1].to_ascii_lowercase().contains("k=v"));
+    }
+
+    #[tokio::test]
+    async fn http_redirect_cap_and_disabled_by_default() {
+        let (url, server) = serve_steps(vec![(
+            302,
+            vec![("location".to_string(), "/next".to_string())],
+            "moved".to_string(),
+        )])
+        .await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool.run(json!({"url": url})).await.unwrap();
+        let data = result.structured.as_ref().unwrap();
+        assert_eq!(data["status"], 302);
+        assert_eq!(data["redirect_chain"].as_array().unwrap().len(), 0);
+        server.await.unwrap();
+
+        let (url, server) = serve_steps(vec![
+            (
+                302,
+                vec![("location".to_string(), "/one".to_string())],
+                "a".to_string(),
+            ),
+            (
+                302,
+                vec![("location".to_string(), "/two".to_string())],
+                "b".to_string(),
+            ),
+            (
+                302,
+                vec![("location".to_string(), "/three".to_string())],
+                "c".to_string(),
+            ),
+        ])
+        .await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": url,
+                "follow_redirects": true,
+                "max_redirects": 2
+            }))
+            .await
+            .unwrap();
+        let data = result.structured.unwrap();
+        assert_eq!(data["status"], 302);
+        assert_eq!(data["redirect_chain"].as_array().unwrap().len(), 2);
+        let seen = server.await.unwrap();
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn http_redirect_fails_closed_on_out_of_scope_and_local_hosts() {
+        let (url, server) = serve_steps(vec![(
+            302,
+            vec![("location".to_string(), "http://evil.example/x".to_string())],
+            "moved".to_string(),
+        )])
+        .await;
+        let options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            scope_in: vec!["127.0.0.1".to_string()],
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+        let result = tool
+            .run(json!({
+                "url": url,
+                "follow_redirects": true,
+                "max_redirects": 5
+            }))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["error"], "redirect_out_of_scope");
+        let chain = data["redirect_chain"].as_array().unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0]["in_scope"], false);
+        server.await.unwrap();
+
+        let (url, server) = serve_steps(vec![(
+            302,
+            vec![("location".to_string(), "http://localhost/x".to_string())],
+            "moved".to_string(),
+        )])
+        .await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": url,
+                "follow_redirects": true,
+                "max_redirects": 5
+            }))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["error"], "redirect_host_not_allowed");
+        server.await.unwrap();
+
+        let (url, server) = serve_steps(vec![(
+            302,
+            vec![("location".to_string(), "file:///etc/passwd".to_string())],
+            "moved".to_string(),
+        )])
+        .await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": url,
+                "follow_redirects": true,
+                "max_redirects": 5
+            }))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        assert_eq!(
+            result.structured.unwrap()["error"],
+            "redirect_scheme_not_allowed"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sequencer_verdicts_and_metrics() {
+        let tool = SequencerTool;
+        let few = tool.run(json!({"tokens": ["abc", "def"]})).await.unwrap();
+        assert_eq!(
+            few.structured.as_ref().unwrap()["verdict"],
+            "insufficient_samples"
+        );
+
+        let same = tool
+            .run(
+                json!({"tokens": ["abcd", "abcd", "abcd", "abcd", "abcd", "abcd", "abcd", "abcd"]}),
+            )
+            .await
+            .unwrap();
+        let data = same.structured.unwrap();
+        assert_eq!(data["verdict"], "suspicious");
+        assert_eq!(data["distinct_count"], 1);
+        assert_eq!(data["longest_common_prefix"], 4);
+
+        let varied = tool
+            .run(json!({
+                "tokens": ["abcd", "bcad", "cdba", "dabc", "badc", "cadb", "dbca", "acbd"]
+            }))
+            .await
+            .unwrap();
+        let data = varied.structured.unwrap();
+        assert_eq!(data["verdict"], "plausible");
+        assert_eq!(data["sample_count"], 8);
+        assert_eq!(data["distinct_count"], 8);
+        assert_eq!(data["position_entropy"].as_array().unwrap().len(), 4);
+        assert!(data.get("chi_square").is_some());
+        assert!(data.get("bit_balance").is_some());
+    }
+
+    #[tokio::test]
+    async fn collaborator_start_records_and_fetch_returns_interaction() {
+        use base64::Engine;
+        use tokio::io::AsyncWriteExt;
+        let tool = CollaboratorTool::with_options(ToolOptions::default());
+        let started = tool.run(json!({"operation": "start"})).await.unwrap();
+        assert!(started.ok);
+        let data = started.structured.unwrap();
+        let token = data["token"].as_str().unwrap().to_string();
+        let payload = data["payload"].as_str().unwrap().to_string();
+        let server = data["server_location"].as_str().unwrap().to_string();
+        assert!(payload.contains(&format!("{token}.localhost")));
+        assert!(server.starts_with("127.0.0.1:"));
+
+        let second = tool.run(json!({"operation": "start"})).await.unwrap();
+        assert_ne!(second.structured.unwrap()["token"].as_str().unwrap(), token);
+
+        let mut stream = tokio::net::TcpStream::connect(&server).await.unwrap();
+        stream
+            .write_all(b"GET /oob HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        drop(stream);
+
+        let mut found = false;
+        for _ in 0..50 {
+            let fetched = tool
+                .run(json!({"operation": "fetch", "token": token}))
+                .await
+                .unwrap();
+            let data = fetched.structured.unwrap();
+            if data["interaction_count"].as_u64().unwrap_or(0) >= 1 {
+                let interaction = &data["interactions"][0];
+                assert_eq!(interaction["type"], "http");
+                assert_eq!(interaction["client_ip"], "127.0.0.1");
+                let encoded = interaction["request_b64"].as_str().unwrap();
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap();
+                assert_eq!(decoded, b"GET /oob HTTP/1.1\r\nHost: x\r\n\r\n");
+                assert_eq!(data["server_location"].as_str().unwrap(), server);
+                assert_eq!(data["cleared"], false);
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(found, "no OOB interaction recorded");
+
+        let again = tool
+            .run(json!({"operation": "fetch", "token": token}))
+            .await
+            .unwrap();
+        assert_eq!(again.structured.unwrap()["interaction_count"], 1);
+        let missing = tool
+            .run(json!({"operation": "fetch", "token": "unknown"}))
+            .await
+            .unwrap();
+        assert_eq!(missing.structured.unwrap()["interaction_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn active_scan_substitutes_markers_and_honors_cap() {
+        let (url, server) = serve_steps(vec![
+            (200, vec![], "base".to_string()),
+            (200, vec![], "payload-a".to_string()),
+            (200, vec![], "payload-b".to_string()),
+        ])
+        .await;
+        let marked = format!("{url}?q=§q§");
+        let tool = ActiveScanTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": marked,
+                "positions": ["q"],
+                "payloads": ["a", "b"],
+                "max_requests": 10
+            }))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["requests"], 3);
+        assert_eq!(data["stopped_at_cap"], false);
+        let results = data["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        for (index, payload) in ["a", "b"].iter().enumerate() {
+            assert_eq!(results[index]["payload"].as_str().unwrap(), *payload);
+            assert_eq!(results[index]["position"].as_str().unwrap(), "q");
+            assert_eq!(results[index]["ok"], true);
+            assert_eq!(results[index]["status"], 200);
+            assert!(results[index].get("length_delta").is_some());
+            assert!(results[index].get("capture").is_some());
+        }
+        let seen = server.await.unwrap();
+        assert!(seen[0].contains("q=%C2%A7q%C2%A7"), "{}", seen[0]);
+        assert!(seen[1].contains("GET /?q=a HTTP/1.1"), "{}", seen[1]);
+        assert!(seen[2].contains("GET /?q=b HTTP/1.1"), "{}", seen[2]);
+    }
+
+    #[tokio::test]
+    async fn active_scan_stops_at_request_cap() {
+        let (url, server) = serve_steps(vec![
+            (200, vec![], "base".to_string()),
+            (200, vec![], "one".to_string()),
+        ])
+        .await;
+        let tool = ActiveScanTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": url,
+                "positions": ["q"],
+                "payloads": ["a", "b", "c"],
+                "max_requests": 2
+            }))
+            .await
+            .unwrap();
+        let data = result.structured.unwrap();
+        assert_eq!(data["requests"], 2);
+        assert_eq!(data["stopped_at_cap"], true);
+        assert_eq!(data["results"].as_array().unwrap().len(), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_scan_inherits_allowed_methods_and_scope() {
+        let options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            allowed_methods: Some(vec!["GET".to_string()]),
+            ..ToolOptions::default()
+        };
+        let tool = ActiveScanTool::with_options(options);
+        let result = tool
+            .run(json!({
+                "url": "http://127.0.0.1:9/",
+                "method": "POST",
+                "positions": ["q"],
+                "payloads": ["a"],
+                "max_requests": 5
+            }))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        let data = result.structured.unwrap();
+        let results = data["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["error"], "method_not_allowed");
+
+        let scoped = ToolOptions {
+            scope_in: vec!["example.com".to_string()],
+            ..ToolOptions::default()
+        };
+        let tool = ActiveScanTool::with_options(scoped);
+        let result = tool
+            .run(json!({
+                "url": "http://127.0.0.1:9/",
+                "positions": ["q"],
+                "payloads": ["a"],
+                "max_requests": 5
+            }))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        let data = result.structured.unwrap();
+        let results = data["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["ok"], false);
+        assert!(results[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("scope policy"));
+    }
+
+    #[test]
+    fn http_request_schema_still_requires_top_level_url() {
+        let tool = HttpRequestTool::new();
+        let spec = tool.spec();
+        assert_eq!(spec.parameters()["required"], json!(["url"]));
+        assert!(validate_tool_args(&spec, &json!({"url": "https://example.com"})).is_ok());
+        assert!(validate_tool_args(&spec, &json!({"cookies": "a=1"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn new_burp_tools_are_registered_with_expected_risks() {
+        let dir = std::env::temp_dir().join(format!("mbt-reg-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = try_default_registry_with_options(&dir, ToolOptions::default()).unwrap();
+        assert_eq!(registry.host_risk("sequencer"), "safe");
+        assert_eq!(registry.host_risk("collaborator"), "safe");
+        assert_eq!(registry.host_risk("active_scan"), "network-write");
+        assert!(registry.get("sequencer").is_some());
+        assert!(registry.get("collaborator").is_some());
+        assert!(registry.get("active_scan").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -389,6 +389,11 @@ impl Store {
                engagement_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_engagement_controls_id ON engagement_controls(engagement_id);
+             CREATE TABLE IF NOT EXISTS authorization_revalidation(
+               engagement_id TEXT PRIMARY KEY, state TEXT NOT NULL,
+               observed_hash TEXT NOT NULL DEFAULT '', requested_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS schema_version(
                version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
              );
@@ -398,7 +403,11 @@ impl Store {
                tool_calls_used INTEGER NOT NULL DEFAULT 0,
                network_calls_used INTEGER NOT NULL DEFAULT 0,
                window_start_ms INTEGER NOT NULL DEFAULT 0,
-               calls_in_window INTEGER NOT NULL DEFAULT 0
+               calls_in_window INTEGER NOT NULL DEFAULT 0,
+               steps_offset INTEGER NOT NULL DEFAULT 0,
+               tool_calls_offset INTEGER NOT NULL DEFAULT 0,
+               network_calls_offset INTEGER NOT NULL DEFAULT 0,
+               tokens_offset INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS pending_tool_calls(
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, approval_id TEXT NOT NULL,
@@ -589,6 +598,19 @@ impl Store {
             "ALTER TABLE sessions ADD COLUMN resume_attempts INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // Parent->child budget inheritance: old databases gain zero-valued
+        // offsets, so their existing usage snapshots are unchanged.
+        for column in [
+            "steps_offset INTEGER NOT NULL DEFAULT 0",
+            "tool_calls_offset INTEGER NOT NULL DEFAULT 0",
+            "network_calls_offset INTEGER NOT NULL DEFAULT 0",
+            "tokens_offset INTEGER NOT NULL DEFAULT 0",
+        ] {
+            let _ = conn.execute(
+                &format!("ALTER TABLE session_budgets ADD COLUMN {column}"),
+                [],
+            );
+        }
         for column in [
             "requirement_id TEXT NOT NULL DEFAULT ''",
             "claim TEXT NOT NULL DEFAULT ''",
@@ -1849,12 +1871,54 @@ impl Store {
         Ok(())
     }
 
+    /// Seed the inherited usage of a parent session into a child budget row.
+    ///
+    /// Idempotent: the offsets are written only once, when every offset is
+    /// still zero. Later calls (including retries) are no-ops, so a resumed
+    /// child cannot reset or double-apply its inherited usage. A row with all
+    /// zero offsets is indistinguishable from a row created before inheritance
+    /// existed.
+    pub fn seed_budget_offsets(
+        &self,
+        session_id: &str,
+        steps: usize,
+        tool_calls: usize,
+        network_calls: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO session_budgets(session_id) VALUES(?1)",
+            params![session_id],
+        )?;
+        conn.execute(
+            "UPDATE session_budgets SET
+               steps_offset=?2, tool_calls_offset=?3,
+               network_calls_offset=?4, tokens_offset=?5
+             WHERE session_id=?1 AND steps_offset=0 AND tool_calls_offset=0
+               AND network_calls_offset=0 AND tokens_offset=0",
+            params![
+                session_id,
+                steps as i64,
+                tool_calls as i64,
+                network_calls as i64,
+                tokens as i64
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Durable usage snapshot. The requests-per-minute window rolls over after 60s.
+    /// Inherited offsets are added to the raw counters so the existing budget
+    /// gates see the parent's usage as if the child had spent it itself.
     pub fn budget_usage(&self, session_id: &str) -> Result<BudgetUsage> {
         let conn = self.conn.lock().unwrap();
         let row: Option<(i64, i64, i64, i64, i64)> = conn
             .query_row(
-                "SELECT steps_used, tool_calls_used, network_calls_used, window_start_ms, calls_in_window
+                "SELECT steps_used + steps_offset,
+                        tool_calls_used + tool_calls_offset,
+                        network_calls_used + network_calls_offset,
+                        window_start_ms, calls_in_window
                  FROM session_budgets WHERE session_id=?1",
                 params![session_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
@@ -2335,6 +2399,20 @@ impl Store {
             completion_tokens: completion.unwrap_or(0).max(0) as u64,
             cost_usd: cost.unwrap_or(0.0),
         })
+    }
+
+    /// Total tokens consumed by a session as a plain count. There is no
+    /// `tokens_used` column: the billing ledger is `token_usage`, so this sums
+    /// its prompt and completion tokens. Sessions without billing rows return
+    /// zero. Kept separate from [`Store::token_usage`] because that pre-existing
+    /// API returns the richer [`TokenUsage`] breakdown used by the runner and UI.
+    pub fn token_usage_total(&self, session_id: &str) -> Result<usize> {
+        let usage = self.token_usage(session_id)?;
+        Ok(usage
+            .prompt_tokens
+            .saturating_add(usage.completion_tokens)
+            .try_into()
+            .unwrap_or(usize::MAX))
     }
 
     /// Pin a session to a goal digest. Repeated calls replace the lock.
@@ -3131,6 +3209,18 @@ pub struct AuthorizationSnapshot {
     pub created_at: String,
 }
 
+/// Out-of-band request to revalidate an engagement's authorization on resume.
+/// `state` is `requested` until it is resolved to `cleared` or `blocked`;
+/// `observed_hash` records the authorization snapshot that was inspected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevalidationRequest {
+    pub engagement_id: String,
+    pub state: String,
+    pub observed_hash: String,
+    pub requested_at: String,
+    pub updated_at: String,
+}
+
 /// An out-of-band operator acknowledgement for one ambiguous line or version.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorizationAck {
@@ -3188,6 +3278,97 @@ impl Store {
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    /// Durable record that an engagement must re-check its authorization before
+    /// the next resume. Repeated requests keep the original `requested_at`.
+    pub fn request_authorization_revalidation(&self, engagement_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let ts = now();
+        conn.execute(
+            "INSERT INTO authorization_revalidation(
+               engagement_id, state, observed_hash, requested_at, updated_at)
+             VALUES (?1, 'requested', '', ?2, ?2)
+             ON CONFLICT(engagement_id) DO UPDATE SET
+               state='requested', updated_at=excluded.updated_at",
+            params![engagement_id, ts],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_authorization_revalidation(
+        &self,
+        engagement_id: &str,
+    ) -> Result<Option<RevalidationRequest>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT engagement_id, state, observed_hash, requested_at, updated_at
+             FROM authorization_revalidation WHERE engagement_id=?1",
+        )?;
+        let row = stmt
+            .query_row(params![engagement_id], |r| {
+                Ok(RevalidationRequest {
+                    engagement_id: r.get(0)?,
+                    state: r.get(1)?,
+                    observed_hash: r.get(2)?,
+                    requested_at: r.get(3)?,
+                    updated_at: r.get(4)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Resolve a pending revalidation. `state` must be `cleared` or `blocked`;
+    /// any other value is rejected so a typo cannot silently clear a block.
+    pub fn finish_authorization_revalidation(
+        &self,
+        engagement_id: &str,
+        state: &str,
+        observed_hash: &str,
+    ) -> Result<()> {
+        if state != "cleared" && state != "blocked" {
+            return Err(anyhow::anyhow!(
+                "invalid revalidation state: {state} (expected cleared or blocked)"
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE authorization_revalidation SET state=?2, observed_hash=?3, updated_at=?4
+             WHERE engagement_id=?1",
+            params![engagement_id, state, observed_hash, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Highest-version authorization snapshot recorded for an engagement.
+    pub fn latest_authorization_snapshot(
+        &self,
+        engagement_id: &str,
+    ) -> Result<Option<AuthorizationSnapshot>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT engagement_id, version, source_url, content_hash, scope_hash,
+                    roe_hash, observed_at, state, created_at
+             FROM authorization_snapshots WHERE engagement_id=?1
+             ORDER BY version DESC LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row(params![engagement_id], |r| {
+                Ok(AuthorizationSnapshot {
+                    engagement_id: r.get(0)?,
+                    version: r.get(1)?,
+                    source_url: r.get(2)?,
+                    content_hash: r.get(3)?,
+                    scope_hash: r.get(4)?,
+                    roe_hash: r.get(5)?,
+                    observed_at: r.get(6)?,
+                    state: r.get(7)?,
+                    created_at: r.get(8)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
     }
 
     pub fn save_authorization_ack(&self, ack: &AuthorizationAck) -> Result<bool> {
@@ -4420,6 +4601,41 @@ mod tests {
         assert_eq!(usage.tool_calls_used, 2);
         assert_eq!(usage.network_calls_used, 1);
         assert_eq!(usage.calls_in_window, 2);
+    }
+
+    #[test]
+    fn budget_offsets_are_additive_and_idempotent() {
+        let store = Store::open(":memory:").unwrap();
+        let plain = store.create_session("plain").unwrap();
+        let child = store.create_session("child").unwrap();
+        store.ensure_budget(&plain.id).unwrap();
+        store.ensure_budget(&child.id).unwrap();
+        assert_eq!(store.budget_usage(&plain.id).unwrap().steps_used, 0);
+        assert_eq!(store.budget_usage(&child.id).unwrap().steps_used, 0);
+
+        store.seed_budget_offsets(&child.id, 3, 2, 1, 99).unwrap();
+        // A retry must not re-apply the inherited usage.
+        store
+            .seed_budget_offsets(&child.id, 30, 20, 10, 999)
+            .unwrap();
+        store.record_step(&child.id).unwrap();
+        store.record_tool_call(&child.id, true).unwrap();
+        let usage = store.budget_usage(&child.id).unwrap();
+        assert_eq!(usage.steps_used, 4);
+        assert_eq!(usage.tool_calls_used, 3);
+        assert_eq!(usage.network_calls_used, 2);
+        assert_eq!(usage.calls_in_window, 1);
+        store.record_token_usage(&child.id, 40, 8, 0.0).unwrap();
+        assert_eq!(store.token_usage_total(&child.id).unwrap(), 48);
+
+        // Zero offsets are the default and leave the row behaving as before.
+        store.seed_budget_offsets(&plain.id, 0, 0, 0, 0).unwrap();
+        store.record_step(&plain.id).unwrap();
+        let plain_usage = store.budget_usage(&plain.id).unwrap();
+        assert_eq!(plain_usage.steps_used, 1);
+        assert_eq!(plain_usage.tool_calls_used, 0);
+        assert_eq!(plain_usage.network_calls_used, 0);
+        assert_eq!(store.token_usage_total(&plain.id).unwrap(), 0);
     }
 
     #[test]
@@ -6050,6 +6266,77 @@ fn authorization_ack_is_hash_scoped_and_idempotent() {
             "rule-2"
         )
         .unwrap());
+}
+
+#[test]
+fn authorization_revalidation_is_idempotent_and_scoped() {
+    let store = Store::open(":memory:").unwrap();
+    assert!(store
+        .get_authorization_revalidation("eng-1")
+        .unwrap()
+        .is_none());
+
+    store.request_authorization_revalidation("eng-1").unwrap();
+    let first = store
+        .get_authorization_revalidation("eng-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.state, "requested");
+    assert_eq!(first.observed_hash, "");
+
+    store.request_authorization_revalidation("eng-1").unwrap();
+    let again = store
+        .get_authorization_revalidation("eng-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.requested_at, first.requested_at);
+    assert_eq!(again.state, "requested");
+
+    // Read is scoped by engagement id.
+    assert!(store
+        .get_authorization_revalidation("eng-2")
+        .unwrap()
+        .is_none());
+
+    store
+        .finish_authorization_revalidation("eng-1", "blocked", "snapshot-hash")
+        .unwrap();
+    let done = store
+        .get_authorization_revalidation("eng-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.state, "blocked");
+    assert_eq!(done.observed_hash, "snapshot-hash");
+    assert!(store
+        .finish_authorization_revalidation("eng-1", "unknown", "x")
+        .is_err());
+
+    // The snapshot reader returns the newest version for this engagement only.
+    for (engagement_id, version) in [("eng-1", 1), ("eng-1", 2), ("eng-2", 9)] {
+        store
+            .save_authorization_snapshot(&AuthorizationSnapshot {
+                engagement_id: engagement_id.to_string(),
+                version,
+                source_url: "https://example.test/brief".to_string(),
+                content_hash: format!("hash-{engagement_id}-{version}"),
+                scope_hash: "scope".to_string(),
+                roe_hash: "roe".to_string(),
+                observed_at: "1".to_string(),
+                state: "ingested".to_string(),
+                created_at: "1".to_string(),
+            })
+            .unwrap();
+    }
+    let latest = store
+        .latest_authorization_snapshot("eng-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.version, 2);
+    assert_eq!(latest.content_hash, "hash-eng-1-2");
+    assert!(store
+        .latest_authorization_snapshot("missing")
+        .unwrap()
+        .is_none());
 }
 
 #[test]

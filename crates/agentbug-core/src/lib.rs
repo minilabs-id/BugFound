@@ -483,6 +483,18 @@ impl Runner {
     }
 }
 
+/// Usage inherited from a parent session when a child runner starts. Only
+/// plain counters and an opaque parent id live here; domain vocabulary stays
+/// outside the core (ADR-001).
+#[derive(Debug, Clone)]
+pub struct BudgetInheritance {
+    pub parent_session_id: String,
+    pub steps_offset: usize,
+    pub tool_calls_offset: usize,
+    pub network_calls_offset: usize,
+    pub tokens_offset: usize,
+}
+
 pub struct Runner {
     pub store: Store,
     pub llm: Arc<dyn Llm + Send + Sync>,
@@ -497,6 +509,8 @@ pub struct Runner {
     pub tool_calls_used: std::sync::atomic::AtomicUsize,
     /// Short-lived per-target cooldowns after 429/403 responses.
     cooldowns: Mutex<HashMap<String, Instant>>,
+    /// Parent usage seeded into each session this runner starts.
+    budget_inheritance: Option<BudgetInheritance>,
 }
 
 impl Runner {
@@ -518,12 +532,20 @@ impl Runner {
             owner_id: format!("runner-{}", Uuid::new_v4()),
             tool_calls_used: std::sync::atomic::AtomicUsize::new(0),
             cooldowns: Mutex::new(HashMap::new()),
+            budget_inheritance: None,
         }
     }
 
     /// Replace the domain adapter. `Runner::new` keeps its 5-argument signature.
     pub fn with_domain(mut self, domain: Arc<dyn Domain>) -> Self {
         self.domain = domain;
+        self
+    }
+
+    /// Seed a child session's budget with its parent's already-spent usage.
+    /// The store applies the offsets once, before the first step is counted.
+    pub fn with_budget_inheritance(mut self, inheritance: BudgetInheritance) -> Self {
+        self.budget_inheritance = Some(inheritance);
         self
     }
 
@@ -1876,6 +1898,20 @@ impl Runner {
 
     async fn run_loop(&self, session_id: &str, model: &str) -> Result<String> {
         self.store.ensure_budget(session_id)?;
+        if let Some(inheritance) = &self.budget_inheritance {
+            self.store.seed_budget_offsets(
+                session_id,
+                inheritance.steps_offset,
+                inheritance.tool_calls_offset,
+                inheritance.network_calls_offset,
+                inheritance.tokens_offset,
+            )?;
+            info!(
+                parent = %inheritance.parent_session_id,
+                session = %session_id,
+                "runner budget inherited from parent"
+            );
+        }
         let mut step = self.store.budget_usage(session_id)?.steps_used;
         let mut last_evidence = self.domain.progress_count(&self.store, session_id);
         let mut stalled_steps = 0usize;

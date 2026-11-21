@@ -366,3 +366,29 @@ All results remain construction evidence. No benchmark claim is asserted.
 - Still deferred: OOB Collaborator, live intercepting proxy, Sequencer,
   cookie jar/redirect control, full gated active-scan orchestrator.
 - All numbers remain construction evidence. No benchmark claim is asserted.
+
+
+### R18 — Execute remaining deferred engine capabilities (COMPLETE)
+- `agentbug-tools`: cookie jar + per-hop scope-validated redirects on
+  `http_request` (fail-closed on every `Location`); `sequencer` (entropy,
+  bit balance, chi-square, verdict); `collaborator` (loopback-only OOB
+  simulation, capped 32 interactions — explicitly cannot be a real external
+  oracle); `active_scan` (gated Intruder-style runner, caps 20/200, reuse of
+  all scope/method/rate/canary gates).
+- `agentbug-store` + `agentbug-core` + `handoff`: budget-offset inheritance
+  from parent to child sessions; child caps clamped to parent remaining,
+  never widened; zero-consumption handoff rejected when parent is exhausted.
+- `agentbug-engagement` + CLI: opt-in `--revalidate-brief` on resume — hash
+  match clears, hash mismatch pauses, blocks further resume, emits no report
+  and never marks aborted; `active_scan` registered only when all four gates
+  (`allow_fuzzing`, `allow_intrusive`, `allow_network_write`,
+  `allow_state_change`) are true, with audit event on withholding.
+- New `agentbug-proxy` crate: bounded deterministic HTTP intercepting proxy,
+  operator `y` ack required by default in gated mode, scope fail-closed,
+  JSONL history flushed per request. Plain HTTP only; no TLS MITM.
+- Verification: 319 tests green, clippy clean, ADR-001 boundary clean,
+  exactly one `chat_full` in core.
+- Deliberately NOT implemented: auto-submit / report transmission (forbidden
+  by design invariant and requires a new ADR), external Collaborator server /
+  DNS listener, TLS MITM certificate generation, platform adapters, typed
+  safe-harbor model. No benchmark claim; all results are construction evidence.

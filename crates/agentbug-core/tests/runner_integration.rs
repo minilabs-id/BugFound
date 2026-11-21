@@ -1,7 +1,7 @@
 use agentbug_core::inbox::{Delivery, Inbox, InboxKind};
 use agentbug_core::{
     build_policy, build_policy_config, extract_policy_target, normalized_args_signature,
-    record_provider_usage, request_stop, AgentConfig, Runner,
+    record_provider_usage, request_stop, AgentConfig, BudgetInheritance, Runner,
 };
 use agentbug_llm::{ChatMessage, ChatResponse, Llm, ToolCall, ToolSpec};
 use agentbug_policy::Mode;
@@ -45,6 +45,33 @@ impl Llm for MockLlm {
             tool_calls: vec![],
             model: self.model.clone(),
         }))
+    }
+}
+
+/// Counts `chat_full` calls made through the default trait implementation.
+struct CountingLlm {
+    calls: Mutex<usize>,
+    model: String,
+}
+
+#[async_trait]
+impl Llm for CountingLlm {
+    async fn resolve_model(&self) -> Result<String> {
+        Ok(self.model.clone())
+    }
+
+    async fn chat(
+        &self,
+        _model: &str,
+        _messages: &[ChatMessage],
+        _tools: &[ToolSpec],
+    ) -> Result<ChatResponse> {
+        *self.calls.lock().unwrap() += 1;
+        Ok(ChatResponse {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            model: self.model.clone(),
+        })
     }
 }
 
@@ -2421,4 +2448,44 @@ async fn graceful_termination_precedes_step_cap() {
     let events = store.list_events(session, 100).unwrap();
     assert!(events.iter().any(|e| e.kind == "runner.limit_approaching"));
     assert!(events.iter().any(|e| e.kind == "session.max_steps"));
+}
+
+#[tokio::test]
+async fn inherited_budget_offset_starts_runner_at_parent_step_count() {
+    let store = Store::open(":memory:").unwrap();
+    let llm = Arc::new(CountingLlm {
+        calls: Mutex::new(0),
+        model: "m".into(),
+    });
+    let runner = Runner::new(
+        store.clone(),
+        llm.clone(),
+        ToolRegistry::new(),
+        build_policy(Mode::FullAuto),
+        AgentConfig {
+            mode: Mode::FullAuto,
+            max_steps: 5,
+            ..Default::default()
+        },
+    )
+    .with_budget_inheritance(BudgetInheritance {
+        parent_session_id: "parent-session".into(),
+        steps_offset: 3,
+        tool_calls_offset: 2,
+        network_calls_offset: 1,
+        tokens_offset: 10,
+    });
+
+    assert_eq!(runner.run_goal("child").await.unwrap(), "done");
+    assert_eq!(*llm.calls.lock().unwrap(), 1);
+
+    let session = store.list_sessions(10).unwrap().remove(0);
+    let usage = store.budget_usage(&session.id).unwrap();
+    assert_eq!(usage.steps_used, 4);
+    assert_eq!(usage.tool_calls_used, 2);
+    assert_eq!(usage.network_calls_used, 1);
+    let events = store.list_events(&session.id, 100).unwrap();
+    assert!(events
+        .iter()
+        .any(|e| e.kind == "step.start" && e.message == "step=4"));
 }

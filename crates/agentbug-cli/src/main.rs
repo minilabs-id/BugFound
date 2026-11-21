@@ -219,6 +219,9 @@ enum Commands {
         resume: bool,
         #[arg(long)]
         abort: bool,
+        /// Re-fetch the program brief on resume and verify its content hash
+        #[arg(long, requires = "resume")]
+        revalidate_brief: bool,
     },
 }
 
@@ -1252,6 +1255,7 @@ path = ".agentbug/agentbug.db"
             pause,
             resume,
             abort,
+            revalidate_brief,
         } => {
             let db_path = std::path::PathBuf::from(db.unwrap_or_else(|| cfg.storage.path.clone()));
             if pause {
@@ -1259,7 +1263,14 @@ path = ".agentbug/agentbug.db"
                 println!("engagement {} paused", redact(&id));
             }
             if resume {
-                agentbug_engagement::resume_at(&db_path, &id).context("resume engagement")?;
+                if revalidate_brief {
+                    println!(
+                        "engagement {} revalidation requested; the brief will be re-fetched at the next safe boundary",
+                        redact(&id)
+                    );
+                }
+                agentbug_engagement::resume_at_with_revalidation(&db_path, &id, revalidate_brief)
+                    .context("resume engagement")?;
                 println!("engagement {} resumed", redact(&id));
             }
             if abort {

@@ -127,23 +127,34 @@ recomputed without trusting the report. See `docs/evaluation.md`.
 agentbug engagement --id <id> --status
 agentbug engagement --id <id> --pause
 agentbug engagement --id <id> --resume
+agentbug engagement --id <id> --resume --revalidate-brief
 agentbug engagement --id <id> --abort
 ```
 
 Pass `--db <path>` when the engagement was launched with `engage --db <path>`;
-control commands must point at the same database.
+control commands must point at the same database. `--revalidate-brief` requires
+`--resume`.
 
 - **Pause** writes a durable control state and requests a stop on the runner
   sessions; it takes effect at the next step boundary, not instantaneously. All
   state is persisted. Use it to review findings or tighten scope.
-- **Resume** clears the durable stop flag and sets state back to running. It does
-  **not** re-fetch or re-read the program brief; scope and policy are still
-  re-evaluated before each network action by the tool/runtime gates. If you changed
-  the ROE, re-run from a fresh engagement (or re-import scope manually).
+- **Resume** clears the durable stop flag and sets state back to running. By
+  default it does **not** re-fetch or re-read the program brief; scope and policy
+  are still re-evaluated before each network action by the tool/runtime gates.
+  Add `--revalidate-brief` to explicitly re-fetch the brief at the next safe
+  boundary and compare its SHA-256 content hash against the versioned
+  authorization snapshot. An unchanged hash clears the check (`authorization.revalidated`)
+  and the run continues. A changed hash records `authorization.revalidation_conflict`,
+  pauses the engagement, and permanently blocks that engagement: any later
+  `resume` is refused, so start a new engagement instead. No report is produced
+  under a changed brief. If you changed the ROE without revalidating, re-run from
+  a fresh engagement (or re-import scope manually).
 - **Abort** is terminal: no further tool calls and `resume` refuses an aborted
   engagement. Existing findings, evidence, and any partial report remain available
   for inspection.
 - In the desktop Engagement tab the same actions are buttons next to the state display.
+  The desktop resume button uses the default no-refetch behaviour; brief revalidation
+  is a CLI-only opt-in.
 
 ## 9. Inspect findings and export the report
 
@@ -186,7 +197,12 @@ or submitting it.**
   finding before it is reported. `validate_poc` is a tool, not an authoritative
   gate; operator review remains the final acceptance step.
 - **Not a substitute for authorization.** A program page is a statement of intent,
-  not a legal grant. Confirm you are allowed to test each in-scope asset.
+  not a legal grant. Confirm you are allowed to test each in-scope asset. A plain
+  `resume` never re-reads the brief, so a changed brief is not detected automatically;
+  explicitly opt in with `agentbug engagement --id <id> --resume --revalidate-brief`
+  to verify its content hash. A changed hash pauses and permanently blocks that
+  engagement (no further resume); start a new engagement after reviewing the new
+  brief and ROE.
 - **No OS sandbox / no clustering.** Run on an isolated host, keep egress restricted,
   and prefer `ask` mode unless the engagement explicitly authorizes autonomy.
 - **Replay fidelity.** A replay JSONL (Cochise-style) is required for evaluation,

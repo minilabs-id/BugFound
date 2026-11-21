@@ -345,11 +345,31 @@ pub fn pause_at(db: &Path, engagement_id: &str) -> Result<()> {
 }
 
 pub fn resume_at(db: &Path, engagement_id: &str) -> Result<()> {
+    // Desktop and other callers keep the default no-refetch behaviour; only an
+    // explicit opt-in through `resume_at_with_revalidation` requests a re-fetch.
+    resume_at_with_revalidation(db, engagement_id, false)
+}
+
+/// Resume an engagement, optionally requesting an explicit brief revalidation.
+///
+/// A revalidation is recorded durably and acted on by the engagement task loop
+/// at its next safe boundary. Plain [`resume_at`] never re-fetches the brief.
+pub fn resume_at_with_revalidation(db: &Path, engagement_id: &str, revalidate: bool) -> Result<()> {
     let store = Store::open(db)?;
     if let Some(state) = store.get_engagement_control(engagement_id)? {
         if state == "aborted" {
             return Err(anyhow!("engagement {engagement_id} was aborted"));
         }
+    }
+    if let Some(revalidation) = store.get_authorization_revalidation(engagement_id)? {
+        if revalidation.state == "blocked" {
+            return Err(anyhow!(
+                "engagement {engagement_id} blocked by authorization revalidation conflict; start a new engagement"
+            ));
+        }
+    }
+    if revalidate {
+        store.request_authorization_revalidation(engagement_id)?;
     }
     store.upsert_engagement_control(engagement_id, "running")?;
     notify_in_process(engagement_id, ControlState::Running, true)
@@ -1035,11 +1055,105 @@ async fn run_engagement(
             break;
         }
 
+        // Opt-in brief revalidation. This is the only network re-fetch permitted
+        // after engagement start, and it is driven exclusively by a durable
+        // request row created by `resume_at_with_revalidation(.., true)`.
+        if let Some(revalidation) = store.get_authorization_revalidation(id)? {
+            if revalidation.state == "requested" {
+                let (_refetched_html, refetched_text) = fetch_brief(program_url).await?;
+                let observed_hash = hex_digest(refetched_text.as_bytes());
+                let latest = store.latest_authorization_snapshot(id)?;
+                let baseline_hash = latest
+                    .as_ref()
+                    .map(|snapshot| snapshot.content_hash.as_str())
+                    .unwrap_or("");
+                if observed_hash == baseline_hash {
+                    store.finish_authorization_revalidation(id, "cleared", &observed_hash)?;
+                    trace.record(
+                        store,
+                        "authorization.revalidated",
+                        json!({
+                            "content_hash": observed_hash,
+                            "version": latest.as_ref().map(|snapshot| snapshot.version),
+                        }),
+                    );
+                    emit(
+                        tx,
+                        Some(replay),
+                        EngagementEvent::Action {
+                            tool: "authorization_revalidation".into(),
+                            target: None,
+                            ok: true,
+                            detail: "brief content hash unchanged".into(),
+                        },
+                    );
+                } else {
+                    // Fail closed: no report under a changed brief. This is a
+                    // terminal pause, not an aborted engagement, so a plain
+                    // resume is refused on the next call via the blocked row.
+                    store.finish_authorization_revalidation(id, "blocked", &observed_hash)?;
+                    let _ = store.upsert_engagement_control(id, "paused");
+                    interrupt_engagement_sessions(db_path, id);
+                    update_control(id, |control| control.state = ControlState::Paused);
+                    trace.record(
+                        store,
+                        "authorization.revalidation_conflict",
+                        json!({
+                            "expected_hash": baseline_hash,
+                            "observed_hash": observed_hash,
+                        }),
+                    );
+                    emit(
+                        tx,
+                        Some(replay),
+                        EngagementEvent::Action {
+                            tool: "authorization_revalidation".into(),
+                            target: None,
+                            ok: false,
+                            detail: "brief content hash changed; paused — start a new engagement"
+                                .into(),
+                        },
+                    );
+                    return Ok(profile.clone());
+                }
+            }
+        }
+
         let tools = build_tools(workspace, &profile, &roe, &options)?;
         // TC-4: make the fail-closed method gate observable in the replay log
         // and the event stream so an auditor can see why generic HTTP is gone.
         if !roe.allow_state_change {
             let detail = "ROE forbids state changes: http_request and validate_poc withheld; read-only http_probe and dns_lookup retained";
+            emit(
+                tx,
+                Some(replay),
+                EngagementEvent::Action {
+                    tool: "tool_registry".into(),
+                    target: None,
+                    ok: true,
+                    detail: detail.into(),
+                },
+            );
+            trace.record(
+                store,
+                "action",
+                json!({
+                    "tool": redact("tool_registry"),
+                    "target": Value::Null,
+                    "ok": true,
+                    "detail": redact(detail),
+                }),
+            );
+        }
+        // `active_scan` bundles intrusive fuzzing with network writes and state
+        // changes. Document the fail-closed withholding in the event stream and
+        // replay log, just like the generic state-change gate above.
+        let active_scan_allowed = roe.allow_fuzzing
+            && options.allow_intrusive
+            && options.allow_network_write
+            && roe.allow_state_change;
+        if !active_scan_allowed {
+            let detail = "active_scan withheld: requires brief-permitted fuzzing and state changes plus operator intrusive and network-write opt-ins";
             emit(
                 tx,
                 Some(replay),
@@ -3415,6 +3529,19 @@ fn build_tools(
     for spec in registry.specs() {
         let name = spec.name.to_ascii_lowercase();
         let risk = spec.risk.as_str();
+        // `active_scan` combines intrusive fuzzing, network writes and state
+        // changes in one tool. Register it only when all four gates agree: the
+        // brief must permit fuzzing and state changes, and the operator must opt
+        // in to both intrusive and network-write tools. No LLM/tool flag or
+        // blanket auto-approval can widen this set.
+        if name == "active_scan"
+            && !(roe.allow_fuzzing
+                && options.allow_intrusive
+                && options.allow_network_write
+                && roe.allow_state_change)
+        {
+            continue;
+        }
         // Fuzzing needs both the brief's authorisation and the operator opt-in.
         if name.contains("fuzz") && !(roe.allow_fuzzing && options.allow_intrusive) {
             continue;
@@ -3759,6 +3886,75 @@ No DoS testing. Do not modify data. No disclosure.
     }
 
     #[test]
+    fn active_scan_requires_all_four_gates() {
+        let profile =
+            extract_profile_from_text("In scope:\n- example.com\n", "https://example.com/security");
+        let workspace =
+            std::env::temp_dir().join(format!("agentbug-active-scan-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&workspace);
+        let full_roe = RoePolicy {
+            allow_fuzzing: true,
+            allow_state_change: true,
+            ..RoePolicy::default()
+        };
+        let full_options = EngagementOptions {
+            allow_intrusive: true,
+            allow_network_write: true,
+            ..EngagementOptions::default()
+        };
+        assert!(
+            build_tools(&workspace, &profile, &full_roe, &full_options)
+                .expect("build tools")
+                .get("active_scan")
+                .is_some(),
+            "active_scan must be present when all four gates are satisfied"
+        );
+
+        // Dropping any single gate removes the tool. Blanket auto-approval must
+        // never be able to widen the gate.
+        let cases = [
+            (
+                RoePolicy {
+                    allow_fuzzing: false,
+                    ..full_roe.clone()
+                },
+                full_options.clone(),
+            ),
+            (
+                RoePolicy {
+                    allow_state_change: false,
+                    ..full_roe.clone()
+                },
+                full_options.clone(),
+            ),
+            (
+                full_roe.clone(),
+                EngagementOptions {
+                    allow_intrusive: false,
+                    ..full_options.clone()
+                },
+            ),
+            (
+                full_roe.clone(),
+                EngagementOptions {
+                    allow_network_write: false,
+                    ..full_options.clone()
+                },
+            ),
+        ];
+        for (roe, mut options) in cases {
+            options.auto_approve_all = true;
+            assert!(
+                build_tools(&workspace, &profile, &roe, &options)
+                    .expect("build tools")
+                    .get("active_scan")
+                    .is_none(),
+                "active_scan must be withheld when any gate is closed"
+            );
+        }
+    }
+
+    #[test]
     fn full_auto_denies_intrusive_and_network_write_by_default() {
         let workspace =
             std::env::temp_dir().join(format!("agentbug-roe-denied-{}", std::process::id()));
@@ -3824,6 +4020,45 @@ No DoS testing. Do not modify data. No disclosure.
         assert!(store
             .has_session_flag(&second.id, agentbug_core::STOP_REQUESTED_FLAG)
             .unwrap());
+    }
+
+    #[test]
+    fn revalidation_is_opt_in_and_a_blocked_engagement_cannot_resume() {
+        let db = temp_db("revalidation-resume");
+        let store = Store::open(&db).unwrap();
+        let engagement = store
+            .create_engagement("https://example.com/program")
+            .unwrap();
+        let id = engagement.id;
+
+        // Plain resume never requests a re-fetch.
+        resume_at(&db, &id).unwrap();
+        assert!(store.get_authorization_revalidation(&id).unwrap().is_none());
+
+        // The explicit opt-in records a durable `requested` row.
+        resume_at_with_revalidation(&db, &id, true).unwrap();
+        let row = store
+            .get_authorization_revalidation(&id)
+            .unwrap()
+            .expect("revalidation row");
+        assert_eq!(row.state, "requested");
+
+        // A conflict permanently blocks the engagement, including plain resume.
+        store
+            .finish_authorization_revalidation(&id, "blocked", "changed-hash")
+            .unwrap();
+        let error = resume_at(&db, &id).unwrap_err().to_string();
+        assert!(
+            error.contains("blocked by authorization revalidation conflict"),
+            "unexpected error: {error}"
+        );
+        let error = resume_at_with_revalidation(&db, &id, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("start a new engagement"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

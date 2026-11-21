@@ -4,7 +4,7 @@
 //! one opaque prompt string from `BountyDomain`.
 
 use crate::{build_role_tools, role_profile, BountyDomain, RoleId};
-use agentbug_core::{build_policy_config, request_stop, AgentConfig, Runner};
+use agentbug_core::{build_policy_config, request_stop, AgentConfig, BudgetInheritance, Runner};
 use agentbug_llm::Llm;
 use agentbug_policy::PolicyConfig;
 use agentbug_store::Store;
@@ -141,12 +141,89 @@ impl Tool for HandoffTool {
             return Ok(reject("max_children"));
         }
 
+        let parent_usage = self.store.budget_usage(&parent.id)?;
+        let parent_tokens = self.store.token_usage_total(&parent.id)?;
+
+        // A zero cap means "inherit/unlimited" in AgentConfig, so pick the
+        // first configured cap the same way the runner's effective_* helpers do.
+        let parent_step_cap = [
+            self.agent.max_steps,
+            self.agent.budgets.max_steps,
+            self.agent.budget.max_steps,
+            self.agent.rate_limits.max_steps,
+            self.agent.rate_limit.max_steps,
+        ]
+        .into_iter()
+        .find(|cap| *cap > 0)
+        .unwrap_or(0);
+        let parent_tool_cap = [
+            self.agent.max_tool_calls,
+            self.agent.budgets.max_tool_calls,
+            self.agent.budget.max_tool_calls,
+            self.agent.rate_limits.max_tool_calls,
+            self.agent.rate_limit.max_tool_calls,
+        ]
+        .into_iter()
+        .find(|cap| *cap > 0)
+        .unwrap_or(0);
+        let parent_network_cap = [
+            self.agent.max_network_calls,
+            self.agent.budgets.max_network_calls,
+            self.agent.budget.max_network_calls,
+            self.agent.rate_limits.max_network_calls,
+            self.agent.rate_limit.max_network_calls,
+        ]
+        .into_iter()
+        .find(|cap| *cap > 0)
+        .unwrap_or(0);
+        let parent_token_cap = [
+            self.agent.max_estimated_tokens,
+            self.agent.budgets.max_tokens,
+            self.agent.budget.max_tokens,
+            self.agent.rate_limits.max_tokens,
+            self.agent.rate_limit.max_tokens,
+        ]
+        .into_iter()
+        .find(|cap| *cap > 0)
+        .unwrap_or(0);
+        if (parent_step_cap > 0 && parent_usage.steps_used >= parent_step_cap)
+            || (parent_tool_cap > 0 && parent_usage.tool_calls_used >= parent_tool_cap)
+            || (parent_network_cap > 0 && parent_usage.network_calls_used >= parent_network_cap)
+            || (parent_token_cap > 0 && parent_tokens as u64 >= parent_token_cap)
+        {
+            return Ok(reject("parent budget exhausted"));
+        }
+
         let profile = role_profile(role);
         let child_tools = build_role_tools(&self.base_tools, role);
         let mut child_agent = self.agent.clone();
-        child_agent.max_steps = profile.max_steps;
-        if profile.max_tool_calls > 0 {
+        // Only ever clamp downwards from the parent config, which is already
+        // ROE-clamped; a role cap can therefore never widen the ROE ceiling.
+        child_agent.max_steps = if parent_step_cap > 0 {
+            profile
+                .max_steps
+                .min(parent_step_cap.saturating_sub(parent_usage.steps_used))
+        } else {
+            profile.max_steps
+        };
+        if parent_tool_cap > 0 {
+            let remaining = parent_tool_cap.saturating_sub(parent_usage.tool_calls_used);
+            child_agent.max_tool_calls = if profile.max_tool_calls > 0 {
+                profile.max_tool_calls.min(remaining)
+            } else {
+                remaining
+            };
+        } else if profile.max_tool_calls > 0 {
             child_agent.max_tool_calls = profile.max_tool_calls;
+        }
+        if parent_network_cap > 0 {
+            // An explicit child cap takes precedence over inherited budgets.
+            child_agent.max_network_calls =
+                parent_network_cap.saturating_sub(parent_usage.network_calls_used);
+        }
+        if parent_token_cap > 0 {
+            child_agent.max_estimated_tokens =
+                parent_token_cap.saturating_sub(parent_tokens as u64);
         }
         child_agent.auto_approve_tools.clear();
 
@@ -177,7 +254,14 @@ impl Tool for HandoffTool {
             scope_key: self.memory_scope_key.clone(),
             parent_session_id: Some(parent.id.clone()),
             task_id: None,
-        }));
+        }))
+        .with_budget_inheritance(BudgetInheritance {
+            parent_session_id: parent.id.clone(),
+            steps_offset: parent_usage.steps_used,
+            tool_calls_offset: parent_usage.tool_calls_used,
+            network_calls_offset: parent_usage.network_calls_used,
+            tokens_offset: parent_tokens,
+        });
 
         let outcome = tokio::time::timeout(CHILD_TIMEOUT, child_runner.run_goal(&child_goal)).await;
         let (status, text) = match outcome {

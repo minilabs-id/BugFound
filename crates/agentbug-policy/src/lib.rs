@@ -145,6 +145,35 @@ impl ScopeConfig {
             || t_raw.starts_with(&format!("{p}/"))
     }
 
+    /// Number of host labels in a scope rule, ignoring any path. Used to
+    /// compare how specific two matching rules are.
+    fn specificity(rule: &str) -> usize {
+        let host = rule
+            .split("://")
+            .last()
+            .unwrap_or(rule)
+            .split('/')
+            .next()
+            .unwrap_or(rule);
+        host.trim_start_matches("*.")
+            .trim_matches('.')
+            .split('.')
+            .filter(|part| !part.is_empty())
+            .count()
+    }
+
+    /// A path-scoped exclusion (e.g. `clockify.me/help/*`) must not exclude a
+    /// bare host target: that is broader than the rule intends.
+    fn is_path_scoped_exclusion(rule: &str) -> bool {
+        rule.contains('/')
+            && rule
+                .split('/')
+                .next()
+                .unwrap_or_default()
+                .parse::<std::net::IpAddr>()
+                .is_err()
+    }
+
     pub fn check_target(&self, target: &str) -> (bool, String) {
         if target.trim().is_empty() {
             return (false, "empty target".to_string());
@@ -152,6 +181,7 @@ impl ScopeConfig {
         let out_matches: Vec<&String> = self
             .out_of_scope
             .iter()
+            .filter(|rule| !Self::is_path_scoped_exclusion(rule))
             .filter(|rule| Self::matches(rule, target))
             .collect();
         if self.in_scope.is_empty() {
@@ -171,16 +201,21 @@ impl ScopeConfig {
         // A program may list a concrete asset as in-scope while also excluding
         // a broad wildcard subdomain. The more specific, explicitly named asset
         // wins; an out-of-scope wildcard alone never overrides it.
-        let exact_in = in_matches.iter().find(|rule| !rule.contains('*'));
-        if let Some(exact) = exact_in {
-            if !out_matches.is_empty() && out_matches.iter().all(|rule| rule.contains('*')) {
-                return (
-                    true,
-                    format!(
-                        "target '{target}' allowed by explicit in-scope asset '{exact}' despite broader out-of-scope wildcard"
-                    ),
-                );
-            }
+        let winning_in = in_matches.iter().find(|in_rule| {
+            let in_labels = Self::specificity(in_rule);
+            let in_exact = !in_rule.contains('*');
+            !out_matches.is_empty()
+                && out_matches.iter().all(|out_rule| {
+                    out_rule.contains('*') && (in_exact || in_labels > Self::specificity(out_rule))
+                })
+        });
+        if let Some(winner) = winning_in {
+            return (
+                true,
+                format!(
+                    "target '{target}' allowed by more specific in-scope asset '{winner}' despite broader out-of-scope wildcard"
+                ),
+            );
         }
         if let Some(rule) = out_matches.first() {
             return (
@@ -755,5 +790,31 @@ mod provenance_tests {
         // A real CIDR still behaves as a CIDR.
         assert!(ScopeConfig::matches("10.1.2.0/24", "10.1.2.3"));
         assert!(!ScopeConfig::matches("10.1.2.0/24", "11.0.0.1"));
+    }
+
+    #[test]
+    fn path_scoped_exclusion_does_not_block_specific_host() {
+        let scope = ScopeConfig {
+            in_scope: vec!["*.api.clockify.me/api/".to_string()],
+            out_of_scope: vec![
+                "clockify.me/help/*".to_string(),
+                "*.clockify.me".to_string(),
+            ],
+            engagement: None,
+            notes: None,
+        };
+        let (ok, reason) = scope.check_target("api.clockify.me");
+        assert!(ok, "{reason}");
+        // A genuinely excluded subdomain stays excluded.
+        let (ok, _) = scope.check_target("nope.clockify.me");
+        assert!(!ok);
+        // An exact out-of-scope host still wins over a wildcard in-scope rule.
+        let strict = ScopeConfig {
+            in_scope: vec!["*.example.com".to_string()],
+            out_of_scope: vec!["admin.example.com".to_string()],
+            engagement: None,
+            notes: None,
+        };
+        assert!(!strict.check_target("admin.example.com").0);
     }
 }

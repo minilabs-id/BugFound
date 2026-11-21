@@ -324,6 +324,14 @@ struct FileConfig {
     network: NetworkFile,
     #[serde(default)]
     external_tools: ExternalFile,
+    #[serde(default)]
+    oob: OobFile,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+struct OobFile {
+    /// Loopback admin endpoint of `agentbug-collaborator`.
+    endpoint: Option<String>,
 }
 
 impl FileConfig {
@@ -717,6 +725,7 @@ fn engagement_options(cfg: &FileConfig) -> agentbug_engagement::EngagementOption
         allow_network_write: cfg.network.allow_network_write,
         allow_intrusive: cfg.network.allow_intrusive,
         auto_approve_all: cfg.agent.auto_approve_all,
+        oob_endpoint: cfg.oob.endpoint.clone(),
     }
 }
 

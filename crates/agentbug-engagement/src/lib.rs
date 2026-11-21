@@ -119,6 +119,8 @@ pub struct EngagementOptions {
     pub allow_network_write: bool,
     pub allow_intrusive: bool,
     pub auto_approve_all: bool,
+    /// Optional external Collaborator admin endpoint (loopback only).
+    pub oob_endpoint: Option<String>,
 }
 
 impl Default for EngagementOptions {
@@ -133,6 +135,7 @@ impl Default for EngagementOptions {
             allow_network_write: false,
             allow_intrusive: false,
             auto_approve_all: false,
+            oob_endpoint: None,
         }
     }
 }
@@ -1341,7 +1344,15 @@ async fn run_engagement(
         let discovered = feedback_prompt(store, id);
         let goal = format!(
             "engagement_id={id}\n{}\n\nScope reminder: {scope_reminder}\n\
-             Use the available tools to gather evidence. Return findings and evidence in your final answer. \
+             Tool guidance (already registered; do not call tool_registry repeatedly): \
+             http_probe(url) is the read-only HTTP recon tool. State-changing http_request and \
+             active_scan are intentionally withheld unless the brief and operator opt-ins allow them. \
+             enumerate_insertion_points(url,method,headers,cookies,body) lists url/form/cookie/header/path \
+             parameters with byte offsets before you probe inputs. http_diff(a,b) compares two captured \
+             responses. decode(operation,input) handles url/base64/hex. sequencer(tokens) assesses token \
+             randomness. collaborator start/fetch provides an OOB oracle (external only when configured). \
+             Every network tool call with an explicit target records coverage automatically. \
+             Use session_finish when the playbook is done. Return findings and evidence in your final answer. \
              Do not submit anything to any external system.{discovered}",
             task.statement
         );
@@ -1361,6 +1372,10 @@ async fn run_engagement(
             task_coverage += store.coverage_count(&session.id).unwrap_or(0);
             if let Ok(rows) = store.list_coverage(&session.id) {
                 for row in rows {
+                    // Reports read coverage keyed by the engagement id, while
+                    // runners record it on their own session id. Mirror the
+                    // row so coverage is visible in reports and status.
+                    let _ = store.record_coverage(id, &row.target, &row.method, &row.path);
                     let _ = store.record_coverage_decision(agentbug_store::CoverageDecision {
                         session_id: id,
                         target: &row.target,
@@ -3679,6 +3694,7 @@ fn build_tools(
         auto_detect_external: false,
         user_agent: roe.ua_marker.clone().or(legacy_ua),
         max_rps: roe.max_rps.or(legacy_rps),
+        oob_endpoint: options.oob_endpoint.clone(),
         ..Default::default()
     };
     let registry = try_default_registry_with_options(workspace, tool_options)?;
@@ -3926,6 +3942,7 @@ No DoS testing. Do not modify data. No disclosure.
             allow_network_write: true,
             allow_intrusive: false,
             auto_approve_all: false,
+            oob_endpoint: None,
         };
         let config = agent_config(
             &options,

@@ -309,6 +309,7 @@ fn engagement_options(
         allow_network_write: config.network.allow_network_write,
         allow_intrusive: config.network.allow_intrusive,
         auto_approve_all: config.agent.auto_approve_all,
+        oob_endpoint: None,
     }
 }
 

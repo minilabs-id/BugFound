@@ -866,11 +866,15 @@ allow_intrusive = false
 [storage]
 path = ".agentbug/agentbug.db"
 
-# Optional gated browser adapter. Install with:
-#   npm install eval/fixtures/browser && npx playwright install chromium
+# Optional gated browser adapters (choose one). Config-only; never auto-enabled.
+# Google Chrome DevTools MCP (no extension, CDP based) - recommended:
+#   npm install eval/fixtures/chrome-mcp
 # [external_tools]
 # enabled = true
 # [external_tools.commands]
+# chrome_mcp = "cmd /c /path/to/agentbug/eval/fixtures/chrome-mcp/chrome-mcp-wrapper.cmd {action} {url} {selector}"
+# Playwright fallback (also supported):
+#   npm install eval/fixtures/browser && npx playwright install chromium
 # playwright = "node /path/to/agentbug/eval/fixtures/browser/playwright-wrapper.js {action} {url} {selector}"
 "#;
 

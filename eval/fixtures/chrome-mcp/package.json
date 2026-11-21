@@ -1,0 +1,9 @@
+﻿{
+  "name": "agentbug-chrome-devtools-mcp",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Google chrome-devtools-mcp CLI backend for AgentBug browser tool.",
+  "dependencies": {
+    "chrome-devtools-mcp": "^1.13.0"
+  }
+}

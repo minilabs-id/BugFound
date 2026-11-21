@@ -3956,7 +3956,7 @@ pub fn try_default_registry_with_options(
         description: "Gated CLI adapter that forwards browser actions to a configured Playwright CLI (navigate/click/screenshot); NOT full browser automation. Requires an explicit external_commands entry and is gated when unavailable.",
         risk: "network",
         required: &["url", "action"],
-        commands: &["playwright"],
+        commands: &["chrome_mcp", "playwright", "chrome"],
         registry: reg.clone(),
     }));
     Ok(reg)
@@ -4079,7 +4079,15 @@ fn register_external_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &Tool
 /// Command-driven adapters are gated solely by `external_commands`: providing
 /// a command is the explicit opt-in, independent of `enable_external_tools`.
 fn register_command_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &ToolOptions) {
-    for name in ["nmap", "naabu", "nuclei", "playwright", "ffuf", "katana"] {
+    for name in [
+        "nmap",
+        "naabu",
+        "nuclei",
+        "playwright",
+        "chrome",
+        "ffuf",
+        "katana",
+    ] {
         let Some(command) = options.external_commands.get(name) else {
             continue;
         };

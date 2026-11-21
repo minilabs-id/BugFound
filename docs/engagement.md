@@ -349,6 +349,30 @@ ROE gates; providing a binary is **not** an authorization bypass. If the
 binary is unavailable the tool returns a structured gated result instead of
 failing silently.
 
+### Browser backend
+
+The preferred browser backend is Google's `chrome-devtools-mcp` CLI. It speaks
+Chrome DevTools Protocol directly — no browser extension and no AutoGLM-style
+service. Install it as a tracked dependency:
+
+```sh
+npm install eval/fixtures/chrome-mcp
+```
+
+Register the wrapper in config (the MCP backend is tried first):
+
+```toml
+[external_tools]
+enabled = true
+[external_tools.commands]
+chrome_mcp = "cmd /c /path/to/agentbug/eval/fixtures/chrome-mcp/chrome-mcp-wrapper.cmd {action} {url} {selector}"
+```
+
+The wrapper supports `navigate` (returns a page snapshot), `screenshot` and a
+restricted CSS-selector `click`. Playwright remains available as an optional
+fallback backend. Google's server prints a one-time data-collection disclaimer;
+pass `--no-usage-statistics` in the wrapper if the operator opts out.
+
 ## External OOB collaborator
 
 The `collaborator` tool defaults to a loopback-only simulation. To use a real

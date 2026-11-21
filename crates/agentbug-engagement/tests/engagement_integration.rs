@@ -1,8 +1,8 @@
 use agentbug_engagement::{
     cvss_base, engage_with_local_brief_tx_and_roe, engage_with_local_brief_tx_and_roe_and_loop,
     extract_profile_from_text, normalize_scope_pattern, parse_roe, roe_classify, roe_overrides,
-    roe_unparsed_constraints, search_round_tasks, wstg_playbooks, EngagementEvent,
-    EngagementLoopOptions, EngagementOptions, EngagementRoeOptions, RoePolicyMode,
+    roe_unparsed_constraints, wstg_playbooks, EngagementEvent, EngagementLoopOptions,
+    EngagementOptions, EngagementRoeOptions, RoePolicyMode,
 };
 use agentbug_policy::Mode;
 use agentbug_store::Store;

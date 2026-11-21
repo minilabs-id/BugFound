@@ -310,6 +310,7 @@ fn engagement_options(
         allow_intrusive: config.network.allow_intrusive,
         auto_approve_all: config.agent.auto_approve_all,
         oob_endpoint: None,
+        trusted_local_targets: Vec::new(),
     }
 }
 

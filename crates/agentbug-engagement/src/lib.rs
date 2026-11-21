@@ -121,6 +121,8 @@ pub struct EngagementOptions {
     pub auto_approve_all: bool,
     /// Optional external Collaborator admin endpoint (loopback only).
     pub oob_endpoint: Option<String>,
+    /// Loopback hosts explicitly trusted by the operator (offline lab only).
+    pub trusted_local_targets: Vec<String>,
 }
 
 impl Default for EngagementOptions {
@@ -136,6 +138,7 @@ impl Default for EngagementOptions {
             allow_intrusive: false,
             auto_approve_all: false,
             oob_endpoint: None,
+            trusted_local_targets: Vec::new(),
         }
     }
 }
@@ -3818,7 +3821,6 @@ fn build_tools(
     let tool_options = ToolOptions {
         allow_proxy: false,
         proxy_url: None,
-        trusted_local_targets: Vec::new(),
         enable_external_tools,
         external_commands,
         scope_in: profile.scope.in_scope.clone(),
@@ -3827,6 +3829,7 @@ fn build_tools(
         user_agent: roe.ua_marker.clone().or(legacy_ua),
         max_rps: roe.max_rps.or(legacy_rps),
         oob_endpoint: options.oob_endpoint.clone(),
+        trusted_local_targets: options.trusted_local_targets.clone(),
         ..Default::default()
     };
     let registry = try_default_registry_with_options(workspace, tool_options)?;
@@ -4116,6 +4119,7 @@ Fuzzing is authorized.
             allow_intrusive: false,
             auto_approve_all: false,
             oob_endpoint: None,
+            trusted_local_targets: Vec::new(),
         };
         let config = agent_config(
             &options,

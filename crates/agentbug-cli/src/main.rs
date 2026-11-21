@@ -731,6 +731,7 @@ fn engagement_options(cfg: &FileConfig) -> agentbug_engagement::EngagementOption
         allow_intrusive: cfg.network.allow_intrusive,
         auto_approve_all: cfg.agent.auto_approve_all,
         oob_endpoint: cfg.oob.endpoint.clone(),
+        trusted_local_targets: cfg.network.trusted_local_targets.clone(),
     }
 }
 

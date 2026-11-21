@@ -186,6 +186,35 @@ platform and brief-only runs keep the strict defaults. Changing the mode does no
 retroactively alter a running or finished engagement — start a new engagement to
 apply it.
 
+### Bounded search rounds
+
+AgentBug keeps searching the playbook queue from different angles until its
+operator-configured round budget is exhausted; it then writes the local report.
+The cap is an `[agent]` config field, not a CLI flag, and is never derived from
+`auto_approve_all`, the run `mode`, tool output, or any LLM value:
+
+```toml
+[agent]
+# Default: one pass (the original behavior). Valid range: 1..=10.
+max_rounds = 1
+```
+
+Round 1 runs every unfinished playbook exactly as before. Later rounds revisit
+only playbooks that are `needs-review` or `failed`, plus playbooks that still
+have an open hypothesis from earlier clues; `done` and `completed` playbooks are
+never replayed. Each later round adds an explicit instruction to attack a
+different parameter class, method (where allowed), asset or browser snapshot,
+and to reuse earlier feedback rather than repeat identical probes. All scope,
+tool/method, ROE, verification and evidence gates remain in force on every
+round, and rounds are bounded by the same budgets as a single pass. There is
+no submission step at any point.
+
+Each round emits a `search.round` trace row (`round`, `max_rounds`,
+`retried_tasks`) and a `search_round` action event. A playbook that remains
+`needs-review` after the final round stays that way and is reflected in the
+report (`Search rounds: N of M`, under Methodology) and in the `incomplete`
+outcome. Read-only platform and brief-only runs do not execute a search loop.
+
 ### Desktop
 
 Open `start-desktop.bat` and select the **Engagement** tab. Paste the program URL,
@@ -203,6 +232,7 @@ The Engagement tab and the trace log show a stream of events. Typical kinds incl
 | `run_start` | Run boundary; carries `run_id` for reproducibility. |
 | `brief.ingested` / `brief.extracted` | Program page snapshot and scope/ROE extraction result. |
 | `action` | A tool call with `tool`, `target`, `ok` and redacted detail. |
+| `search.round` | One bounded search round: `round`, `max_rounds` and the retried playbook ids. |
 | `finding` | A deduplicated finding with `id`, `type`, `cwe` and verifier verdict. |
 | `verifier` | Deterministic verdict over tool-captured bytes + canary (not LLM fields). |
 | `usage` | Real API `prompt_tokens` / `completion_tokens` for the run. |

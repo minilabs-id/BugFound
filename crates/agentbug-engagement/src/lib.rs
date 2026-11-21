@@ -186,6 +186,22 @@ pub struct EngagementPlatformOptions {
     pub api_key_env: Option<String>,
 }
 
+/// Bounded search-loop setting, kept separate from [`EngagementOptions`] so
+/// existing callers that construct that struct exhaustively (desktop) keep
+/// compiling. The default of one round preserves the previous single-pass
+/// behavior exactly. Like [`EngagementRoeOptions`], this is a config-only knob:
+/// it cannot be changed by the LLM, tools, approvals or `auto_approve_all`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngagementLoopOptions {
+    pub max_rounds: usize,
+}
+
+impl Default for EngagementLoopOptions {
+    fn default() -> Self {
+        Self { max_rounds: 1 }
+    }
+}
+
 /// Typed rules of engagement parsed from the *full* brief text. Every flag is
 /// fail-closed: fuzzing, state changes and disclosure are denied unless the
 /// brief explicitly authorises them.
@@ -253,6 +269,30 @@ pub fn engage_with_options_and_roe(
     roe_options: EngagementRoeOptions,
     tx: Sender<EngagementEvent>,
 ) -> Result<EngagementProfile> {
+    engage_with_options_and_loop(
+        program_url,
+        workspace,
+        db_path,
+        options,
+        roe_options,
+        EngagementLoopOptions::default(),
+        tx,
+    )
+}
+
+/// Start an engagement with explicit operator, ROE-policy and bounded search-loop
+/// options. `max_rounds` only controls how many times the playbook queue is
+/// revisited; it never relaxes scope, tool, method, verification or reporting
+/// gates, and it cannot trigger a submission.
+pub fn engage_with_options_and_loop(
+    program_url: &str,
+    workspace: &Path,
+    db_path: &Path,
+    options: EngagementOptions,
+    roe_options: EngagementRoeOptions,
+    loop_options: EngagementLoopOptions,
+    tx: Sender<EngagementEvent>,
+) -> Result<EngagementProfile> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -265,6 +305,7 @@ pub fn engage_with_options_and_roe(
         false,
         options,
         roe_options,
+        loop_options,
         EngagementPlatformOptions::default(),
         BriefSource::Url,
     ))
@@ -322,6 +363,29 @@ pub fn engage_with_local_brief_tx_and_roe(
     roe_options: EngagementRoeOptions,
     tx: Sender<EngagementEvent>,
 ) -> Result<String> {
+    engage_with_local_brief_tx_and_roe_and_loop(
+        db,
+        workspace,
+        brief_text,
+        options,
+        roe_options,
+        EngagementLoopOptions::default(),
+        tx,
+    )
+}
+
+/// Local-brief variant with explicit bounded search-loop options. Offline and
+/// deterministic: `max_rounds` only revisits unfinished playbooks from a
+/// different angle and never submits or relaxes a gate.
+pub fn engage_with_local_brief_tx_and_roe_and_loop(
+    db: &Path,
+    workspace: &Path,
+    brief_text: &str,
+    options: EngagementOptions,
+    roe_options: EngagementRoeOptions,
+    loop_options: EngagementLoopOptions,
+    tx: Sender<EngagementEvent>,
+) -> Result<String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -334,6 +398,7 @@ pub fn engage_with_local_brief_tx_and_roe(
         false,
         options,
         roe_options,
+        loop_options,
         EngagementPlatformOptions::default(),
         BriefSource::LocalText(brief_text.to_string()),
     ))?;
@@ -377,6 +442,7 @@ pub fn engage_brief_only_with_options(
         true,
         options,
         EngagementRoeOptions::default(),
+        EngagementLoopOptions::default(),
         EngagementPlatformOptions::default(),
         BriefSource::Url,
     ))
@@ -406,6 +472,7 @@ pub fn engage_with_platform(
         false,
         options,
         EngagementRoeOptions::default(),
+        EngagementLoopOptions::default(),
         platform_options,
         BriefSource::Url,
     ))
@@ -432,6 +499,7 @@ pub fn engage_brief_only_with_platform(
         true,
         options,
         EngagementRoeOptions::default(),
+        EngagementLoopOptions::default(),
         platform_options,
         BriefSource::Url,
     ))
@@ -859,6 +927,7 @@ async fn engage_async(
     brief_only: bool,
     options: EngagementOptions,
     roe_options: EngagementRoeOptions,
+    loop_options: EngagementLoopOptions,
     platform_options: EngagementPlatformOptions,
     brief_source: BriefSource,
 ) -> Result<EngagementProfile> {
@@ -924,6 +993,7 @@ async fn engage_async(
                 "allow_network_write": options.allow_network_write,
                 "allow_intrusive": options.allow_intrusive,
                 "auto_approve_all": options.auto_approve_all,
+                "max_rounds": loop_options.max_rounds,
             }
         }),
     );
@@ -940,6 +1010,7 @@ async fn engage_async(
         brief_only,
         options,
         roe_options,
+        loop_options,
         platform_options,
         brief_source,
     )
@@ -980,6 +1051,7 @@ async fn run_engagement(
     brief_only: bool,
     options: EngagementOptions,
     roe_options: EngagementRoeOptions,
+    loop_options: EngagementLoopOptions,
     platform_options: EngagementPlatformOptions,
     brief_source: BriefSource,
 ) -> Result<EngagementProfile> {
@@ -1391,204 +1463,255 @@ async fn run_engagement(
     // persisted by core. No LLM-supplied request/response participates.
     let mut evidence_hashes: HashMap<String, String> = HashMap::new();
 
-    for task in store.list_tasks(id)? {
-        if task.status == "done" || task.status == "completed" {
-            continue;
-        }
-        if !wait_while_paused(db_path, id) {
-            break;
-        }
+    // Bounded search loop. `max_rounds` is the only extra work multiplier; every
+    // existing per-task budget, gate and verifier still applies on every round.
+    // A zero value from a programmatic caller is normalised to one round.
+    let max_rounds = loop_options.max_rounds.max(1);
+    let mut rounds_run = 0usize;
+    'rounds: for round in 1..=max_rounds {
+        let round_tasks = search_round_tasks(store, id, round)?;
+        // Round 1 is the original single pass, so nothing is a "retry" yet.
+        let retried_tasks: Vec<String> = if round == 1 {
+            Vec::new()
+        } else {
+            round_tasks
+                .iter()
+                .map(|task| task.playbook_id.clone())
+                .collect()
+        };
+        trace.record(
+            store,
+            "search.round",
+            json!({
+                "round": round,
+                "max_rounds": max_rounds,
+                "retried_tasks": retried_tasks,
+            }),
+        );
+        emit(
+            tx,
+            Some(replay),
+            EngagementEvent::Action {
+                tool: "search_round".into(),
+                target: None,
+                ok: true,
+                detail: format!(
+                    "search round {round}/{max_rounds}: {} playbook(s) selected",
+                    round_tasks.len()
+                ),
+            },
+        );
+        rounds_run = round;
 
-        // Opt-in brief revalidation. This is the only network re-fetch permitted
-        // after engagement start, and it is driven exclusively by a durable
-        // request row created by `resume_at_with_revalidation(.., true)`.
-        if let Some(revalidation) = store.get_authorization_revalidation(id)? {
-            if revalidation.state == "requested" {
-                // A local brief has no network source to re-fetch; the supplied
-                // bytes remain the authority, so the observed hash is unchanged
-                // and revalidation clears without any network access.
-                let (_refetched_html, refetched_text) = match &brief_source {
-                    BriefSource::Url => {
-                        fetch_engagement_brief(
-                            platform_options.platform,
-                            platform_options.api_key_env.as_deref(),
-                            program_url,
-                        )
-                        .await?
+        for task in round_tasks {
+            if !wait_while_paused(db_path, id) {
+                break 'rounds;
+            }
+
+            // Opt-in brief revalidation. This is the only network re-fetch permitted
+            // after engagement start, and it is driven exclusively by a durable
+            // request row created by `resume_at_with_revalidation(.., true)`.
+            if let Some(revalidation) = store.get_authorization_revalidation(id)? {
+                if revalidation.state == "requested" {
+                    // A local brief has no network source to re-fetch; the supplied
+                    // bytes remain the authority, so the observed hash is unchanged
+                    // and revalidation clears without any network access.
+                    let (_refetched_html, refetched_text) = match &brief_source {
+                        BriefSource::Url => {
+                            fetch_engagement_brief(
+                                platform_options.platform,
+                                platform_options.api_key_env.as_deref(),
+                                program_url,
+                            )
+                            .await?
+                        }
+                        BriefSource::LocalText(text) => (text.clone(), text.clone()),
+                    };
+                    let observed_hash = hex_digest(refetched_text.as_bytes());
+                    let latest = store.latest_authorization_snapshot(id)?;
+                    let baseline_hash = latest
+                        .as_ref()
+                        .map(|snapshot| snapshot.content_hash.as_str())
+                        .unwrap_or("");
+                    if observed_hash == baseline_hash {
+                        store.finish_authorization_revalidation(id, "cleared", &observed_hash)?;
+                        trace.record(
+                            store,
+                            "authorization.revalidated",
+                            json!({
+                                "content_hash": observed_hash,
+                                "version": latest.as_ref().map(|snapshot| snapshot.version),
+                            }),
+                        );
+                        emit(
+                            tx,
+                            Some(replay),
+                            EngagementEvent::Action {
+                                tool: "authorization_revalidation".into(),
+                                target: None,
+                                ok: true,
+                                detail: "brief content hash unchanged".into(),
+                            },
+                        );
+                    } else {
+                        // Fail closed: no report under a changed brief. This is a
+                        // terminal pause, not an aborted engagement, so a plain
+                        // resume is refused on the next call via the blocked row.
+                        store.finish_authorization_revalidation(id, "blocked", &observed_hash)?;
+                        let _ = store.upsert_engagement_control(id, "paused");
+                        interrupt_engagement_sessions(db_path, id);
+                        update_control(id, |control| control.state = ControlState::Paused);
+                        trace.record(
+                            store,
+                            "authorization.revalidation_conflict",
+                            json!({
+                                "expected_hash": baseline_hash,
+                                "observed_hash": observed_hash,
+                            }),
+                        );
+                        emit(
+                            tx,
+                            Some(replay),
+                            EngagementEvent::Action {
+                                tool: "authorization_revalidation".into(),
+                                target: None,
+                                ok: false,
+                                detail:
+                                    "brief content hash changed; paused — start a new engagement"
+                                        .into(),
+                            },
+                        );
+                        return Ok(profile.clone());
                     }
-                    BriefSource::LocalText(text) => (text.clone(), text.clone()),
-                };
-                let observed_hash = hex_digest(refetched_text.as_bytes());
-                let latest = store.latest_authorization_snapshot(id)?;
-                let baseline_hash = latest
-                    .as_ref()
-                    .map(|snapshot| snapshot.content_hash.as_str())
-                    .unwrap_or("");
-                if observed_hash == baseline_hash {
-                    store.finish_authorization_revalidation(id, "cleared", &observed_hash)?;
-                    trace.record(
-                        store,
-                        "authorization.revalidated",
-                        json!({
-                            "content_hash": observed_hash,
-                            "version": latest.as_ref().map(|snapshot| snapshot.version),
-                        }),
-                    );
-                    emit(
-                        tx,
-                        Some(replay),
-                        EngagementEvent::Action {
-                            tool: "authorization_revalidation".into(),
-                            target: None,
-                            ok: true,
-                            detail: "brief content hash unchanged".into(),
-                        },
-                    );
-                } else {
-                    // Fail closed: no report under a changed brief. This is a
-                    // terminal pause, not an aborted engagement, so a plain
-                    // resume is refused on the next call via the blocked row.
-                    store.finish_authorization_revalidation(id, "blocked", &observed_hash)?;
-                    let _ = store.upsert_engagement_control(id, "paused");
-                    interrupt_engagement_sessions(db_path, id);
-                    update_control(id, |control| control.state = ControlState::Paused);
-                    trace.record(
-                        store,
-                        "authorization.revalidation_conflict",
-                        json!({
-                            "expected_hash": baseline_hash,
-                            "observed_hash": observed_hash,
-                        }),
-                    );
-                    emit(
-                        tx,
-                        Some(replay),
-                        EngagementEvent::Action {
-                            tool: "authorization_revalidation".into(),
-                            target: None,
-                            ok: false,
-                            detail: "brief content hash changed; paused — start a new engagement"
-                                .into(),
-                        },
-                    );
-                    return Ok(profile.clone());
                 }
             }
-        }
 
-        let tools = build_tools(workspace, &profile, &roe, &options)?;
-        // TC-4: make the fail-closed method gate observable in the replay log
-        // and the event stream so an auditor can see why generic HTTP is gone.
-        if !roe.allow_state_change {
-            let detail = "ROE forbids state changes: http_request and validate_poc withheld; read-only http_probe and dns_lookup retained";
-            emit(
-                tx,
-                Some(replay),
-                EngagementEvent::Action {
-                    tool: "tool_registry".into(),
-                    target: None,
-                    ok: true,
-                    detail: detail.into(),
+            let tools = build_tools(workspace, &profile, &roe, &options)?;
+            // TC-4: make the fail-closed method gate observable in the replay log
+            // and the event stream so an auditor can see why generic HTTP is gone.
+            if !roe.allow_state_change {
+                let detail = "ROE forbids state changes: http_request and validate_poc withheld; read-only http_probe and dns_lookup retained";
+                emit(
+                    tx,
+                    Some(replay),
+                    EngagementEvent::Action {
+                        tool: "tool_registry".into(),
+                        target: None,
+                        ok: true,
+                        detail: detail.into(),
+                    },
+                );
+                trace.record(
+                    store,
+                    "action",
+                    json!({
+                        "tool": redact("tool_registry"),
+                        "target": Value::Null,
+                        "ok": true,
+                        "detail": redact(detail),
+                    }),
+                );
+            }
+            // `active_scan` bundles intrusive fuzzing with network writes and state
+            // changes. Document the fail-closed withholding in the event stream and
+            // replay log, just like the generic state-change gate above.
+            let active_scan_allowed = roe.allow_fuzzing
+                && options.allow_intrusive
+                && options.allow_network_write
+                && roe.allow_state_change;
+            if !active_scan_allowed {
+                let detail = "active_scan withheld: requires brief-permitted fuzzing and state changes plus operator intrusive and network-write opt-ins";
+                emit(
+                    tx,
+                    Some(replay),
+                    EngagementEvent::Action {
+                        tool: "tool_registry".into(),
+                        target: None,
+                        ok: true,
+                        detail: detail.into(),
+                    },
+                );
+                trace.record(
+                    store,
+                    "action",
+                    json!({
+                        "tool": redact("tool_registry"),
+                        "target": Value::Null,
+                        "ok": true,
+                        "detail": redact(detail),
+                    }),
+                );
+            }
+            // H-01: only safe/read tools are auto-approved by default. Network-write
+            // and intrusive tools require an explicit operator opt-in, and blanket
+            // auto-approval is a separate explicit escape hatch.
+            let auto_approve_tools = auto_approvable_tools(&tools, &options);
+            let agent = agent_config(&options, &scope_reminder, auto_approve_tools, &roe);
+            // TC-4: FullAuto no longer implicitly trusts intrusive/network-write
+            // tools. Every such tool is denied by name unless the operator opted in.
+            let denied_tools = default_denied_tools(&tools, &options);
+            let policy_config = PolicyConfig {
+                mode: options.mode,
+                deny_destructive: true,
+                scope: profile.scope.clone(),
+                denied_tools,
+                budgets: BudgetConfig {
+                    requests_per_minute: options.requests_per_minute,
+                    max_network_calls: agent.max_network_calls,
+                    ..BudgetConfig::default()
                 },
-            );
-            trace.record(
-                store,
-                "action",
-                json!({
-                    "tool": redact("tool_registry"),
-                    "target": Value::Null,
-                    "ok": true,
-                    "detail": redact(detail),
+                ..PolicyConfig::default()
+            };
+            let policy = build_policy_config(policy_config.clone());
+            let scope_summary = policy.scope_summary();
+            let base_tools = tools.clone();
+            let mut root_tools = tools;
+            root_tools.register_with_host_risk(
+                Arc::new(HandoffTool {
+                    store: store.clone(),
+                    llm: runner_llm.clone(),
+                    base_tools,
+                    policy_config: policy_config.clone(),
+                    agent: agent.clone(),
+                    scope_summary: scope_summary.clone(),
+                    engagement_marker: format!("engagement_id={id}"),
+                    memory_scope_key: format!("engagement={id}"),
                 }),
+                "network",
             );
-        }
-        // `active_scan` bundles intrusive fuzzing with network writes and state
-        // changes. Document the fail-closed withholding in the event stream and
-        // replay log, just like the generic state-change gate above.
-        let active_scan_allowed = roe.allow_fuzzing
-            && options.allow_intrusive
-            && options.allow_network_write
-            && roe.allow_state_change;
-        if !active_scan_allowed {
-            let detail = "active_scan withheld: requires brief-permitted fuzzing and state changes plus operator intrusive and network-write opt-ins";
-            emit(
-                tx,
-                Some(replay),
-                EngagementEvent::Action {
-                    tool: "tool_registry".into(),
-                    target: None,
-                    ok: true,
-                    detail: detail.into(),
-                },
-            );
-            trace.record(
-                store,
-                "action",
-                json!({
-                    "tool": redact("tool_registry"),
-                    "target": Value::Null,
-                    "ok": true,
-                    "detail": redact(detail),
-                }),
-            );
-        }
-        // H-01: only safe/read tools are auto-approved by default. Network-write
-        // and intrusive tools require an explicit operator opt-in, and blanket
-        // auto-approval is a separate explicit escape hatch.
-        let auto_approve_tools = auto_approvable_tools(&tools, &options);
-        let agent = agent_config(&options, &scope_reminder, auto_approve_tools, &roe);
-        // TC-4: FullAuto no longer implicitly trusts intrusive/network-write
-        // tools. Every such tool is denied by name unless the operator opted in.
-        let denied_tools = default_denied_tools(&tools, &options);
-        let policy_config = PolicyConfig {
-            mode: options.mode,
-            deny_destructive: true,
-            scope: profile.scope.clone(),
-            denied_tools,
-            budgets: BudgetConfig {
-                requests_per_minute: options.requests_per_minute,
-                max_network_calls: agent.max_network_calls,
-                ..BudgetConfig::default()
-            },
-            ..PolicyConfig::default()
-        };
-        let policy = build_policy_config(policy_config.clone());
-        let scope_summary = policy.scope_summary();
-        let base_tools = tools.clone();
-        let mut root_tools = tools;
-        root_tools.register_with_host_risk(
-            Arc::new(HandoffTool {
-                store: store.clone(),
-                llm: runner_llm.clone(),
-                base_tools,
-                policy_config: policy_config.clone(),
-                agent: agent.clone(),
-                scope_summary: scope_summary.clone(),
-                engagement_marker: format!("engagement_id={id}"),
-                memory_scope_key: format!("engagement={id}"),
-            }),
-            "network",
-        );
-        let role = role_for_playbook(&task.playbook_id);
-        let base_tools = root_tools.clone();
-        let scoped_tools = build_role_tools(&base_tools, role);
-        let runner = Runner::new(
-            store.clone(),
-            runner_llm.clone(),
-            scoped_tools,
-            policy.clone(),
-            role_agent_config(&agent, role),
-        )
-        .with_domain(Arc::new(BountyDomain {
-            scope_summary,
-            role,
-            scope_key: format!("engagement={id}"),
-            parent_session_id: None,
-            task_id: Some(task.id.clone()),
-        }));
-        let discovered = feedback_prompt(store, id);
-        let goal = format!(
-            "engagement_id={id}\n{}\n\nScope reminder: {scope_reminder}\n\
+            let role = role_for_playbook(&task.playbook_id);
+            let base_tools = root_tools.clone();
+            let scoped_tools = build_role_tools(&base_tools, role);
+            let runner = Runner::new(
+                store.clone(),
+                runner_llm.clone(),
+                scoped_tools,
+                policy.clone(),
+                role_agent_config(&agent, role),
+            )
+            .with_domain(Arc::new(BountyDomain {
+                scope_summary,
+                role,
+                scope_key: format!("engagement={id}"),
+                parent_session_id: None,
+                task_id: Some(task.id.clone()),
+            }));
+            let discovered = feedback_prompt(store, id);
+            // Later rounds must attack a different angle, using only observations
+            // already durably stored by earlier sessions. The existing tool guidance
+            // and no-submit line below are unchanged in every round.
+            let angle = if round > 1 {
+                format!(
+                    "Round {round}/{max_rounds}: re-examine this playbook from a DIFFERENT angle \
+                 than the previous round (different parameter class, different HTTP method if \
+                 allowed, different asset or browser snapshot). Use feedback/clues from prior \
+                 rounds. Do not repeat identical probes.\n"
+                )
+            } else {
+                String::new()
+            };
+            let goal = format!(
+            "engagement_id={id}\n{angle}{}\n\nScope reminder: {scope_reminder}\n\
              Tool guidance (already registered; do not call tool_registry repeatedly): \
              http_probe(url) is the read-only HTTP recon tool. State-changing http_request and \
              active_scan are intentionally withheld unless the brief and operator opt-ins allow them. \
@@ -1602,62 +1725,63 @@ async fn run_engagement(
             task.statement
         );
 
-        let sessions_before: HashSet<String> = store
-            .list_sessions(500)?
-            .into_iter()
-            .map(|session| session.id)
-            .collect();
-        mark_task_hypotheses(store, id, &task.playbook_id, "running", "", "");
-        let run_result = runner.run_goal(&goal).await;
-        let mut task_coverage = 0usize;
-        for session in store.list_sessions(500)? {
-            if sessions_before.contains(&session.id) {
-                continue;
-            }
-            task_coverage += store.coverage_count(&session.id).unwrap_or(0);
-            if let Ok(rows) = store.list_coverage(&session.id) {
-                for row in rows {
-                    // Reports read coverage keyed by the engagement id, while
-                    // runners record it on their own session id. Mirror the
-                    // row so coverage is visible in reports and status.
-                    let _ = store.record_coverage(id, &row.target, &row.method, &row.path);
-                    let _ = store.record_coverage_decision(agentbug_store::CoverageDecision {
-                        session_id: id,
-                        target: &row.target,
-                        method: &row.method,
-                        path: &row.path,
-                        requirement_id: &row.requirement_id,
-                        status: &row.status,
-                        rationale: &row.rationale,
-                        evidence_ref: &row.evidence_ref,
-                    });
+            let sessions_before: HashSet<String> = store
+                .list_sessions(500)?
+                .into_iter()
+                .map(|session| session.id)
+                .collect();
+            mark_task_hypotheses(store, id, &task.playbook_id, "running", "", "");
+            let run_result = runner.run_goal(&goal).await;
+            let mut task_coverage = 0usize;
+            for session in store.list_sessions(500)? {
+                if sessions_before.contains(&session.id) {
+                    continue;
                 }
+                task_coverage += store.coverage_count(&session.id).unwrap_or(0);
+                if let Ok(rows) = store.list_coverage(&session.id) {
+                    for row in rows {
+                        // Reports read coverage keyed by the engagement id, while
+                        // runners record it on their own session id. Mirror the
+                        // row so coverage is visible in reports and status.
+                        let _ = store.record_coverage(id, &row.target, &row.method, &row.path);
+                        let _ = store.record_coverage_decision(agentbug_store::CoverageDecision {
+                            session_id: id,
+                            target: &row.target,
+                            method: &row.method,
+                            path: &row.path,
+                            requirement_id: &row.requirement_id,
+                            status: &row.status,
+                            rationale: &row.rationale,
+                            evidence_ref: &row.evidence_ref,
+                        });
+                    }
+                }
+                sync_hypotheses_from_coverage(store, id, &task.playbook_id, &session.id);
+                observe_session(store, id, Some(&task.id), &session.id, tx, replay, trace)?;
+                let _ = feedback_hypotheses(store, id, &session.id, &profile.scope.in_scope, trace);
             }
-            sync_hypotheses_from_coverage(store, id, &task.playbook_id, &session.id);
-            observe_session(store, id, Some(&task.id), &session.id, tx, replay, trace)?;
-            let _ = feedback_hypotheses(store, id, &session.id, &profile.scope.in_scope, trace);
-        }
 
-        match run_result {
-            Ok(_) => {
-                // "Done" must mean evidence, not merely that the runner
-                // returned. A playbook with zero coverage and zero evidence
-                // is incomplete and must be surfaced as such.
-                let evidence_count = store.list_findings(id).map(|rows| rows.len()).unwrap_or(0)
-                    + store.list_artifacts(id).map(|rows| rows.len()).unwrap_or(0);
-                if task_coverage == 0 && evidence_count == 0 {
-                    store.update_task_status(&task.id, "needs-review")?;
-                    let _ = store.append_trace(
-                        id,
-                        id,
-                        "playbook.incomplete",
-                        &json!({
-                            "playbook_id": task.playbook_id,
-                            "reason": "runner completed without coverage or evidence"
-                        })
-                        .to_string(),
-                    );
-                    emit(
+            match run_result {
+                Ok(_) => {
+                    // "Done" must mean evidence, not merely that the runner
+                    // returned. A playbook with zero coverage and zero evidence
+                    // is incomplete and must be surfaced as such.
+                    let evidence_count =
+                        store.list_findings(id).map(|rows| rows.len()).unwrap_or(0)
+                            + store.list_artifacts(id).map(|rows| rows.len()).unwrap_or(0);
+                    if task_coverage == 0 && evidence_count == 0 {
+                        store.update_task_status(&task.id, "needs-review")?;
+                        let _ = store.append_trace(
+                            id,
+                            id,
+                            "playbook.incomplete",
+                            &json!({
+                                "playbook_id": task.playbook_id,
+                                "reason": "runner completed without coverage or evidence"
+                            })
+                            .to_string(),
+                        );
+                        emit(
                         tx,
                         Some(replay),
                         EngagementEvent::Error {
@@ -1667,107 +1791,108 @@ async fn run_engagement(
                             ),
                         },
                     );
-                } else {
-                    store.update_task_status(&task.id, "done")?;
-                }
-                update_control(id, |control| {
-                    if task_coverage > 0 || evidence_count > 0 {
-                        control.tasks_done += 1;
+                    } else {
+                        store.update_task_status(&task.id, "done")?;
                     }
-                    control.coverage += task_coverage;
-                });
+                    update_control(id, |control| {
+                        if task_coverage > 0 || evidence_count > 0 {
+                            control.tasks_done += 1;
+                        }
+                        control.coverage += task_coverage;
+                    });
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    store.update_task_status(&task.id, "failed")?;
+                    emit(
+                        tx,
+                        Some(replay),
+                        EngagementEvent::Error {
+                            message: format!("playbook {} failed: {message}", task.playbook_id),
+                        },
+                    );
+                }
             }
-            Err(error) => {
-                let message = format!("{error:#}");
-                store.update_task_status(&task.id, "failed")?;
-                emit(
-                    tx,
-                    Some(replay),
-                    EngagementEvent::Error {
-                        message: format!("playbook {} failed: {message}", task.playbook_id),
-                    },
-                );
-            }
-        }
 
-        let current = store.list_findings(id)?;
-        update_control(id, |control| control.findings = current.len());
-        for finding in current {
-            if known_findings.insert(finding.id.clone()) {
-                let memory_scope_key = format!("engagement={id}");
-                let verification = verify_candidate_role(VerificationRequest {
-                    store,
-                    llm: runner_llm.clone(),
-                    base_tools: &base_tools,
-                    policy_config: &policy_config,
-                    agent: &agent,
-                    scope_summary: policy.scope_summary(),
-                    engagement_id: id,
-                    memory_scope_key: &memory_scope_key,
-                    finding_id: &finding.id,
-                })
-                .await;
-                match verification {
-                    Ok(verdict) => {
-                        let _ = store.append_trace(
-                            id,
-                            id,
-                            "verifier_falsification",
-                            &json!({"finding": finding.id, "verdict": verdict}).to_string(),
-                        );
-                        mark_task_hypotheses(
-                            store,
-                            id,
-                            &task.playbook_id,
-                            "confirmed-candidate",
-                            "candidate finding verified by role",
-                            &finding.id,
-                        );
+            let current = store.list_findings(id)?;
+            update_control(id, |control| control.findings = current.len());
+            for finding in current {
+                if known_findings.insert(finding.id.clone()) {
+                    let memory_scope_key = format!("engagement={id}");
+                    let verification = verify_candidate_role(VerificationRequest {
+                        store,
+                        llm: runner_llm.clone(),
+                        base_tools: &base_tools,
+                        policy_config: &policy_config,
+                        agent: &agent,
+                        scope_summary: policy.scope_summary(),
+                        engagement_id: id,
+                        memory_scope_key: &memory_scope_key,
+                        finding_id: &finding.id,
+                    })
+                    .await;
+                    match verification {
+                        Ok(verdict) => {
+                            let _ = store.append_trace(
+                                id,
+                                id,
+                                "verifier_falsification",
+                                &json!({"finding": finding.id, "verdict": verdict}).to_string(),
+                            );
+                            mark_task_hypotheses(
+                                store,
+                                id,
+                                &task.playbook_id,
+                                "confirmed-candidate",
+                                "candidate finding verified by role",
+                                &finding.id,
+                            );
+                        }
+                        Err(error) => {
+                            let _ = store.append_trace(
+                                id,
+                                id,
+                                "verifier_falsification",
+                                &json!({"finding": finding.id, "error": format!("{error:#}")})
+                                    .to_string(),
+                            );
+                            mark_task_hypotheses(
+                                store,
+                                id,
+                                &task.playbook_id,
+                                "open_proof_gap",
+                                "verification role incomplete",
+                                &finding.id,
+                            );
+                        }
                     }
-                    Err(error) => {
-                        let _ = store.append_trace(
-                            id,
-                            id,
-                            "verifier_falsification",
-                            &json!({"finding": finding.id, "error": format!("{error:#}")})
-                                .to_string(),
-                        );
-                        mark_task_hypotheses(
-                            store,
-                            id,
-                            &task.playbook_id,
-                            "open_proof_gap",
-                            "verification role incomplete",
-                            &finding.id,
-                        );
+                    match capture_evidence(store, &finding) {
+                        Ok((_, evidence_hash)) => {
+                            evidence_hashes.insert(finding.id.clone(), evidence_hash);
+                        }
+                        Err(error) => {
+                            emit(
+                                tx,
+                                Some(replay),
+                                EngagementEvent::Error {
+                                    message: format!(
+                                        "failed to store evidence for finding {}: {error:#}",
+                                        finding.id
+                                    ),
+                                },
+                            );
+                        }
                     }
+                    emit(
+                        tx,
+                        Some(replay),
+                        EngagementEvent::Finding {
+                            id: finding.id,
+                            title: redact(&finding.title),
+                            severity: finding.severity,
+                        },
+                    );
                 }
-                match capture_evidence(store, &finding) {
-                    Ok((_, evidence_hash)) => {
-                        evidence_hashes.insert(finding.id.clone(), evidence_hash);
-                    }
-                    Err(error) => {
-                        emit(
-                            tx,
-                            Some(replay),
-                            EngagementEvent::Error {
-                                message: format!(
-                                    "failed to store evidence for finding {}: {error:#}",
-                                    finding.id
-                                ),
-                            },
-                        );
-                    }
-                }
-                emit(
-                    tx,
-                    Some(replay),
-                    EngagementEvent::Finding {
-                        id: finding.id,
-                        title: redact(&finding.title),
-                        severity: finding.severity,
-                    },
-                );
             }
         }
     }
@@ -1835,6 +1960,7 @@ async fn run_engagement(
         &verified_findings,
         &evidence_hashes,
         &roe,
+        Some((rounds_run, max_rounds)),
     );
     let report_path = workspace.join(format!("report-{id}.md"));
     std::fs::write(&report_path, &report)
@@ -1918,6 +2044,40 @@ async fn run_engagement(
         },
     );
     Ok(profile)
+}
+
+/// Select the playbook tasks for one bounded search round using only the
+/// existing durable task and hypothesis tables.
+///
+/// Round 1 keeps the original behavior: every task that is not already
+/// done/completed. Later rounds revisit only tasks that are `needs-review` or
+/// `failed`, or whose playbook still has a non-terminal hypothesis. Completed
+/// tasks are never replayed. This is deliberately a pure query so the retry
+/// policy can be audited offline without running an LLM.
+pub fn search_round_tasks(
+    store: &Store,
+    engagement_id: &str,
+    round: usize,
+) -> Result<Vec<agentbug_store::Task>> {
+    let tasks = store.list_tasks(engagement_id)?;
+    let pending = |task: &agentbug_store::Task| task.status != "done" && task.status != "completed";
+    if round <= 1 {
+        return Ok(tasks.into_iter().filter(pending).collect());
+    }
+    let open_requirements: HashSet<String> = store
+        .list_hypotheses(engagement_id)?
+        .into_iter()
+        .filter(|hypothesis| !is_terminal_hypothesis(&hypothesis.status))
+        .map(|hypothesis| hypothesis.requirement_id)
+        .collect();
+    Ok(tasks
+        .into_iter()
+        .filter(pending)
+        .filter(|task| {
+            matches!(task.status.as_str(), "needs-review" | "failed")
+                || open_requirements.contains(&task.playbook_id)
+        })
+        .collect())
 }
 
 /// Translate a runner's persisted messages into engagement Action events and
@@ -3686,6 +3846,7 @@ fn engagement_coverage(
     rows
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_canonical_report(
     store: &Store,
     context: ReportContext<'_>,
@@ -3694,6 +3855,7 @@ fn build_canonical_report(
     verified: &[agentbug_store::Finding],
     evidence_hashes: &HashMap<String, String>,
     roe: &RoePolicy,
+    search_rounds: Option<(usize, usize)>,
 ) -> String {
     use agentbug_tools::{
         platform_from_program_url, render_canonical_report, ReportFinding, ReportInput,
@@ -3869,6 +4031,15 @@ fn build_canonical_report(
         report_id: redact(context.engagement_id),
     });
     // Additive audit line only. It never affects verification, outcome or state.
+    // Inserted under Methodology without changing the canonical renderer, so
+    // strict report validators and older renderings stay byte-identical.
+    if let Some((rounds_run, max_rounds)) = search_rounds {
+        let line = format!("Search rounds: {rounds_run} of {max_rounds}\n\n");
+        match report.find("## Methodology\n\n") {
+            Some(heading) => report.insert_str(heading + "## Methodology\n\n".len(), &line),
+            None => report.push_str(&line),
+        }
+    }
     if let Ok(Some(line)) = valid_safe_harbor_receipt_line(store, context.engagement_id) {
         report.push('\n');
         report.push_str(&line);
@@ -4790,6 +4961,7 @@ Fuzzing is authorized.
             &verified,
             &hashes,
             &RoePolicy::default(),
+            None,
         );
         for heading in [
             "## Executive Summary",

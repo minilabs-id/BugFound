@@ -1,7 +1,8 @@
 use agentbug_engagement::{
-    cvss_base, engage_with_local_brief_tx_and_roe, extract_profile_from_text,
-    normalize_scope_pattern, parse_roe, roe_classify, roe_overrides, roe_unparsed_constraints,
-    wstg_playbooks, EngagementEvent, EngagementOptions, EngagementRoeOptions, RoePolicyMode,
+    cvss_base, engage_with_local_brief_tx_and_roe, engage_with_local_brief_tx_and_roe_and_loop,
+    extract_profile_from_text, normalize_scope_pattern, parse_roe, roe_classify, roe_overrides,
+    roe_unparsed_constraints, search_round_tasks, wstg_playbooks, EngagementEvent,
+    EngagementLoopOptions, EngagementOptions, EngagementRoeOptions, RoePolicyMode,
 };
 use agentbug_policy::Mode;
 use agentbug_store::Store;
@@ -512,4 +513,226 @@ fn permissive_mode_is_idempotent_across_runs() {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0]["outcome"], "incomplete");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded search rounds (offline, no submission, gates unchanged)
+// ---------------------------------------------------------------------------
+
+fn search_brief() -> String {
+    "Program: Acme Corp\nIn scope:\n- *.acme.test\nOut of scope:\n- admin.acme.test\nRules of engagement:\n"
+        .to_string()
+}
+
+fn run_local_brief_loop(
+    paths: &TestPaths,
+    brief: &str,
+    max_rounds: usize,
+) -> (anyhow::Result<String>, Vec<EngagementEvent>) {
+    let (tx, rx) = std::sync::mpsc::channel::<EngagementEvent>();
+    let result = engage_with_local_brief_tx_and_roe_and_loop(
+        &paths.db,
+        &paths.workspace,
+        brief,
+        EngagementOptions::default(),
+        EngagementRoeOptions::default(),
+        EngagementLoopOptions { max_rounds },
+        tx,
+    );
+    (result, rx.try_iter().collect())
+}
+
+fn engagement_sessions(db: &Path, engagement_id: &str) -> Vec<agentbug_store::Session> {
+    let marker = format!("engagement_id={engagement_id}");
+    Store::open(db)
+        .unwrap()
+        .list_sessions(500)
+        .unwrap()
+        .into_iter()
+        .filter(|session| session.goal.contains(&marker))
+        .collect()
+}
+
+fn report_from(events: &[EngagementEvent]) -> String {
+    let path = events
+        .iter()
+        .find_map(|event| match event {
+            EngagementEvent::ReportReady { path } => Some(path.clone()),
+            _ => None,
+        })
+        .expect("ReportReady event must be emitted");
+    std::fs::read_to_string(path).expect("read canonical report")
+}
+
+#[test]
+fn search_rounds_retry_needs_review_playbook_with_different_angle() {
+    let paths = temp_paths("search-retry");
+    let (result, events) = run_local_brief_loop(&paths, &search_brief(), 2);
+    let id = result.expect("bounded search engagement must complete");
+
+    // The offline runner issues no probes, so every playbook is needs-review in
+    // round 1 and is therefore retried once in round 2.
+    let rounds = trace_payloads(&paths.db, &id, "search.round");
+    assert_eq!(rounds.len(), 2, "{rounds:?}");
+    assert_eq!(rounds[0]["round"], 1);
+    assert_eq!(rounds[0]["max_rounds"], 2);
+    assert_eq!(rounds[0]["retried_tasks"].as_array().unwrap().len(), 0);
+    assert_eq!(rounds[1]["round"], 2);
+    assert_eq!(rounds[1]["max_rounds"], 2);
+    assert!(!rounds[1]["retried_tasks"].as_array().unwrap().is_empty());
+
+    let round_actions: Vec<&EngagementEvent> = events
+        .iter()
+        .filter(
+            |event| matches!(event, EngagementEvent::Action { tool, .. } if tool == "search_round"),
+        )
+        .collect();
+    assert_eq!(round_actions.len(), 2);
+
+    let sessions = engagement_sessions(&paths.db, &id);
+    let second_angle: Vec<&agentbug_store::Session> = sessions
+        .iter()
+        .filter(|session| session.goal.contains("Round 2/2"))
+        .collect();
+    assert!(!second_angle.is_empty(), "{:?}", sessions.len());
+    assert!(
+        second_angle
+            .iter()
+            .all(|session| session.goal.contains("DIFFERENT angle")
+                && session.goal.contains("Do not repeat identical probes")
+                && session
+                    .goal
+                    .contains("Do not submit anything to any external system")),
+        "second-round goals must carry the bounded different-angle instruction and no-submit line"
+    );
+    assert!(
+        sessions
+            .iter()
+            .any(|session| !session.goal.contains("Round 2/2")),
+        "round 1 goals must remain unchanged"
+    );
+
+    // After the last round a still-empty playbook remains needs-review and the
+    // report records the bounded retry (never a submission).
+    let tasks = Store::open(&paths.db).unwrap().list_tasks(&id).unwrap();
+    assert!(tasks.iter().all(|task| task.status == "needs-review"));
+    assert!(report_from(&events).contains("Search rounds: 2 of 2"));
+}
+
+#[test]
+fn max_rounds_one_preserves_existing_behavior() {
+    let paths = temp_paths("search-single");
+    let (result, events) = run_local_brief_loop(&paths, &search_brief(), 1);
+    let id = result.expect("single-round engagement must complete");
+
+    let rounds = trace_payloads(&paths.db, &id, "search.round");
+    assert_eq!(rounds.len(), 1, "{rounds:?}");
+    assert_eq!(rounds[0]["round"], 1);
+    assert_eq!(rounds[0]["max_rounds"], 1);
+    assert!(engagement_sessions(&paths.db, &id)
+        .iter()
+        .all(|session| !session.goal.contains("Round 2")));
+    assert!(report_from(&events).contains("Search rounds: 1 of 1"));
+}
+
+#[test]
+fn completed_playbooks_are_not_retried() {
+    let paths = temp_paths("search-completed");
+    let store = Store::open(&paths.db).unwrap();
+    let engagement = store.create_engagement("local-brief://offline").unwrap();
+    let id = engagement.id;
+
+    let done = store
+        .create_task(&id, "done playbook", "wstg-info", None, 0)
+        .unwrap();
+    store.update_task_status(&done.id, "done").unwrap();
+    let completed = store
+        .create_task(&id, "completed playbook", "wstg-config", None, 1)
+        .unwrap();
+    store
+        .update_task_status(&completed.id, "completed")
+        .unwrap();
+    let needs_review = store
+        .create_task(&id, "retry playbook", "wstg-authn", None, 2)
+        .unwrap();
+    store
+        .update_task_status(&needs_review.id, "needs-review")
+        .unwrap();
+    let failed = store
+        .create_task(&id, "failed playbook", "wstg-injection", None, 3)
+        .unwrap();
+    store.update_task_status(&failed.id, "failed").unwrap();
+    let open_hypothesis = store
+        .create_task(&id, "open clue playbook", "wstg-api", None, 4)
+        .unwrap();
+    store
+        .update_task_status(&open_hypothesis.id, "tested")
+        .unwrap();
+    store
+        .add_structured_hypothesis(&id, "clue", "wstg-api", "clue", "", "")
+        .unwrap();
+    store
+        .add_structured_hypothesis(&id, "closed clue", "wstg-errs", "closed", "", "")
+        .unwrap();
+    let closed = store
+        .list_hypotheses(&id)
+        .unwrap()
+        .into_iter()
+        .last()
+        .unwrap();
+    store
+        .hypothesis_transition(&closed.id, "ruled_out", "control pair", "")
+        .unwrap();
+
+    let first = search_round_tasks(&store, &id, 1)
+        .unwrap()
+        .into_iter()
+        .map(|task| task.playbook_id)
+        .collect::<Vec<_>>();
+    assert_eq!(first, ["wstg-authn", "wstg-injection", "wstg-api"]);
+
+    let second = search_round_tasks(&store, &id, 2)
+        .unwrap()
+        .into_iter()
+        .map(|task| task.playbook_id)
+        .collect::<Vec<_>>();
+    assert_eq!(second, ["wstg-authn", "wstg-injection", "wstg-api"]);
+    assert!(!second.iter().any(|id| id == "wstg-info"));
+    assert!(!second.iter().any(|id| id == "wstg-config"));
+}
+
+#[test]
+fn final_report_is_written_after_last_round() {
+    let paths = temp_paths("search-report");
+    let (result, events) = run_local_brief_loop(&paths, &search_brief(), 3);
+    let id = result.expect("bounded search engagement must complete");
+
+    let rounds = trace_payloads(&paths.db, &id, "search.round");
+    assert_eq!(rounds.len(), 3, "{rounds:?}");
+    assert_eq!(rounds[2]["round"], 3);
+    assert_eq!(rounds[2]["max_rounds"], 3);
+
+    let conn = rusqlite::Connection::open(&paths.db).unwrap();
+    let last_round_row: i64 = conn
+        .query_row(
+            "SELECT MAX(rowid) FROM trace_events WHERE engagement_id=?1 AND kind='search.round'",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let report_row: i64 = conn
+        .query_row(
+            "SELECT MAX(rowid) FROM trace_events WHERE engagement_id=?1 AND kind='report.ready'",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        report_row > last_round_row,
+        "the report must be written after the final search round"
+    );
+
+    let report = report_from(&events);
+    assert!(report.contains("## Methodology"), "{report}");
+    assert!(report.contains("Search rounds: 3 of 3"), "{report}");
 }

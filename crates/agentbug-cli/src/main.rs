@@ -386,6 +386,18 @@ impl FileConfig {
                 ));
             }
         }
+        // Bounded search rounds: at least one pass, at most ten. This is an
+        // operator-only cap on revisiting unfinished playbooks, not a permission.
+        if let Some(max_rounds) = self.agent.max_rounds {
+            if max_rounds == 0 {
+                return Err(anyhow!("agent.max_rounds must be at least 1"));
+            }
+            if max_rounds > 10 {
+                return Err(anyhow!(
+                    "agent.max_rounds must be at most 10 (got {max_rounds})"
+                ));
+            }
+        }
         // Absurd budget values are almost always a misconfiguration; reject them
         // rather than letting a run consume unbounded time or resources.
         let budgets = [
@@ -511,6 +523,10 @@ struct AgentFile {
     max_tool_calls: Option<usize>,
     #[serde(default)]
     max_network_calls: Option<usize>,
+    /// Bounded number of search rounds. Config-only: never derived from
+    /// `auto_approve_all`, `mode`, CLI flags or LLM/tool output.
+    #[serde(default)]
+    max_rounds: Option<usize>,
     #[serde(default)]
     requests_per_minute: Option<u64>,
     #[serde(default)]
@@ -782,6 +798,15 @@ fn roe_options(cfg: &FileConfig) -> agentbug_engagement::EngagementRoeOptions {
     agentbug_engagement::EngagementRoeOptions { mode }
 }
 
+/// Translate the operator's config-only search-round cap into the engagement
+/// loop option. `validate` guarantees the value is in 1..=10; absent means one
+/// round, which preserves the original single-pass behavior.
+fn engagement_loop_options(cfg: &FileConfig) -> agentbug_engagement::EngagementLoopOptions {
+    agentbug_engagement::EngagementLoopOptions {
+        max_rounds: cfg.agent.max_rounds.unwrap_or(1),
+    }
+}
+
 /// Emit a loud operator notice so the permissive mode is never a silent downgrade.
 fn warn_if_permissive_roe(cfg: &FileConfig) {
     if cfg.authorization.roe_policy_mode == "permissive_audited" {
@@ -835,6 +860,9 @@ timeout_ms = 60000
 [agent]
 mode = "ask"          # ask | full_auto
 max_steps = 20
+# Bounded search rounds (config-only, 1..=10). Later rounds retry unfinished
+# playbooks from a different angle; 1 keeps the original single pass.
+max_rounds = 1
 # Escape hatch: skip every approval prompt (off by default).
 auto_approve_all = false
 
@@ -1402,6 +1430,7 @@ async fn main() -> Result<()> {
             monitor.start()?;
             let options = engagement_options(&cfg);
             let roe = roe_options(&cfg);
+            let loop_options = engagement_loop_options(&cfg);
             let (tx, rx) = std::sync::mpsc::channel::<agentbug_engagement::EngagementEvent>();
 
             // Keep the id emitted by the Started event so Ctrl+C can abort the
@@ -1435,12 +1464,13 @@ async fn main() -> Result<()> {
             let worker_db = db_path.clone();
             let worker = std::thread::spawn(move || -> Result<()> {
                 if let Some(brief_text) = worker_brief {
-                    agentbug_engagement::engage_with_local_brief_tx_and_roe(
+                    agentbug_engagement::engage_with_local_brief_tx_and_roe_and_loop(
                         Path::new(&worker_db),
                         Path::new(&worker_cwd),
                         &brief_text,
                         options,
                         roe,
+                        loop_options,
                         tx,
                     )
                     .map(|_| ())
@@ -1460,12 +1490,13 @@ async fn main() -> Result<()> {
                     // The generic platform uses the plain public-page fetch, so
                     // this is the URL engagement path that honours the operator's
                     // config-only universal ROE mode.
-                    agentbug_engagement::engage_with_options_and_roe(
+                    agentbug_engagement::engage_with_options_and_loop(
                         &worker_url,
                         Path::new(&worker_cwd),
                         Path::new(&worker_db),
                         options,
                         roe,
+                        loop_options,
                         tx,
                     )
                     .map(|_| ())
@@ -1672,6 +1703,62 @@ max_tokens_budget = 55
         assert!(!options.allow_network_write);
         assert!(!options.allow_intrusive);
         assert!(!options.auto_approve_all);
+    }
+
+    #[test]
+    fn max_rounds_defaults_to_one_and_is_config_only() {
+        let cfg = FileConfig::default();
+        assert_eq!(cfg.agent.max_rounds, None);
+        assert_eq!(engagement_loop_options(&cfg).max_rounds, 1);
+
+        let cfg: FileConfig = toml::from_str("").expect("parse empty config");
+        cfg.validate().expect("validate empty config");
+        assert_eq!(engagement_loop_options(&cfg).max_rounds, 1);
+
+        // auto_approve_all and mode are unrelated gates; neither may change the
+        // bounded search-round cap.
+        let cfg: FileConfig = toml::from_str(OPT_IN_CONFIG).expect("parse opt-in config");
+        cfg.validate().expect("validate opt-in config");
+        assert_eq!(engagement_loop_options(&cfg).max_rounds, 1);
+    }
+
+    #[test]
+    fn max_rounds_is_validated_and_forwarded() {
+        for (value, message) in [(0, "at least 1"), (11, "at most 10")] {
+            let text = format!("[agent]\nmax_rounds = {value}\n");
+            let cfg: FileConfig = toml::from_str(&text).expect("parse config");
+            let error = cfg
+                .validate()
+                .expect_err("out-of-range max_rounds must be rejected");
+            assert!(
+                error.to_string().contains("agent.max_rounds"),
+                "unexpected error: {error}"
+            );
+            assert!(
+                error.to_string().contains(message),
+                "unexpected error: {error}"
+            );
+        }
+
+        for value in [1, 10] {
+            let text = format!("[agent]\nmax_rounds = {value}\n");
+            let cfg: FileConfig = toml::from_str(&text).expect("parse config");
+            cfg.validate()
+                .expect("in-range max_rounds must be accepted");
+            assert_eq!(engagement_loop_options(&cfg).max_rounds, value);
+        }
+    }
+
+    #[test]
+    fn init_sample_documents_max_rounds() {
+        assert!(
+            INIT_SAMPLE.contains("max_rounds = 1"),
+            "init sample must document the single-round default"
+        );
+        assert!(
+            INIT_SAMPLE.contains("1..=10"),
+            "init sample must document the validated range"
+        );
     }
 
     #[test]

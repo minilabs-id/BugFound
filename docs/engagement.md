@@ -147,6 +147,45 @@ line `Safe-harbor receipt: <id> (operator ..., expires ...)` in
 acknowledged, unexpired, and matches the engagement's latest brief hash. It has
 no effect on `final_state`, verification, or outcome.
 
+### Universal ROE policy mode
+
+The **universal ROE policy mode** controls how AgentBug handles brief lines that
+cannot be mapped to a typed `RoePolicy` field. It is an **operator-only config
+setting**: there is no CLI flag for it, and it is never derived from `--platform`,
+`agent.mode`, `auto_approve_all`, or any LLM/tool value.
+
+```toml
+[authorization]
+# Default. Unmappable ROE lines stop the engagement until an operator records a
+# hash-scoped acknowledgement with `agentbug authorize`.
+roe_policy_mode = "strict"
+
+# Opt-in alternative (config-only):
+# roe_policy_mode = "permissive_audited"
+```
+
+- **`strict` (default).** Fail-closed: an unmappable ROE line aborts the
+  engagement until an operator acknowledges it explicitly. Acknowledgements are
+  scoped to the **exact brief content hash** and the exact rule, are written to
+  the audit trail, and are **idempotent** (re-recording the same acknowledgement
+  is a no-op). Because an ack is hash-scoped, **changing the brief requires new
+  acknowledgements** for the new hash — an acknowledgement for an older hash
+  never carries over.
+- **`permissive_audited`.** Intended for brief sources that emit arbitrary,
+  unmappable prose. Each unmappable line is auto-acknowledged for **that exact
+  brief hash** so the run can continue. Those auto-acknowledgements are
+  idempotent and fully audited (operator-visible identity, rule and brief hash),
+  and AgentBug prints a loud operator warning whenever this mode is active. It
+  is still **not** an authorization bypass: the engagement outcome is forced to
+  `incomplete`, so a run in this mode can never be reported as fully clean.
+
+Neither mode relaxes a real gate. `denied_finding_classes`, scope intersection,
+tool/method allowlists and budgets, verification, and reporting are unchanged;
+gated tools stay gated and denied vulnerability classes stay excluded. Read-only
+platform and brief-only runs keep the strict defaults. Changing the mode does not
+retroactively alter a running or finished engagement — start a new engagement to
+apply it.
+
 ### Desktop
 
 Open `start-desktop.bat` and select the **Engagement** tab. Paste the program URL,

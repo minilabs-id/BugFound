@@ -28,8 +28,8 @@ use agentbug_core::{build_policy_config, AgentConfig, Runner};
 use agentbug_llm::{ChatMessage, ChatResponse, Llm, LlmClient, LlmConfig};
 use agentbug_policy::{BudgetConfig, Mode, PolicyConfig, ScopeConfig};
 use agentbug_store::{
-    redact, AuthorizationSnapshot, OpenAuthorizationRule, RuleProvenance, SafeHarborReceipt, Store,
-    ToolCapture,
+    redact, AuthorizationAck, AuthorizationSnapshot, OpenAuthorizationRule, RuleProvenance,
+    SafeHarborReceipt, Store, ToolCapture,
 };
 use agentbug_tools::{try_default_registry_with_options, write_evidence_artifact, ToolOptions};
 use anyhow::{anyhow, Context, Result};
@@ -143,6 +143,35 @@ impl Default for EngagementOptions {
     }
 }
 
+/// How the engagement treats ROE brief lines that cannot be mapped to a typed
+/// [`RoePolicy`] field. The default is [`RoePolicyMode::Strict`]: every unmapped
+/// line aborts until an operator records a hash-scoped acknowledgement.
+///
+/// [`RoePolicyMode::PermissiveAudited`] is a config-only mode for brief sources
+/// that emit arbitrary, unmappable prose. It auto-records a hash-scoped,
+/// auditable acknowledgement for each unmapped line so the engagement can
+/// continue, but it never relaxes a real gate: denied finding classes, scope
+/// intersection, tool/method gates, verification and reporting are unchanged,
+/// and the outcome is still forced to `incomplete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoePolicyMode {
+    Strict,
+    PermissiveAudited,
+}
+
+impl Default for RoePolicyMode {
+    fn default() -> Self {
+        Self::Strict
+    }
+}
+
+/// Config-only ROE policy settings, kept separate from [`EngagementOptions`] so
+/// existing callers that construct that struct exhaustively stay compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EngagementRoeOptions {
+    pub mode: RoePolicyMode,
+}
+
 /// Platform brief-source settings. Kept separate from [`EngagementOptions`] so
 /// existing callers that construct `EngagementOptions` exhaustively (desktop)
 /// keep compiling. `api_key_env` is the *name* of an environment variable; the
@@ -198,6 +227,29 @@ pub fn engage_with_options(
     options: EngagementOptions,
     tx: Sender<EngagementEvent>,
 ) -> Result<EngagementProfile> {
+    engage_with_options_and_roe(
+        program_url,
+        workspace,
+        db_path,
+        options,
+        EngagementRoeOptions::default(),
+        tx,
+    )
+}
+
+/// Start a new engagement with explicit operator and ROE-policy options.
+///
+/// The ROE options only change how unmappable brief lines are *audited*; they
+/// never widen scope, tool, method, verification or reporting gates. Strict
+/// mode (the default) keeps the fail-closed abort behaviour.
+pub fn engage_with_options_and_roe(
+    program_url: &str,
+    workspace: &Path,
+    db_path: &Path,
+    options: EngagementOptions,
+    roe_options: EngagementRoeOptions,
+    tx: Sender<EngagementEvent>,
+) -> Result<EngagementProfile> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -209,6 +261,7 @@ pub fn engage_with_options(
         tx,
         false,
         options,
+        roe_options,
         EngagementPlatformOptions::default(),
         BriefSource::Url,
     ))
@@ -246,6 +299,26 @@ pub fn engage_with_local_brief_tx(
     options: EngagementOptions,
     tx: Sender<EngagementEvent>,
 ) -> Result<String> {
+    engage_with_local_brief_tx_and_roe(
+        db,
+        workspace,
+        brief_text,
+        options,
+        EngagementRoeOptions::default(),
+        tx,
+    )
+}
+
+/// Variant of [`engage_with_local_brief_tx`] with explicit ROE-policy options.
+/// See [`engage_with_options_and_roe`] for the scope of that configuration.
+pub fn engage_with_local_brief_tx_and_roe(
+    db: &Path,
+    workspace: &Path,
+    brief_text: &str,
+    options: EngagementOptions,
+    roe_options: EngagementRoeOptions,
+    tx: Sender<EngagementEvent>,
+) -> Result<String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -257,6 +330,7 @@ pub fn engage_with_local_brief_tx(
         tx,
         false,
         options,
+        roe_options,
         EngagementPlatformOptions::default(),
         BriefSource::LocalText(brief_text.to_string()),
     ))?;
@@ -299,6 +373,7 @@ pub fn engage_brief_only_with_options(
         tx,
         true,
         options,
+        EngagementRoeOptions::default(),
         EngagementPlatformOptions::default(),
         BriefSource::Url,
     ))
@@ -327,6 +402,7 @@ pub fn engage_with_platform(
         tx,
         false,
         options,
+        EngagementRoeOptions::default(),
         platform_options,
         BriefSource::Url,
     ))
@@ -352,6 +428,7 @@ pub fn engage_brief_only_with_platform(
         tx,
         true,
         options,
+        EngagementRoeOptions::default(),
         platform_options,
         BriefSource::Url,
     ))
@@ -778,6 +855,7 @@ async fn engage_async(
     tx: Sender<EngagementEvent>,
     brief_only: bool,
     options: EngagementOptions,
+    roe_options: EngagementRoeOptions,
     platform_options: EngagementPlatformOptions,
     brief_source: BriefSource,
 ) -> Result<EngagementProfile> {
@@ -857,6 +935,7 @@ async fn engage_async(
         &mut trace,
         brief_only,
         options,
+        roe_options,
         platform_options,
         brief_source,
     )
@@ -896,6 +975,7 @@ async fn run_engagement(
     trace: &mut TraceRun,
     brief_only: bool,
     options: EngagementOptions,
+    roe_options: EngagementRoeOptions,
     platform_options: EngagementPlatformOptions,
     brief_source: BriefSource,
 ) -> Result<EngagementProfile> {
@@ -1024,6 +1104,47 @@ async fn run_engagement(
                     "rule_hash": rule_hash,
                     "acknowledged": acknowledged,
                     "rule": redact(line),
+                })
+                .to_string(),
+            );
+        }
+        // Config-only universal ROE policy. This is the *only* additional
+        // behaviour: record the same hash-scoped acknowledgement an operator
+        // would otherwise write out of band, naming the configuration as the
+        // operator. It grants no capability — the all_acknowledged check, the
+        // forced `incomplete` outcome and every downstream gate are unchanged.
+        // Strict mode (the default) is an exact no-op here.
+        if roe_options.mode == RoePolicyMode::PermissiveAudited {
+            const OPERATOR: &str = "config:roe_policy_mode=permissive_audited";
+            let mut inserted_flags = Vec::with_capacity(unparsed.len());
+            for line in &unparsed {
+                let rule_hash = hex_digest(line.trim().as_bytes());
+                let ack = AuthorizationAck {
+                    program_url: program_url.to_string(),
+                    content_hash: content_hash.clone(),
+                    subject_kind: "unparsed_roe".to_string(),
+                    subject_hash: rule_hash,
+                    subject_text: line.clone(),
+                    decision: "acknowledged".to_string(),
+                    operator: OPERATOR.to_string(),
+                    note: "config-only ROE policy: unmapped brief line auto-acknowledged; no scope, tool, method, verification or reporting gate relaxed"
+                        .to_string(),
+                    created_at: String::new(),
+                };
+                // DB errors must fail closed: never swallow a failed ack write.
+                inserted_flags.push(store.save_authorization_ack(&ack)?);
+            }
+            let _ = store.append_trace(
+                id,
+                id,
+                "authorization.permissive_mode_applied",
+                &json!({
+                    "content_hash": content_hash.clone(),
+                    "count": unparsed.len(),
+                    "mode": "permissive_audited",
+                    "operator": OPERATOR,
+                    "inserted": inserted_flags,
+                    "inserted_count": inserted_flags.iter().filter(|inserted| **inserted).count(),
                 })
                 .to_string(),
             );

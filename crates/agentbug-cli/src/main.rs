@@ -331,6 +331,32 @@ struct FileConfig {
     external_tools: ExternalFile,
     #[serde(default)]
     oob: OobFile,
+    /// Operator-only rules-of-engagement controls. The universal ROE mode is
+    /// read exclusively from here — never from CLI flags, `auto_approve_all`,
+    /// the run `mode`, or any LLM/tool value.
+    #[serde(default)]
+    authorization: AuthorizationFile,
+}
+
+/// Config-only universal ROE mode. Kept as the raw string so `validate` can
+/// reject unknown values with a clear operator-facing message; the typed
+/// `RoePolicyMode` is produced by `roe_options` after validation.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct AuthorizationFile {
+    #[serde(default = "default_roe_policy_mode")]
+    roe_policy_mode: String,
+}
+
+fn default_roe_policy_mode() -> String {
+    "strict".to_string()
+}
+
+impl Default for AuthorizationFile {
+    fn default() -> Self {
+        Self {
+            roe_policy_mode: default_roe_policy_mode(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -392,6 +418,14 @@ impl FileConfig {
         {
             if pattern.trim().is_empty() {
                 return Err(anyhow!("scope patterns must not be empty"));
+            }
+        }
+        match self.authorization.roe_policy_mode.as_str() {
+            "strict" | "permissive_audited" => {}
+            other => {
+                return Err(anyhow!(
+                    "invalid authorization.roe_policy_mode '{other}' (expected 'strict' or 'permissive_audited')"
+                ));
             }
         }
         Ok(())
@@ -735,6 +769,30 @@ fn engagement_options(cfg: &FileConfig) -> agentbug_engagement::EngagementOption
     }
 }
 
+/// Translate the operator's config-only ROE mode into the engagement option.
+/// `validate` guarantees the string is one of the two accepted values.
+fn roe_options(cfg: &FileConfig) -> agentbug_engagement::EngagementRoeOptions {
+    let mode = match cfg.authorization.roe_policy_mode.as_str() {
+        "permissive_audited" => agentbug_engagement::RoePolicyMode::PermissiveAudited,
+        // Anything else is rejected by `FileConfig::validate`; strict is also
+        // the fail-closed default.
+        _ => agentbug_engagement::RoePolicyMode::Strict,
+    };
+    agentbug_engagement::EngagementRoeOptions { mode }
+}
+
+/// Emit a loud operator notice so the permissive mode is never a silent downgrade.
+fn warn_if_permissive_roe(cfg: &FileConfig) {
+    if cfg.authorization.roe_policy_mode == "permissive_audited" {
+        eprintln!(
+            "warning: authorization.roe_policy_mode = \"permissive_audited\" is active: \
+             every unmappable ROE line is auto-acknowledged for its exact brief hash, \
+             the engagement outcome is forced to `incomplete`, and every auto-acknowledgement \
+             is fully audited. This does NOT relax denied finding classes, scope, or tool gates."
+        );
+    }
+}
+
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -763,23 +821,9 @@ fn print_engagement_status(db: &std::path::Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
-        .with_target(false)
-        .init();
-    let cli = Cli::parse();
-    let config_path = cli.config.clone();
-    let cfg = load_config(&cli.config)?;
-    cfg.validate()?;
-    match cli.command {
-        Commands::Init { force } => {
-            let path = Path::new("agentbug.toml");
-            if path.exists() && !force {
-                println!("agentbug.toml already exists (use --force to overwrite)");
-            } else {
-                let sample = r#"# AgentBug core config (hardened MVP)
+/// Sample config written by `agentbug init`. Kept as a constant so tests can
+/// assert that the operator-only ROE controls are documented.
+const INIT_SAMPLE: &str = r#"# AgentBug core config (hardened MVP)
 [llm]
 base_url = "https://api.openai.com"
 # api_key = "env:OPENAI_API_KEY"  # recommended: read from environment
@@ -792,6 +836,14 @@ mode = "ask"          # ask | full_auto
 max_steps = 20
 # Escape hatch: skip every approval prompt (off by default).
 auto_approve_all = false
+
+# Universal ROE policy mode (config-only; never derived from flags or LLM output):
+#   strict             - unmappable ROE lines abort until an operator acknowledges them.
+#   permissive_audited - auto-acknowledge every unmappable line for the exact brief hash,
+#                        force outcome `incomplete`, and fully audit every acknowledgement.
+# See docs/engagement.md ("Universal ROE policy mode").
+# [authorization]
+# roe_policy_mode = "strict"
 
 # Policy allow/deny lists and budgets. Budgets are aliases: 0 = unlimited.
 [policy]
@@ -813,7 +865,25 @@ allow_intrusive = false
 [storage]
 path = ".agentbug/agentbug.db"
 "#;
-                std::fs::write(path, sample).context("write agentbug.toml")?;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
+        .with_target(false)
+        .init();
+    let cli = Cli::parse();
+    let config_path = cli.config.clone();
+    let cfg = load_config(&cli.config)?;
+    cfg.validate()?;
+    warn_if_permissive_roe(&cfg);
+    match cli.command {
+        Commands::Init { force } => {
+            let path = Path::new("agentbug.toml");
+            if path.exists() && !force {
+                println!("agentbug.toml already exists (use --force to overwrite)");
+            } else {
+                std::fs::write(path, INIT_SAMPLE).context("write agentbug.toml")?;
                 println!("wrote agentbug.toml");
             }
         }
@@ -1319,6 +1389,7 @@ path = ".agentbug/agentbug.db"
             ));
             monitor.start()?;
             let options = engagement_options(&cfg);
+            let roe = roe_options(&cfg);
             let (tx, rx) = std::sync::mpsc::channel::<agentbug_engagement::EngagementEvent>();
 
             // Keep the id emitted by the Started event so Ctrl+C can abort the
@@ -1352,15 +1423,18 @@ path = ".agentbug/agentbug.db"
             let worker_db = db_path.clone();
             let worker = std::thread::spawn(move || -> Result<()> {
                 if let Some(brief_text) = worker_brief {
-                    agentbug_engagement::engage_with_local_brief_tx(
+                    agentbug_engagement::engage_with_local_brief_tx_and_roe(
                         Path::new(&worker_db),
                         Path::new(&worker_cwd),
                         &brief_text,
                         options,
+                        roe,
                         tx,
                     )
                     .map(|_| ())
                 } else if brief_only {
+                    // No ROE-aware platform variant exists; keep the existing
+                    // brief-only behavior (engagement uses strict defaults).
                     agentbug_engagement::engage_brief_only_with_platform(
                         &worker_url,
                         Path::new(&worker_cwd),
@@ -1370,7 +1444,22 @@ path = ".agentbug/agentbug.db"
                         tx,
                     )
                     .map(|_| ())
+                } else if matches!(platform, PlatformArg::Generic) {
+                    // The generic platform uses the plain public-page fetch, so
+                    // this is the URL engagement path that honours the operator's
+                    // config-only universal ROE mode.
+                    agentbug_engagement::engage_with_options_and_roe(
+                        &worker_url,
+                        Path::new(&worker_cwd),
+                        Path::new(&worker_db),
+                        options,
+                        roe,
+                        tx,
+                    )
+                    .map(|_| ())
                 } else {
+                    // Read-only platform adapters have no ROE-aware variant;
+                    // keep their behavior unchanged (strict ROE defaults).
                     agentbug_engagement::engage_with_platform(
                         &worker_url,
                         Path::new(&worker_cwd),
@@ -1681,5 +1770,124 @@ max_tokens_budget = 55
         assert_eq!(reloaded.policy.allowed_tools, cfg.policy.allowed_tools);
         assert_eq!(reloaded.policy.denied_targets, cfg.policy.denied_targets);
         assert_eq!(reloaded.policy.max_tokens_budget, 55);
+    }
+
+    const STRICT_ROE_CONFIG: &str = r#"
+[authorization]
+roe_policy_mode = "strict"
+"#;
+
+    const PERMISSIVE_ROE_CONFIG: &str = r#"
+[authorization]
+roe_policy_mode = "permissive_audited"
+"#;
+
+    const UNKNOWN_ROE_CONFIG: &str = r#"
+[authorization]
+roe_policy_mode = "permissive"
+"#;
+
+    #[test]
+    fn roe_policy_mode_defaults_to_strict() {
+        let cfg = FileConfig::default();
+        assert_eq!(cfg.authorization.roe_policy_mode, "strict");
+        assert!(matches!(
+            roe_options(&cfg).mode,
+            agentbug_engagement::RoePolicyMode::Strict
+        ));
+
+        let cfg: FileConfig = toml::from_str("").expect("parse empty config");
+        cfg.validate().expect("validate empty config");
+        assert_eq!(cfg.authorization.roe_policy_mode, "strict");
+        assert!(matches!(
+            roe_options(&cfg).mode,
+            agentbug_engagement::RoePolicyMode::Strict
+        ));
+
+        let cfg: FileConfig = toml::from_str("[authorization]\n").expect("parse empty section");
+        cfg.validate().expect("validate empty section");
+        assert_eq!(cfg.authorization.roe_policy_mode, "strict");
+        assert!(matches!(
+            roe_options(&cfg).mode,
+            agentbug_engagement::RoePolicyMode::Strict
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_strict_and_permissive_audited() {
+        let cfg: FileConfig = toml::from_str(STRICT_ROE_CONFIG).expect("parse strict config");
+        cfg.validate().expect("validate strict config");
+        assert!(matches!(
+            roe_options(&cfg).mode,
+            agentbug_engagement::RoePolicyMode::Strict
+        ));
+
+        let cfg: FileConfig =
+            toml::from_str(PERMISSIVE_ROE_CONFIG).expect("parse permissive config");
+        cfg.validate().expect("validate permissive config");
+        assert!(matches!(
+            roe_options(&cfg).mode,
+            agentbug_engagement::RoePolicyMode::PermissiveAudited
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_roe_policy_mode() {
+        let cfg: FileConfig = toml::from_str(UNKNOWN_ROE_CONFIG).expect("parse unknown config");
+        let error = cfg
+            .validate()
+            .expect_err("unknown ROE policy mode must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("authorization.roe_policy_mode"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("'strict' or 'permissive_audited'"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn roe_mode_is_config_only() {
+        // auto_approve_all and mode are unrelated gates; neither may change the
+        // universal ROE mode, and there is no CLI flag for it.
+        let cfg: FileConfig = toml::from_str(OPT_IN_CONFIG).expect("parse opt-in config");
+        cfg.validate().expect("validate opt-in config");
+        assert!(cfg.agent.auto_approve_all);
+        assert!(matches!(
+            roe_options(&cfg).mode,
+            agentbug_engagement::RoePolicyMode::Strict
+        ));
+
+        // There is deliberately no CLI flag for the universal ROE mode.
+        assert!(
+            Cli::try_parse_from([
+                "agentbug",
+                "engage",
+                "--url",
+                "https://example.com",
+                "--roe-policy-mode",
+                "permissive_audited",
+            ])
+            .is_err(),
+            "ROE mode must be config-only, not a CLI flag"
+        );
+    }
+
+    #[test]
+    fn init_sample_documents_roe_policy_mode() {
+        assert!(
+            INIT_SAMPLE.contains("[authorization]"),
+            "init sample must show the authorization section"
+        );
+        assert!(
+            INIT_SAMPLE.contains("roe_policy_mode = \"strict\""),
+            "init sample must document the strict default"
+        );
+        assert!(
+            INIT_SAMPLE.contains("permissive_audited"),
+            "init sample must document the permissive audited mode"
+        );
     }
 }

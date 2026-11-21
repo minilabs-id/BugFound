@@ -11,6 +11,7 @@ pub enum BriefLineClass {
     ProhibitedVulnClass,
     ReportOrRewardPolicy,
     ScopeOrAsset,
+    InformationalProse,
     Noise,
     Unknown,
 }
@@ -22,6 +23,7 @@ impl BriefLineClass {
             Self::ProhibitedVulnClass => "prohibited_vuln_class",
             Self::ReportOrRewardPolicy => "report_or_reward_policy",
             Self::ScopeOrAsset => "scope_or_asset",
+            Self::InformationalProse => "informational_prose",
             Self::Noise => "noise",
             Self::Unknown => "unknown",
         }
@@ -51,6 +53,35 @@ fn has_phrase(tokens: &[String], phrase: &str) -> bool {
     tokens
         .windows(needle.len())
         .any(|window| window == needle.as_slice())
+}
+
+/// Technical-action vocabulary. Informational recognition is suppressed when
+/// any of these appear, so "we never share data" stays informational while
+/// "never scan the staging API" remains an actionable technical rule.
+const TECHNICAL_ACTION_TOKENS: &[&str] = &[
+    "scan",
+    "fuzz",
+    "test",
+    "send",
+    "request",
+    "traffic",
+    "modify",
+    "state chang",
+    "disclos",
+    "submit",
+    "exploit",
+    "brute",
+    "dos",
+    "rate limit",
+    "user-agent",
+    "automated",
+];
+
+fn has_technical_action(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    TECHNICAL_ACTION_TOKENS
+        .iter()
+        .any(|token| lower.contains(token))
 }
 
 /// Explicit reward/report policy signals. These are checked before any
@@ -90,6 +121,30 @@ const REWARD_SIGNALS: &[&str] = &[
     "overall risk to our applications",
 ];
 
+/// Clearly non-operational prose. Checked before [`OPERATIONAL`] so that a
+/// bare "never"/"avoid" in privacy, marketing, or product copy cannot be
+/// mistaken for a tool rule. Reward/report prose is already covered by
+/// [`REWARD_SIGNALS`], which retains first-place precedence.
+const INFORMATIONAL: &[&str] = &[
+    // privacy
+    "privacy policy",
+    "personal data",
+    "we never share",
+    "we never sell",
+    "your information",
+    // marketing / product
+    "sign up",
+    "newsletter",
+    "pricing",
+    "press release",
+    "blog post",
+    "our product",
+    "mobile app",
+    "browser extension",
+    "known limitation",
+    "not currently supported",
+];
+
 /// Vulnerability-class vocabulary from the deterministic CWE rule table.
 const VULN_CLASSES: &[(&str, &str)] = &[
     ("csrf", "csrf_without_auth"),
@@ -105,16 +160,33 @@ const VULN_CLASSES: &[(&str, &str)] = &[
 ];
 
 /// Operational markers that make an unmapped line abortable.
+///
+/// Bare "never"/"avoid" are deliberately absent: on their own they classify
+/// ordinary informational prose as actionable. Only the technical-action
+/// combinations below are abortable.
 const OPERATIONAL: &[&str] = &[
     "do not scan",
     "do not test",
     "do not send",
     "do not use",
     "must not",
-    "never",
+    "never scan",
+    "never test",
+    "never send",
+    "never use",
+    "never modify",
+    "never disclose",
+    "never submit",
+    "never exploit",
     "prohibited",
     "forbidden",
-    "avoid",
+    "avoid scanning",
+    "avoid testing",
+    "avoid sending",
+    "avoid using",
+    "avoid automated scanners",
+    "avoid fuzzing",
+    "avoid modifying",
     "refrain",
     "maximum",
     "requests per second",
@@ -153,6 +225,21 @@ pub fn classify_line(line: &str) -> ClassifiedLine<'_> {
                 rule_id: rule,
             };
         }
+    }
+    // Non-operational prose is recognized before generic operational markers,
+    // but only when the line carries no technical-action token. This keeps
+    // "we never share personal data" informational without weakening rules
+    // such as "never scan the staging API".
+    if !has_technical_action(trimmed)
+        && INFORMATIONAL
+            .iter()
+            .any(|phrase| has_phrase(&tokens, phrase))
+    {
+        return ClassifiedLine {
+            line,
+            class: BriefLineClass::InformationalProse,
+            rule_id: "informational_prose",
+        };
     }
     if OPERATIONAL.iter().any(|phrase| has_phrase(&tokens, phrase)) {
         return ClassifiedLine {
@@ -194,6 +281,7 @@ pub fn is_abortable(class: BriefLineClass, recognized: bool) -> bool {
         BriefLineClass::ActionableTechnical | BriefLineClass::ProhibitedVulnClass => !recognized,
         BriefLineClass::ReportOrRewardPolicy
         | BriefLineClass::ScopeOrAsset
+        | BriefLineClass::InformationalProse
         | BriefLineClass::Noise
         | BriefLineClass::Unknown => false,
     }
@@ -234,5 +322,55 @@ mod tests {
         let b = classify_line("Do not modify data.");
         assert_eq!(a.class, BriefLineClass::ReportOrRewardPolicy);
         assert_eq!(b.class, BriefLineClass::ActionableTechnical);
+    }
+
+    #[test]
+    fn informational_privacy_line_with_never_is_not_actionable() {
+        let line = "We never share your personal data outside our company.";
+        let classified = classify_line(line);
+        assert_eq!(classified.class, BriefLineClass::InformationalProse);
+        assert_eq!(classified.rule_id, "informational_prose");
+        assert!(!is_abortable(classified.class, false));
+    }
+
+    #[test]
+    fn marketing_product_line_is_informational() {
+        let line = "Sign up for our newsletter to receive product updates.";
+        let classified = classify_line(line);
+        assert_eq!(classified.class, BriefLineClass::InformationalProse);
+        assert!(!is_abortable(classified.class, false));
+    }
+
+    #[test]
+    fn reward_policy_line_with_avoid_is_not_actionable() {
+        let line = "To avoid confusion, reward amounts are final and not subject to change.";
+        let classified = classify_line(line);
+        assert_eq!(classified.class, BriefLineClass::ReportOrRewardPolicy);
+        assert!(!is_abortable(classified.class, false));
+    }
+
+    #[test]
+    fn narrowed_never_still_aborts_with_technical_action() {
+        let line = "Never scan the production database under any circumstances.";
+        let classified = classify_line(line);
+        assert_eq!(classified.class, BriefLineClass::ActionableTechnical);
+        assert!(is_abortable(classified.class, false));
+    }
+
+    #[test]
+    fn avoid_with_automated_scanners_still_aborts() {
+        let line = "Avoid automated scanners when testing our API.";
+        let classified = classify_line(line);
+        assert_eq!(classified.class, BriefLineClass::ActionableTechnical);
+        assert!(is_abortable(classified.class, false));
+    }
+
+    #[test]
+    fn do_not_modify_data_stays_actionable() {
+        let line = "Do not modify data in the production environment.";
+        let classified = classify_line(line);
+        assert_eq!(classified.class, BriefLineClass::ActionableTechnical);
+        assert_eq!(classified.rule_id, "operational_marker");
+        assert!(is_abortable(classified.class, false));
     }
 }

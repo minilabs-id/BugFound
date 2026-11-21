@@ -2064,20 +2064,12 @@ pub fn search_round_tasks(
     if round <= 1 {
         return Ok(tasks.into_iter().filter(pending).collect());
     }
-    let open_requirements: HashSet<String> = store
-        .list_hypotheses(engagement_id)?
-        .into_iter()
-        .filter(|hypothesis| !is_terminal_hypothesis(&hypothesis.status))
-        .map(|hypothesis| hypothesis.requirement_id)
-        .collect();
-    Ok(tasks
-        .into_iter()
-        .filter(pending)
-        .filter(|task| {
-            matches!(task.status.as_str(), "needs-review" | "failed")
-                || open_requirements.contains(&task.playbook_id)
-        })
-        .collect())
+    // Later rounds deliberately revisit EVERY playbook from a different
+    // angle. A `done` status only means the first pass produced evidence,
+    // not that the search is exhausted; unresolved hypotheses must keep
+    // getting fresh angles until the round budget is spent.
+    let _ = pending;
+    Ok(tasks)
 }
 
 /// Translate a runner's persisted messages into engagement Action events and

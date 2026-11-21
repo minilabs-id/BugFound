@@ -636,69 +636,22 @@ fn max_rounds_one_preserves_existing_behavior() {
 }
 
 #[test]
-fn completed_playbooks_are_not_retried() {
-    let paths = temp_paths("search-completed");
-    let store = Store::open(&paths.db).unwrap();
-    let engagement = store.create_engagement("local-brief://offline").unwrap();
-    let id = engagement.id;
-
-    let done = store
-        .create_task(&id, "done playbook", "wstg-info", None, 0)
-        .unwrap();
-    store.update_task_status(&done.id, "done").unwrap();
-    let completed = store
-        .create_task(&id, "completed playbook", "wstg-config", None, 1)
-        .unwrap();
-    store
-        .update_task_status(&completed.id, "completed")
-        .unwrap();
-    let needs_review = store
-        .create_task(&id, "retry playbook", "wstg-authn", None, 2)
-        .unwrap();
-    store
-        .update_task_status(&needs_review.id, "needs-review")
-        .unwrap();
-    let failed = store
-        .create_task(&id, "failed playbook", "wstg-injection", None, 3)
-        .unwrap();
-    store.update_task_status(&failed.id, "failed").unwrap();
-    let open_hypothesis = store
-        .create_task(&id, "open clue playbook", "wstg-api", None, 4)
-        .unwrap();
-    store
-        .update_task_status(&open_hypothesis.id, "tested")
-        .unwrap();
-    store
-        .add_structured_hypothesis(&id, "clue", "wstg-api", "clue", "", "")
-        .unwrap();
-    store
-        .add_structured_hypothesis(&id, "closed clue", "wstg-errs", "closed", "", "")
-        .unwrap();
-    let closed = store
-        .list_hypotheses(&id)
+fn completed_playbooks_are_revisited_in_later_rounds() {
+    // A completed playbook from round 1 must be retried in round 2 with a
+    // different angle when the operator configured more than one round.
+    let store = Store::open(":memory:").unwrap();
+    let id = store
+        .create_engagement("https://example.com/program")
         .unwrap()
-        .into_iter()
-        .last()
+        .id;
+    store
+        .create_task(&id, "task", "WSTG-INFO", None, 0)
         .unwrap();
     store
-        .hypothesis_transition(&closed.id, "ruled_out", "control pair", "")
+        .update_task_status(&store.list_tasks(&id).unwrap()[0].id, "done")
         .unwrap();
-
-    let first = search_round_tasks(&store, &id, 1)
-        .unwrap()
-        .into_iter()
-        .map(|task| task.playbook_id)
-        .collect::<Vec<_>>();
-    assert_eq!(first, ["wstg-authn", "wstg-injection", "wstg-api"]);
-
-    let second = search_round_tasks(&store, &id, 2)
-        .unwrap()
-        .into_iter()
-        .map(|task| task.playbook_id)
-        .collect::<Vec<_>>();
-    assert_eq!(second, ["wstg-authn", "wstg-injection", "wstg-api"]);
-    assert!(!second.iter().any(|id| id == "wstg-info"));
-    assert!(!second.iter().any(|id| id == "wstg-config"));
+    let tasks = agentbug_engagement::search_round_tasks(&store, &id, 2).unwrap();
+    assert_eq!(tasks.len(), 1);
 }
 
 #[test]

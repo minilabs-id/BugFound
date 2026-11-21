@@ -343,3 +343,26 @@ All results remain construction evidence. No benchmark claim is asserted.
   failed on upstream LLM POST errors. No benchmark claim is asserted.
 - All fixes must keep existing tests green; speculative loosening of the narrow
   policy target key list was reverted.
+
+
+### R17 — Burp/ZAP tool mechanisms (COMPLETE, local slice)
+- Deep research from authoritative sources under `/research/` (git-ignored):
+  PortSwigger `burp-extender-api` (42 interfaces, proprietary API contracts —
+  concepts only, no code copied) and OWASP ZAP (Apache 2.0, sparse clone of
+  `ascan`, `network`, `httppanel`). Written up in `docs/research/18_burp_tool_mechanisms.md`.
+- Key finding: AgentBug already has the defensive half of these tools —
+  `HttpRequestTool` canary + method gate, `HttpFuzzTool` caps (200/200),
+  fail-closed tool withholding, byte-authoritative evidence. The genuine gap
+  was the local analysis layer.
+- Added three local, no-egress, no-gate tools: `decode` (Decoder),
+  `enumerate_insertion_points` (Burp Scanner/Intruder + ZAP `VariantFactory`
+  equivalent, with byte offsets for url/form/cookie/header/path), and
+  `http_diff` (Comparer + `analyzeResponseVariations` equivalent).
+- Live rerun a9c02821: 9/9 playbooks evidenced (up from 2/9), 0 findings,
+  coverage 0, outcome `incomplete`, report sha256
+  ab727e33696769d8a9d246f6010cc361897e78d9faf7b4e929303246a6e666c5.
+  Fixed from that run: path-scoped exclusions no longer block whole hosts,
+  specificity compares host-label counts, report timeline is session-scoped.
+- Still deferred: OOB Collaborator, live intercepting proxy, Sequencer,
+  cookie jar/redirect control, full gated active-scan orchestrator.
+- All numbers remain construction evidence. No benchmark claim is asserted.

@@ -2321,6 +2321,350 @@ impl Tool for SessionFinishTool {
     }
 }
 
+/// Burp Decoder equivalent. Fully local; no network and no gate.
+pub struct DecodeTool;
+
+fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn url_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+                {
+                    out.push(high * 16 + low);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn url_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else if byte == b' ' {
+            out.push('+');
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn hex_encode_str(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn hex_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        out.push(hex_value(pair[0])? * 16 + hex_value(pair[1])?);
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+#[async_trait]
+impl Tool for DecodeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "decode".into(),
+            description:
+                "Encode or decode URL, base64 and hex values locally (Burp Decoder equivalent)."
+                    .into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "operation":{"type":"string","enum":["url_decode","url_encode","base64_decode","base64_encode","hex_decode","hex_encode"]},
+                    "input":{"type":"string"}
+                },
+                "required":["operation","input"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let operation = input
+            .get("operation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let value = input.get("input").and_then(|v| v.as_str()).unwrap_or("");
+        use base64::Engine;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let result = match operation {
+            "url_decode" => url_decode(value),
+            "url_encode" => url_encode(value),
+            "base64_encode" => engine.encode(value.as_bytes()),
+            "base64_decode" => engine
+                .decode(value)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_else(|_| format!("invalid base64: {}", redact(value))),
+            "hex_encode" => hex_encode_str(value),
+            "hex_decode" => {
+                hex_decode(value).unwrap_or_else(|| format!("invalid hex: {}", redact(value)))
+            }
+            other => return Err(anyhow!("unsupported decode operation: {other}")),
+        };
+        Ok(ToolResult {
+            ok: true,
+            output: inline_view(&result),
+            structured: Some(json!({"operation": operation, "result": result})),
+        })
+    }
+}
+
+/// Burp Scanner/Intruder insertion-point equivalent (ZAP `VariantFactory`).
+/// Purely local: it only describes where parameters are, it never sends them.
+pub struct InsertionPointsTool;
+
+#[async_trait]
+impl Tool for InsertionPointsTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "enumerate_insertion_points".into(),
+            description: "Enumerate URL, form, cookie, header and path parameter positions with byte offsets in a reconstructed request (Burp Scanner/Intruder insertion points). Local only.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "url":{"type":"string","description":"Absolute http/https URL"},
+                    "method":{"type":"string","default":"GET"},
+                    "headers":{"type":"object","additionalProperties":{"type":"string"}},
+                    "cookies":{"type":"string","description":"Raw Cookie header value"},
+                    "body":{"type":"string"}
+                },
+                "required":["url"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let url = input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("url is required"))?;
+        let parsed = url::Url::parse(url).map_err(|e| anyhow!("invalid url: {e}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(anyhow!("url must be http or https"));
+        }
+        let method = input
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET")
+            .to_ascii_uppercase();
+        let host = parsed.host_str().unwrap_or_default();
+        let path = parsed.path();
+        let query = parsed.query().unwrap_or("");
+        let target = if query.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{query}")
+        };
+        let mut request = format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\n");
+        let mut points: Vec<Value> = Vec::new();
+
+        let path_start = method.len() + 1;
+        for segment in path.split('/').filter(|part| !part.is_empty()) {
+            if let Some(offset) = request[path_start..].find(segment) {
+                let start = path_start + offset;
+                points.push(json!({
+                    "type":"path","name":segment,"value":segment,
+                    "value_start":start,"value_end":start + segment.len()
+                }));
+            }
+        }
+
+        let headers: Vec<(String, String)> = input
+            .get("headers")
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (name.clone(), value.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (name, value) in &headers {
+            let value_start = request.len();
+            request.push_str(&format!("{name}: {value}\r\n"));
+            let start = value_start + name.len() + 2;
+            points.push(json!({
+                "type":"header","name":name,"value":value,
+                "value_start":start,"value_end":start + value.len()
+            }));
+        }
+
+        let cookie = input.get("cookies").and_then(|v| v.as_str()).unwrap_or("");
+        if !cookie.is_empty() {
+            let cookie_start = request.len();
+            request.push_str(&format!("Cookie: {cookie}\r\n"));
+            for pair in cookie.split(';') {
+                if let Some((name, value)) = pair.trim().split_once('=') {
+                    if let Some(offset) = cookie[..].find(pair.trim()) {
+                        let start = cookie_start + "Cookie: ".len() + offset;
+                        let value_start = start + name.len() + 1;
+                        points.push(json!({
+                            "type":"cookie","name":name,"value":value,
+                            "value_start":value_start,
+                            "value_end":value_start + value.len()
+                        }));
+                    }
+                }
+            }
+        }
+
+        let body = input.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        let content_type = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("");
+        let body_offset = request.len() + 2;
+        request.push_str("\r\n");
+        if !body.is_empty() {
+            request.push_str(body);
+            // ZAP only exposes form parameters for urlencoded bodies.
+            if content_type.starts_with("application/x-www-form-urlencoded") {
+                for (name, value) in url::form_urlencoded::parse(body.as_bytes()) {
+                    if let Some(offset) = body.find(&format!("{name}={value}")) {
+                        let value_start = body_offset + offset + name.len() + 1;
+                        points.push(json!({
+                            "type":"form","name":name,"value":value,
+                            "value_start":value_start,
+                            "value_end":value_start + value.len()
+                        }));
+                    }
+                }
+            }
+        }
+        for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            if let Some(offset) = query.find(&format!("{name}={value}")) {
+                let query_start = request.find(query).unwrap_or(0);
+                let value_start = query_start + offset + name.len() + 1;
+                points.push(json!({
+                    "type":"url","name":name,"value":value,
+                    "value_start":value_start,
+                    "value_end":value_start + value.len()
+                }));
+            }
+        }
+
+        Ok(ToolResult {
+            ok: true,
+            output: format!("{} insertion point(s)", points.len()),
+            structured: Some(json!({
+                "request": request,
+                "body_offset": body_offset,
+                "points": points
+            })),
+        })
+    }
+}
+
+/// Burp Comparer / ZAP `analyzeResponseVariations` equivalent. Local only.
+pub struct HttpDiffTool;
+
+#[async_trait]
+impl Tool for HttpDiffTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "http_diff".into(),
+            description: "Compare two captured responses and report variant/invariant lines (Burp Comparer equivalent). Local only.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "a":{"type":"string"},
+                    "b":{"type":"string"},
+                    "max_lines":{"type":"integer","default":40}
+                },
+                "required":["a","b"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let a = input.get("a").and_then(|v| v.as_str()).unwrap_or("");
+        let b = input.get("b").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = input
+            .get("max_lines")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(40)
+            .min(200) as usize;
+        let lines_a: Vec<&str> = a.lines().map(str::trim_end).collect();
+        let lines_b: Vec<&str> = b.lines().map(str::trim_end).collect();
+        let set_b: std::collections::BTreeSet<&str> = lines_b.iter().copied().collect();
+        let set_a: std::collections::BTreeSet<&str> = lines_a.iter().copied().collect();
+        let invariant: Vec<&str> = set_a.intersection(&set_b).copied().collect();
+        let added: Vec<&str> = set_b.difference(&set_a).copied().collect();
+        let removed: Vec<&str> = set_a.difference(&set_b).copied().collect();
+        let status_a = lines_a.first().and_then(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .and_then(|code| code.parse::<u16>().ok())
+        });
+        let status_b = lines_b.first().and_then(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .and_then(|code| code.parse::<u16>().ok())
+        });
+        Ok(ToolResult {
+            ok: true,
+            output: format!(
+                "diff: {} added, {} removed, {} invariant ({} vs {} bytes)",
+                added.len(),
+                removed.len(),
+                invariant.len(),
+                a.len(),
+                b.len()
+            ),
+            structured: Some(json!({
+                "status_a": status_a,
+                "status_b": status_b,
+                "length_delta": b.len() as i64 - a.len() as i64,
+                "variant_count": added.len() + removed.len(),
+                "invariant_count": invariant.len(),
+                "added": added.into_iter().take(limit).collect::<Vec<_>>(),
+                "removed": removed.into_iter().take(limit).collect::<Vec<_>>(),
+                "invariant": invariant.into_iter().take(limit).collect::<Vec<_>>()
+            })),
+        })
+    }
+}
+
 pub fn try_default_registry_with_options(
     cwd: impl AsRef<Path>,
     options: ToolOptions,
@@ -2379,6 +2723,10 @@ pub fn try_default_registry_with_options(
     reg.register(Arc::new(JwtDecodeTool));
     reg.register(Arc::new(HashUtilTool));
     reg.register(Arc::new(KnowledgeLookupTool));
+    // Burp/ZAP-equivalent local analysis tools. No network, no gate.
+    reg.register(Arc::new(DecodeTool));
+    reg.register(Arc::new(InsertionPointsTool));
+    reg.register(Arc::new(HttpDiffTool));
     reg.register(Arc::new(ReportWriterTool));
     reg.register(Arc::new(TaskPutTool));
     reg.register(Arc::new(CluePutTool));
@@ -4924,6 +5272,78 @@ mod tests {
         assert_eq!(decoded.structured.unwrap()["result"], json!("hi"));
         let bad = tool.run(json!({"op": "nope", "value": "x"})).await.unwrap();
         assert!(!bad.ok);
+    }
+
+    #[tokio::test]
+    async fn decode_round_trips_url_base64_and_hex() {
+        for (op, input, expected) in [
+            ("url_encode", "a b+c", "a+b%2Bc"),
+            ("url_decode", "a+b%2Bc", "a b+c"),
+            ("base64_encode", "hello", "aGVsbG8="),
+            ("base64_decode", "aGVsbG8=", "hello"),
+            ("hex_encode", "AB", "4142"),
+            ("hex_decode", "4142", "AB"),
+        ] {
+            let result = DecodeTool
+                .run(json!({"operation": op, "input": input}))
+                .await
+                .unwrap();
+            assert!(result.ok, "{op} failed");
+            assert_eq!(
+                result.structured.unwrap()["result"],
+                json!(expected),
+                "{op}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn insertion_points_enumerate_all_parameter_locations() {
+        let result = InsertionPointsTool
+            .run(json!({
+                "url": "https://api.example.com/v1/items/42?id=7&q=a+b",
+                "method": "POST",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded", "X-Test": "one"},
+                "cookies": "session=abc; theme=dark",
+                "body": "amount=10&currency=usd"
+            }))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        let points = data["points"].as_array().unwrap();
+        for kind in ["url", "form", "cookie", "header", "path"] {
+            assert!(
+                points.iter().any(|point| point["type"] == json!(kind)),
+                "missing {kind} insertion point"
+            );
+        }
+        let url_point = points
+            .iter()
+            .find(|point| point["name"] == json!("id"))
+            .unwrap();
+        assert_eq!(url_point["value"], json!("7"));
+        let request = data["request"].as_str().unwrap();
+        let start = url_point["value_start"].as_u64().unwrap() as usize;
+        let end = url_point["value_end"].as_u64().unwrap() as usize;
+        assert_eq!(&request[start..end], "7");
+    }
+
+    #[tokio::test]
+    async fn http_diff_reports_variant_and_invariant_lines() {
+        let result = HttpDiffTool
+            .run(json!({
+                "a": "HTTP/1.1 200 OK\nX-Mode: old\nSame: yes\nbody-a",
+                "b": "HTTP/1.1 200 OK\nX-Mode: new\nSame: yes\nbody-b"
+            }))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["status_a"], json!(200));
+        assert_eq!(data["status_b"], json!(200));
+        assert_eq!(data["variant_count"], json!(4));
+        assert_eq!(data["invariant_count"], json!(2));
     }
 
     #[tokio::test]

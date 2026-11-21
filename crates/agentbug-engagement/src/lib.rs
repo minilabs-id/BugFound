@@ -905,6 +905,7 @@ async fn engage_async(
             "program_url": redact(program_url),
             "model": model.as_deref().map(redact),
             "brief_only": brief_only,
+            "roe_policy_mode": format!("{:?}", roe_options.mode),
             "brief_source": if matches!(&brief_source, BriefSource::LocalText(_)) {
                 "local_file"
             } else {

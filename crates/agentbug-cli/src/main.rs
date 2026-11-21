@@ -204,8 +204,13 @@ enum Commands {
     },
     /// Run a full autonomous bug-bounty engagement from a program URL
     Engage {
+        /// Public program URL used to fetch the brief (unless --brief-file is given)
+        #[arg(long, required_unless_present = "brief_file")]
+        url: Option<String>,
+        /// Read an already-extracted brief from a local file for an authorized
+        /// offline target. No public-brief fetch is performed in this mode.
         #[arg(long)]
-        url: String,
+        brief_file: Option<String>,
         #[arg(long, default_value = ".")]
         cwd: String,
         #[arg(long)]
@@ -1276,12 +1281,26 @@ path = ".agentbug/agentbug.db"
         }
         Commands::Engage {
             url,
+            brief_file,
             cwd,
             db,
             brief_only,
             platform,
             api_key_env,
         } => {
+            // A local brief is already-extracted text. Read the bytes and use a
+            // lossy UTF-8 fallback; the contents are never printed or logged.
+            let local_brief_text = match &brief_file {
+                Some(path) => {
+                    let bytes =
+                        std::fs::read(path).with_context(|| format!("read brief file {path}"))?;
+                    Some(String::from_utf8_lossy(&bytes).into_owned())
+                }
+                None => None,
+            };
+            if brief_file.is_some() {
+                println!("brief source: local brief file (offline; public brief fetch disabled)");
+            }
             // Only the environment-variable NAME is passed down. The CLI never
             // reads, prints or stores the token value.
             let platform_options = agentbug_engagement::EngagementPlatformOptions {
@@ -1324,11 +1343,23 @@ path = ".agentbug/agentbug.db"
                 });
             });
 
-            let worker_url = url.clone();
+            let (worker_url, worker_brief) = match local_brief_text {
+                Some(text) => (String::new(), Some(text)),
+                None => (url.unwrap_or_default(), None),
+            };
             let worker_cwd = cwd.clone();
             let worker_db = db_path.clone();
-            let worker = std::thread::spawn(move || {
-                if brief_only {
+            let worker = std::thread::spawn(move || -> Result<()> {
+                if let Some(brief_text) = worker_brief {
+                    agentbug_engagement::engage_with_local_brief_tx(
+                        Path::new(&worker_db),
+                        Path::new(&worker_cwd),
+                        &brief_text,
+                        options,
+                        tx,
+                    )
+                    .map(|_| ())
+                } else if brief_only {
                     agentbug_engagement::engage_brief_only_with_platform(
                         &worker_url,
                         Path::new(&worker_cwd),
@@ -1337,6 +1368,7 @@ path = ".agentbug/agentbug.db"
                         platform_options,
                         tx,
                     )
+                    .map(|_| ())
                 } else {
                     agentbug_engagement::engage_with_platform(
                         &worker_url,
@@ -1346,6 +1378,7 @@ path = ".agentbug/agentbug.db"
                         platform_options,
                         tx,
                     )
+                    .map(|_| ())
                 }
             });
 
@@ -1585,6 +1618,58 @@ max_tokens_budget = 55
         assert_eq!(options.max_network_calls, 33);
         assert_eq!(options.requests_per_minute, 44);
         assert_eq!(options.max_estimated_tokens, 55);
+    }
+
+    #[test]
+    fn engage_accepts_brief_file_without_url() {
+        let cli = Cli::try_parse_from([
+            "agentbug",
+            "engage",
+            "--brief-file",
+            "brief.txt",
+            "--cwd",
+            "workspace",
+        ])
+        .expect("parse engage with --brief-file and no --url");
+        match cli.command {
+            Commands::Engage {
+                url,
+                brief_file,
+                cwd,
+                ..
+            } => {
+                assert!(url.is_none());
+                assert_eq!(brief_file.as_deref(), Some("brief.txt"));
+                assert_eq!(cwd, "workspace");
+            }
+            _ => panic!("expected engage command"),
+        }
+    }
+
+    #[test]
+    fn engage_rejects_missing_url_and_brief_file() {
+        let error = Cli::try_parse_from(["agentbug", "engage"])
+            .err()
+            .expect("engage must require either --url or --brief-file");
+        assert!(
+            error.to_string().contains("--url"),
+            "unexpected clap error: {error}"
+        );
+    }
+
+    #[test]
+    fn engage_still_accepts_url_without_brief_file() {
+        let cli = Cli::try_parse_from(["agentbug", "engage", "--url", "https://example.com"])
+            .expect("parse engage with --url");
+        match cli.command {
+            Commands::Engage {
+                url, brief_file, ..
+            } => {
+                assert_eq!(url.as_deref(), Some("https://example.com"));
+                assert!(brief_file.is_none());
+            }
+            _ => panic!("expected engage command"),
+        }
     }
 
     #[test]

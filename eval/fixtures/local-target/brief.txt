@@ -1,0 +1,17 @@
+Program: AgentBug Local Construction Lab
+Program URL: http://127.0.0.1:8099/
+
+In scope:
+127.0.0.1
+127.0.0.1:8099
+
+Out of scope:
+(none)
+
+Rules of engagement:
+Fuzzing is authorized.
+State changes are allowed.
+Automated scanners are allowed.
+No disclosure.
+Do not access any host other than 127.0.0.1.
+Local lab only; no external submission of any kind.

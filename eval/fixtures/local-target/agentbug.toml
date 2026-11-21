@@ -1,0 +1,22 @@
+[llm]
+base_url = "https://tiprouter.my.id/v1"
+api_key = "env:AGENTBUG_API_KEY"
+default_model = "glm-5-3-flash"
+timeout_ms = 60000
+
+[agent]
+mode = "full_auto"
+max_steps = 25
+auto_approve_all = true
+
+[policy]
+allowed_tools = []
+denied_tools = []
+
+[network]
+allow_network_write = true
+allow_intrusive = true
+trusted_local_targets = ["127.0.0.1"]
+
+[oob]
+endpoint = "http://127.0.0.1:8082"

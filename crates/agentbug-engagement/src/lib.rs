@@ -207,7 +207,57 @@ pub fn engage_with_options(
         false,
         options,
         EngagementPlatformOptions::default(),
+        BriefSource::Url,
     ))
+}
+
+/// Start an engagement from an already-extracted local brief file.
+///
+/// This is the offline counterpart of [`engage_with_options`] for an authorized
+/// local target. The supplied text is used verbatim as the extracted brief: it
+/// bypasses only the public-brief fetcher (which intentionally rejects private
+/// hosts). Everything downstream is shared with the URL path — the traced
+/// deterministic scope parse, ROE classification, LLM/heuristic profile
+/// extraction, scope intersection, fail-closed checks and acknowledgement
+/// handling are identical.
+///
+/// Returns the newly created engagement id.
+pub fn engage_with_local_brief(
+    db: &Path,
+    workspace: &Path,
+    brief_text: &str,
+    options: EngagementOptions,
+) -> Result<String> {
+    // Keep the receiver alive so events still reach the replay log; callers
+    // that need a live event stream use `engage_with_local_brief_tx`.
+    let (tx, _rx) = std::sync::mpsc::channel::<EngagementEvent>();
+    engage_with_local_brief_tx(db, workspace, brief_text, options, tx)
+}
+
+/// Variant of [`engage_with_local_brief`] that streams the same events to a
+/// caller-supplied channel, so CLI/desktop monitors keep working offline.
+pub fn engage_with_local_brief_tx(
+    db: &Path,
+    workspace: &Path,
+    brief_text: &str,
+    options: EngagementOptions,
+    tx: Sender<EngagementEvent>,
+) -> Result<String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for local-brief engagement")?;
+    let profile = runtime.block_on(engage_async(
+        LOCAL_BRIEF_PROGRAM_URL,
+        workspace,
+        db,
+        tx,
+        false,
+        options,
+        EngagementPlatformOptions::default(),
+        BriefSource::LocalText(brief_text.to_string()),
+    ))?;
+    Ok(profile.id)
 }
 
 /// Read-only evaluation: ingest the public brief, extract scope/ROE and build
@@ -247,6 +297,7 @@ pub fn engage_brief_only_with_options(
         true,
         options,
         EngagementPlatformOptions::default(),
+        BriefSource::Url,
     ))
 }
 
@@ -274,6 +325,7 @@ pub fn engage_with_platform(
         false,
         options,
         platform_options,
+        BriefSource::Url,
     ))
 }
 
@@ -298,6 +350,7 @@ pub fn engage_brief_only_with_platform(
         true,
         options,
         platform_options,
+        BriefSource::Url,
     ))
 }
 
@@ -701,6 +754,20 @@ impl TraceRun {
 // Engagement orchestration
 // ---------------------------------------------------------------------------
 
+/// Synthetic program URL recorded for offline, local-brief engagements. It is
+/// provenance only: the public-brief fetcher is never invoked for this source.
+const LOCAL_BRIEF_PROGRAM_URL: &str = "local-brief://offline";
+
+/// The single seam at which brief text enters an engagement. `Url` uses the
+/// hardened public fetcher; `LocalText` carries already-extracted text supplied
+/// for an authorized local target. Both variants share every downstream scope
+/// and ROE gate.
+enum BriefSource {
+    Url,
+    LocalText(String),
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn engage_async(
     program_url: &str,
     workspace: &Path,
@@ -709,6 +776,7 @@ async fn engage_async(
     brief_only: bool,
     options: EngagementOptions,
     platform_options: EngagementPlatformOptions,
+    brief_source: BriefSource,
 ) -> Result<EngagementProfile> {
     std::fs::create_dir_all(workspace)
         .with_context(|| format!("create workspace {}", workspace.display()))?;
@@ -756,6 +824,11 @@ async fn engage_async(
             "program_url": redact(program_url),
             "model": model.as_deref().map(redact),
             "brief_only": brief_only,
+            "brief_source": if matches!(&brief_source, BriefSource::LocalText(_)) {
+                "local_file"
+            } else {
+                "url"
+            },
             "options": {
                 "mode": format!("{:?}", options.mode),
                 "max_steps": options.max_steps,
@@ -782,6 +855,7 @@ async fn engage_async(
         brief_only,
         options,
         platform_options,
+        brief_source,
     )
     .await;
     match outcome {
@@ -820,17 +894,26 @@ async fn run_engagement(
     brief_only: bool,
     options: EngagementOptions,
     platform_options: EngagementPlatformOptions,
+    brief_source: BriefSource,
 ) -> Result<EngagementProfile> {
     let mut ack_applied = false;
     // 1. BriefReader â€” no proxy, no redirects, private hosts rejected,
     //    non-2xx rejected, 1 MB body cap (H-02/H-11). Platform adapters are
     //    strictly read-only and fail closed when a required token is absent.
-    let (raw_html, brief_text) = fetch_engagement_brief(
-        platform_options.platform,
-        platform_options.api_key_env.as_deref(),
-        program_url,
-    )
-    .await?;
+    //    A local brief supplies already-extracted text, so only the network
+    //    fetch is skipped; the text is identical to what the fetcher would
+    //    have handed to every step below.
+    let (raw_html, brief_text) = match &brief_source {
+        BriefSource::Url => {
+            fetch_engagement_brief(
+                platform_options.platform,
+                platform_options.api_key_env.as_deref(),
+                program_url,
+            )
+            .await?
+        }
+        BriefSource::LocalText(text) => (text.clone(), text.clone()),
+    };
     if brief_text.trim().is_empty() {
         return Err(anyhow!(
             "program brief contains no readable text; refusing to engage (fail-closed)"
@@ -883,6 +966,32 @@ async fn run_engagement(
     // H-02: parse the full brief into a typed, fail-closed ROE policy and abort
     // on any safety constraint we cannot translate into a field.
     let (roe, unparsed) = roe_classify(&brief_text);
+    if let BriefSource::LocalText(_) = &brief_source {
+        // Advisory provenance for the local-brief path. Including the parsed
+        // flags makes it auditable (and testable) that the exact same fail-closed
+        // ROE classification ran on the supplied text. No permission is granted
+        // here: every gate below still reads `roe` and `options` unchanged.
+        trace.record(
+            store,
+            "brief.source",
+            json!({
+                "source": "local_file",
+                "program_url": redact(program_url),
+                "allow_fuzzing": roe.allow_fuzzing,
+                "allow_state_change": roe.allow_state_change,
+            }),
+        );
+        emit(
+            tx,
+            Some(replay),
+            EngagementEvent::Action {
+                tool: "brief_source".into(),
+                target: None,
+                ok: true,
+                detail: "local brief file (offline; public brief fetcher not used)".into(),
+            },
+        );
+    }
     if !unparsed.is_empty() {
         // Keep every unmapped rule visible. An operator may record a hash-
         // scoped acknowledgement out of band, but this step still aborts by
@@ -1167,12 +1276,20 @@ async fn run_engagement(
         // request row created by `resume_at_with_revalidation(.., true)`.
         if let Some(revalidation) = store.get_authorization_revalidation(id)? {
             if revalidation.state == "requested" {
-                let (_refetched_html, refetched_text) = fetch_engagement_brief(
-                    platform_options.platform,
-                    platform_options.api_key_env.as_deref(),
-                    program_url,
-                )
-                .await?;
+                // A local brief has no network source to re-fetch; the supplied
+                // bytes remain the authority, so the observed hash is unchanged
+                // and revalidation clears without any network access.
+                let (_refetched_html, refetched_text) = match &brief_source {
+                    BriefSource::Url => {
+                        fetch_engagement_brief(
+                            platform_options.platform,
+                            platform_options.api_key_env.as_deref(),
+                            program_url,
+                        )
+                        .await?
+                    }
+                    BriefSource::LocalText(text) => (text.clone(), text.clone()),
+                };
                 let observed_hash = hex_digest(refetched_text.as_bytes());
                 let latest = store.latest_authorization_snapshot(id)?;
                 let baseline_hash = latest
@@ -3941,6 +4058,47 @@ No DoS testing. Do not modify data. No disclosure.
         let engagements = store.list_engagements(10).unwrap();
         assert_eq!(engagements.len(), 1);
         assert_eq!(engagements[0].state, "aborted");
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A local brief authorising both risky classes must keep them authorised
+    /// through the whole engagement path (not just through a bare `parse_roe`
+    /// call), while the public brief fetcher is bypassed entirely.
+    #[test]
+    fn local_brief_path_parses_roe_and_marks_offline_source() {
+        const LOCAL_BRIEF: &str = r#"
+Program: Local Lab
+In scope:
+- *.local-lab.test
+Rules of engagement:
+State changes are allowed.
+Fuzzing is authorized.
+"#;
+        let db = temp_db("local-brief-source");
+        let workspace =
+            std::env::temp_dir().join(format!("agentbug-local-brief-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&workspace);
+
+        let id =
+            engage_with_local_brief(&db, &workspace, LOCAL_BRIEF, EngagementOptions::default())
+                .expect("local brief engagement must succeed");
+
+        let store = Store::open(&db).expect("open local brief db");
+        assert!(store.get_engagement(&id).expect("get engagement").is_some());
+        let conn = rusqlite::Connection::open(&db).expect("open trace db");
+        let payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM trace_events WHERE engagement_id=?1 AND kind='brief.source'",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .expect("local brief source trace must be recorded");
+        let value: Value = serde_json::from_str(&payload).expect("trace payload is JSON");
+        assert_eq!(value["source"], "local_file");
+        assert_eq!(value["allow_state_change"], true);
+        assert_eq!(value["allow_fuzzing"], true);
+
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::remove_file(&db);
     }

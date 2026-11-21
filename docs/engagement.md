@@ -272,3 +272,51 @@ or submitting it.**
 - `docs/report-format.md` — canonical report template, CVSS bands, CWE/OWASP mapping.
 - `docs/threat-model.md` — guardrails behind ROE, prompt-injection, and credential rules.
 - `docs/evaluation.md` / `eval/` — internal benchmark plan and scoring harness.
+
+
+## External recon adapters
+
+`browser` and `content_discovery` are CLI adapters and are **gated by default**.
+They become available only when the operator explicitly maps a command in the
+config file:
+
+```toml
+[external_tools]
+enabled = true
+auto_detect = false
+
+[external_tools.commands]
+playwright = "npx -y playwright"
+ffuf = "/usr/local/bin/ffuf"
+katana = "/usr/local/bin/katana"
+```
+
+`register_command_adapters` supports `nmap`, `naabu`, `nuclei`, `playwright`,
+`ffuf` and `katana`. A mapped command is still subject to scope, method and
+ROE gates; providing a binary is **not** an authorization bypass. If the
+binary is unavailable the tool returns a structured gated result instead of
+failing silently.
+
+## External OOB collaborator
+
+The `collaborator` tool defaults to a loopback-only simulation. To use a real
+OOB oracle, run `agentbug-collaborator` with a delegated domain and configure
+its loopback admin endpoint:
+
+```toml
+[oob]
+endpoint = "http://127.0.0.1:8082"
+```
+
+The engagement then mints tokens via `POST /token` and fetches interactions
+via `GET /interactions?token=...`. DNS interactions require UDP 53 reachable
+from the target (delegate the zone or port-forward). The admin listener is
+loopback-only and must never be exposed publicly. No token or API key is
+written to config or logs.
+
+## Local brief files (offline lab only)
+
+For authorized local targets, `--brief-file` bypasses the public brief fetcher
+(which intentionally rejects private hosts). The local text still goes through
+the same scope parser, ROE classifier and fail-closed gates. This exists for
+construction evidence and offline labs, not for production engagements.

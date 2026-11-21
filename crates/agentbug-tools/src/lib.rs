@@ -4080,7 +4080,7 @@ fn register_external_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &Tool
 /// Command-driven adapters are gated solely by `external_commands`: providing
 /// a command is the explicit opt-in, independent of `enable_external_tools`.
 fn register_command_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &ToolOptions) {
-    for name in ["nmap", "naabu", "nuclei", "playwright"] {
+    for name in ["nmap", "naabu", "nuclei", "playwright", "ffuf", "katana"] {
         let Some(command) = options.external_commands.get(name) else {
             continue;
         };

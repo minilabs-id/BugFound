@@ -630,6 +630,17 @@ impl Store {
         ] {
             let _ = conn.execute(&format!("ALTER TABLE hypotheses ADD COLUMN {column}"), []);
         }
+        // Older databases created `coverage` before the requirement-keyed
+        // columns existed. Without these migrations `list_coverage` fails and
+        // coverage silently reads as zero in reports and status.
+        for column in [
+            "requirement_id TEXT NOT NULL DEFAULT ''",
+            "status TEXT NOT NULL DEFAULT 'covered'",
+            "rationale TEXT NOT NULL DEFAULT ''",
+            "evidence_ref TEXT NOT NULL DEFAULT ''",
+        ] {
+            let _ = conn.execute(&format!("ALTER TABLE coverage ADD COLUMN {column}"), []);
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })

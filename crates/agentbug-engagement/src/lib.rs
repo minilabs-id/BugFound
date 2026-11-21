@@ -5118,4 +5118,27 @@ mod r12_tests {
         assert_eq!(updated.confidence.as_deref(), Some("medium"));
         assert_eq!(updated.oracle_type.as_deref(), Some("canary_echo"));
     }
+
+    #[test]
+    fn legacy_coverage_schema_is_migrated() {
+        let db = temp_db("legacy-coverage");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute(
+                "CREATE TABLE coverage(
+                   id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                   target TEXT NOT NULL, method TEXT NOT NULL,
+                   path TEXT NOT NULL, created_at TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        store
+            .record_coverage("s", "https://example.com", "GET", "/")
+            .unwrap();
+        let rows = store.list_coverage("s").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "covered");
+    }
 }

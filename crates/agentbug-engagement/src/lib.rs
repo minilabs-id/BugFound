@@ -1865,12 +1865,16 @@ async fn run_engagement(
                                 "verifier_falsification",
                                 &json!({"finding": finding.id, "verdict": verdict}).to_string(),
                             );
+                            // The verification role is advisory: only an upheld
+                            // verdict may promote a hypothesis to a confirmed
+                            // candidate. Disproved/inconclusive stay unresolved.
+                            let (status, rationale) = verification_hypothesis_status(&verdict);
                             mark_task_hypotheses(
                                 store,
                                 id,
                                 &task.playbook_id,
-                                "confirmed-candidate",
-                                "candidate finding verified by role",
+                                status,
+                                rationale,
                                 &finding.id,
                             );
                         }
@@ -1971,10 +1975,23 @@ async fn run_engagement(
         })
         .unwrap_or(0);
 
-    let final_state = if aborted { "aborted" } else { "completed" };
-    let _ = store.set_engagement_state(id, final_state);
-    let _ = store.upsert_engagement_control(id, final_state);
     let status = status_at(db_path, id)?;
+    let coverage = status.coverage;
+    let outcome = if aborted {
+        "aborted"
+    } else if ack_applied
+        || status.tasks_done < status.tasks_total
+        || coverage == 0
+        || open_hypotheses > 0
+    {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    // The durable engagement state must reflect the computed outcome: an
+    // engagement that stopped early is never stamped `completed`.
+    let _ = store.set_engagement_state(id, outcome);
+    let _ = store.upsert_engagement_control(id, outcome);
     let report = build_canonical_report(
         store,
         ReportContext {
@@ -2018,18 +2035,6 @@ async fn run_engagement(
             path: report_path.clone(),
         },
     );
-    let coverage = status.coverage;
-    let outcome = if aborted {
-        "aborted"
-    } else if ack_applied
-        || status.tasks_done < status.tasks_total
-        || coverage == 0
-        || open_hypotheses > 0
-    {
-        "incomplete"
-    } else {
-        "completed"
-    };
     let _ = store.append_trace(
         id,
         id,
@@ -2106,6 +2111,19 @@ fn is_terminal_hypothesis(status: &str) -> bool {
         status,
         "validated" | "ruled_out" | "blocked" | "not-applicable"
     )
+}
+
+/// Advisory verification verdicts. Only `upheld` may mark a hypothesis as a
+/// confirmed candidate; the other two leave a self-contained proof gap.
+fn verification_hypothesis_status(verdict: &str) -> (&'static str, &'static str) {
+    match verdict {
+        "upheld" => ("confirmed-candidate", "candidate finding verified by role"),
+        "disproved" => (
+            "open_proof_gap",
+            "verification role disproved the candidate",
+        ),
+        _ => ("open_proof_gap", "verification role inconclusive"),
+    }
 }
 
 fn mark_task_hypotheses(
@@ -3604,6 +3622,9 @@ enum OracleType {
     Timing,
     OobHit,
     BrowserDeferred,
+    /// Role captures are present but the declared class is not a comparator we
+    /// can replay; this is a proof gap, never a silent canary fallback.
+    OpenProofGap,
 }
 
 impl OracleType {
@@ -3615,6 +3636,7 @@ impl OracleType {
             Self::Timing => "timing",
             Self::OobHit => "oob_hit",
             Self::BrowserDeferred => "browser_deferred",
+            Self::OpenProofGap => "open_proof_gap",
         }
     }
 
@@ -3628,19 +3650,52 @@ impl OracleType {
             Self::Timing => "repeated timing samples with baseline and noise threshold",
             Self::OobHit => "external DNS/HTTP listener hit bound to the canary",
             Self::BrowserDeferred => "browser-executed DOM or artifact proof",
+            Self::OpenProofGap => {
+                "certified comparator role captures for the declared finding class"
+            }
         }
     }
 }
 
-fn effective_oracle(finding: &agentbug_store::Finding) -> OracleType {
+/// Pick the oracle that may confirm a finding. A finding with role captures is
+/// only eligible for the generic differential comparator; every other declared
+/// class (including an unknown or missing one) is a proof gap. Canary echo is
+/// reserved for the legacy single-primary-capture case with no role captures.
+fn effective_oracle(store: &Store, finding: &agentbug_store::Finding) -> OracleType {
+    if finding.id.trim().is_empty() {
+        return OracleType::OpenProofGap;
+    }
+    let role_capture = |role| {
+        store
+            .get_role_capture(&finding.id, role)
+            .ok()
+            .flatten()
+            .is_some()
+    };
+    let has_benign = role_capture("paired_benign");
+    let has_payload = role_capture("paired_payload");
+    let has_roles = has_benign || has_payload || role_capture("primary");
     match finding.oracle_type.as_deref() {
-        Some("differential") => OracleType::Differential,
+        Some("differential") | Some("comparator") if has_benign && has_payload => {
+            OracleType::Differential
+        }
+        Some("differential") | Some("comparator") => OracleType::OpenProofGap,
+        _ if has_roles => OracleType::OpenProofGap,
         Some("state_delta") => OracleType::StateDelta,
         Some("timing") => OracleType::Timing,
         Some("oob_hit") => OracleType::OobHit,
         Some("browser_deferred") => OracleType::BrowserDeferred,
         _ => OracleType::CanaryEcho,
     }
+}
+
+struct CandidateVerdict {
+    oracle: OracleType,
+    confirmed: bool,
+    capture_hash: Option<String>,
+    verdict: &'static str,
+    gap_reason: Option<String>,
+    detail: String,
 }
 
 fn verify_findings(
@@ -3656,99 +3711,17 @@ fn verify_findings(
     }
     let mut promoted = 0usize;
     for finding in store.list_findings(id)? {
-        let oracle = effective_oracle(&finding);
-        // Only canary_echo has a real confirmation oracle today. Every other
-        // class stays unconfirmed and must name the missing proof.
-        if oracle != OracleType::CanaryEcho {
-            let digest = store
-                .get_capture(&finding.id)
-                .ok()
-                .flatten()
-                .map(|capture| capture_digest(&capture, &capture_canary(&capture)));
-            trace.record(
-                store,
-                "verifier",
-                json!({
-                    "candidate": redact(&finding.id),
-                    "verified": false,
-                    "rejected": true,
-                    "oracle_type": oracle.as_str(),
-                    "missing_proof": oracle.missing_proof(),
-                }),
-            );
-            let _ = store.set_finding_verdict(
-                &finding.id,
-                "open_proof_gap",
-                Some(&format!("missing proof: {}", oracle.missing_proof())),
-            );
-            let _ = digest;
-            continue;
-        }
-        // A finding without an id, or without a tool capture, can never be
-        // replayed regardless of how self-consistent its LLM fields look.
-        let (verified, capture_hash, advisory_match) = if finding.id.trim().is_empty() {
-            (false, None, false)
-        } else {
-            match store.get_capture(&finding.id)? {
-                None => (false, None, false),
-                Some(capture) => {
-                    let canary = capture_canary(&capture);
-                    let response = String::from_utf8_lossy(&capture.response_bytes);
-                    let mut accepted = response.contains(&canary) && has_success_status(&response);
-                    // Secondary signal: a classic self-graded `<html` echo with
-                    // no canary is not independent evidence.
-                    if accepted && is_self_graded_marker(&response, &canary) {
-                        accepted = false;
-                    }
-                    // ROE constraints invalidate findings that claim forbidden
-                    // techniques in their title/description.
-                    let technique =
-                        format!("{} {}", finding.title, finding.description).to_ascii_lowercase();
-                    if accepted
-                        && !roe.allow_state_change
-                        && ["state chang", "modify data", "destructive", "dos "]
-                            .iter()
-                            .any(|token| technique.contains(token))
-                    {
-                        accepted = false;
-                    }
-                    // Brief-derived finding-class exclusions are enforced here,
-                    // never by the model. This can only reduce promotions.
-                    if accepted && !roe.denied_finding_classes.is_empty() {
-                        let verdict = classify_cwe(
-                            &finding.title,
-                            finding.vuln_type.as_deref(),
-                            Some(&finding.description),
-                        );
-                        if roe
-                            .denied_finding_classes
-                            .iter()
-                            .any(|denied| denied == verdict.cwe || denied == verdict.rule)
-                        {
-                            accepted = false;
-                        }
-                    }
-                    // Advisory only: note whether the LLM-supplied response
-                    // happened to match the captured bytes. Never a verdict.
-                    let matches = finding
-                        .response
-                        .as_deref()
-                        .is_some_and(|text| text.as_bytes() == capture.response_bytes.as_slice());
-                    let digest = capture_digest(&capture, &canary);
-                    (accepted, Some(digest), matches)
-                }
-            }
-        };
-
+        let result = verify_candidate(store, &finding, roe)?;
         // Eval trace: a verifier verdict and a finding record per candidate.
         trace.record(
             store,
             "verifier",
             json!({
                 "candidate": redact(&finding.id),
-                "verified": verified,
-                "rejected": !verified,
-                "verdict": if verified { "confirmed" } else if !finding.id.trim().is_empty() { paired_control_verdict(store, &finding.id) } else { "open_proof_gap" },
+                "verified": result.confirmed,
+                "rejected": !result.confirmed,
+                "oracle_type": result.oracle.as_str(),
+                "verdict": result.verdict,
             }),
         );
         trace.record(
@@ -3758,31 +3731,220 @@ fn verify_findings(
                 "id": redact(&finding.id),
                 "title": redact(&finding.title),
                 "severity": redact(&finding.severity),
-                "verified": verified,
-                "capture_hash": capture_hash.as_deref().map(redact),
+                "verified": result.confirmed,
+                "capture_hash": result.capture_hash.as_deref().map(redact),
             }),
         );
 
-        if !verified {
+        if !result.confirmed {
             if !finding.id.trim().is_empty() {
-                let verdict = paired_control_verdict(store, &finding.id);
-                let reason = if verdict == "ruled_out" {
-                    None
-                } else {
-                    Some("no authoritative benign-success/payload-blocked control pair")
-                };
-                let _ = store.set_finding_verdict(&finding.id, verdict, reason);
+                store.set_finding_verdict(
+                    &finding.id,
+                    result.verdict,
+                    result.gap_reason.as_deref(),
+                )?;
             }
             continue;
         }
-        let hash = capture_hash.expect("verified finding has a capture hash");
-        let detail = format!(
-            "deterministic tool-capture canary replay; sha256={hash}; llm_response_matches_capture={advisory_match}"
-        );
-        store.set_finding_validation(&finding.id, "validated", Some(&detail))?;
+        store.set_finding_validation(&finding.id, "validated", Some(&result.detail))?;
         promoted += 1;
     }
     Ok(promoted)
+}
+
+/// Decide one finding. Paired controls are checked before any promotion: a
+/// tool-minted benign-success/payload-blocked pair rules the candidate out and
+/// no oracle may validate it.
+fn verify_candidate(
+    store: &Store,
+    finding: &agentbug_store::Finding,
+    roe: &RoePolicy,
+) -> Result<CandidateVerdict> {
+    let oracle = effective_oracle(store, finding);
+    let control = if finding.id.trim().is_empty() {
+        "open_proof_gap"
+    } else {
+        paired_control_verdict(store, &finding.id)
+    };
+    if control == "ruled_out" {
+        return Ok(CandidateVerdict {
+            oracle,
+            confirmed: false,
+            capture_hash: paired_control_digest(store, &finding.id),
+            verdict: "ruled_out",
+            gap_reason: None,
+            detail: String::new(),
+        });
+    }
+    match oracle {
+        OracleType::Differential => Ok(differential_candidate(store, finding, roe, oracle)),
+        OracleType::CanaryEcho => canary_candidate(store, finding, roe, oracle),
+        _ => Ok(CandidateVerdict {
+            oracle,
+            confirmed: false,
+            capture_hash: None,
+            verdict: "open_proof_gap",
+            gap_reason: Some(format!("missing proof: {}", oracle.missing_proof())),
+            detail: String::new(),
+        }),
+    }
+}
+
+/// Legacy canary oracle. A primary tool capture is enough only when the canary
+/// appears in the response *body* of a 2xx exchange.
+fn canary_candidate(
+    store: &Store,
+    finding: &agentbug_store::Finding,
+    roe: &RoePolicy,
+    oracle: OracleType,
+) -> Result<CandidateVerdict> {
+    let captured = if finding.id.trim().is_empty() {
+        None
+    } else {
+        store.get_capture(&finding.id)?
+    };
+    let gap = |capture_hash: Option<String>| CandidateVerdict {
+        oracle,
+        confirmed: false,
+        capture_hash,
+        verdict: "open_proof_gap",
+        gap_reason: Some("no authoritative tool capture with a body-reflected canary".to_string()),
+        detail: String::new(),
+    };
+    let Some(capture) = captured else {
+        return Ok(gap(None));
+    };
+    let canary = capture_canary(&capture);
+    let response = String::from_utf8_lossy(&capture.response_bytes);
+    let mut accepted = response_body(&response).is_some_and(|body| body.contains(&canary))
+        && has_success_status(&response);
+    // Secondary signal: a classic self-graded `<html` echo with no canary is
+    // not independent evidence.
+    if accepted && is_self_graded_marker(&response, &canary) {
+        accepted = false;
+    }
+    if accepted && !roe_allows_finding(finding, roe) {
+        accepted = false;
+    }
+    // Advisory only: note whether the LLM-supplied response happened to match
+    // the captured bytes. Never a verdict.
+    let advisory_match = finding
+        .response
+        .as_deref()
+        .is_some_and(|text| text.as_bytes() == capture.response_bytes.as_slice());
+    let digest = capture_digest(&capture, &canary);
+    if !accepted {
+        return Ok(gap(Some(digest)));
+    }
+    Ok(CandidateVerdict {
+        oracle,
+        confirmed: true,
+        capture_hash: Some(digest.clone()),
+        verdict: "confirmed",
+        gap_reason: None,
+        detail: format!(
+            "deterministic tool-capture canary replay; sha256={digest}; llm_response_matches_capture={advisory_match}"
+        ),
+    })
+}
+
+/// Generic differential comparator. Two authoritative role captures with
+/// distinct tool-minted markers must both succeed and return different bodies
+/// once those markers are removed. A marker echoed in a header, an identical
+/// body, or a missing/duplicate marker is an open proof gap.
+fn differential_candidate(
+    store: &Store,
+    finding: &agentbug_store::Finding,
+    roe: &RoePolicy,
+    oracle: OracleType,
+) -> CandidateVerdict {
+    let capture_hash = paired_control_digest(store, &finding.id);
+    let gap = || CandidateVerdict {
+        oracle,
+        confirmed: false,
+        capture_hash: capture_hash.clone(),
+        verdict: "open_proof_gap",
+        gap_reason: Some(format!("missing proof: {}", oracle.missing_proof())),
+        detail: String::new(),
+    };
+    let (Ok(Some(left)), Ok(Some(right))) = (
+        store.get_role_capture(&finding.id, "paired_benign"),
+        store.get_role_capture(&finding.id, "paired_payload"),
+    ) else {
+        return gap();
+    };
+    let (Some(l_marker), Some(r_marker)) = (left.marker.as_deref(), right.marker.as_deref()) else {
+        return gap();
+    };
+    if l_marker.is_empty() || r_marker.is_empty() || l_marker == r_marker {
+        return gap();
+    }
+    let l_request = String::from_utf8_lossy(&left.request_bytes);
+    let r_request = String::from_utf8_lossy(&right.request_bytes);
+    if !l_request.contains(l_marker) || !r_request.contains(r_marker) {
+        return gap();
+    }
+    let l_response = String::from_utf8_lossy(&left.response_bytes);
+    let r_response = String::from_utf8_lossy(&right.response_bytes);
+    if !has_success_status(&l_response) || !has_success_status(&r_response) {
+        return gap();
+    }
+    let (Some(l_body), Some(r_body)) = (response_body(&l_response), response_body(&r_response))
+    else {
+        return gap();
+    };
+    let scrub = |body: &str| body.replace(l_marker, "").replace(r_marker, "");
+    if scrub(l_body) == scrub(r_body) {
+        return gap();
+    }
+    if !roe_allows_finding(finding, roe) {
+        return gap();
+    }
+    let detail = match &capture_hash {
+        Some(hash) => format!("deterministic differential role-capture replay; sha256={hash}"),
+        None => "deterministic differential role-capture replay".to_string(),
+    };
+    CandidateVerdict {
+        oracle,
+        confirmed: true,
+        capture_hash,
+        verdict: "confirmed",
+        gap_reason: None,
+        detail,
+    }
+}
+
+/// Only the body of an HTTP response repr can carry independent reflection
+/// evidence; a canary echoed in a header is not a reflected finding.
+fn response_body(response: &str) -> Option<&str> {
+    response.split_once("\r\n\r\n").map(|(_, body)| body)
+}
+
+/// Brief-derived and operator-set ROE limits apply to every oracle class.
+fn roe_allows_finding(finding: &agentbug_store::Finding, roe: &RoePolicy) -> bool {
+    let technique = format!("{} {}", finding.title, finding.description).to_ascii_lowercase();
+    if !roe.allow_state_change
+        && ["state chang", "modify data", "destructive", "dos "]
+            .iter()
+            .any(|token| technique.contains(token))
+    {
+        return false;
+    }
+    if !roe.denied_finding_classes.is_empty() {
+        let verdict = classify_cwe(
+            &finding.title,
+            finding.vuln_type.as_deref(),
+            Some(&finding.description),
+        );
+        if roe
+            .denied_finding_classes
+            .iter()
+            .any(|denied| denied == verdict.cwe || denied == verdict.rule)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Authoritative paired-control decision. Both exchanges must be tool-captured
@@ -4185,6 +4347,9 @@ fn build_tools(
         max_rps: roe.max_rps.or(legacy_rps),
         oob_endpoint: options.oob_endpoint.clone(),
         trusted_local_targets: options.trusted_local_targets.clone(),
+        // Findings cannot be saved without explicit falsification fields, so
+        // an LLM cannot skip the oracle declaration this verifier relies on.
+        require_falsification: true,
         ..Default::default()
     };
     let registry = try_default_registry_with_options(workspace, tool_options)?;
@@ -4598,6 +4763,44 @@ Fuzzing is permitted. State changes are allowed. Disclosure is permitted.
             .specs()
             .iter()
             .any(|spec| spec.name.to_ascii_lowercase().contains("fuzz")));
+    }
+
+    #[test]
+    fn engagement_tool_options_enable_falsification_gate() {
+        let roe = parse_roe("In scope:\n- example.com\n");
+        let profile =
+            extract_profile_from_text(BOURSOBANK_BRIEF, "https://boursobank.com/security");
+        let workspace = std::env::temp_dir().join(format!(
+            "agentbug-falsification-tools-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&workspace);
+        let registry = build_tools(&workspace, &profile, &roe, &EngagementOptions::default())
+            .expect("build tools");
+        let tool = registry.get("save_finding").expect("save_finding tool");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime
+            .block_on(tool.run(json!({
+                "title": "t",
+                "severity": "low",
+                "description": "d"
+            })))
+            .unwrap();
+        assert!(
+            !result.ok,
+            "engagement findings require falsification fields"
+        );
+        assert_eq!(
+            result
+                .structured
+                .as_ref()
+                .and_then(|value| value.get("error"))
+                .and_then(Value::as_str),
+            Some("falsification_incomplete")
+        );
     }
 
     #[test]
@@ -5031,7 +5234,9 @@ Fuzzing is permitted. State changes are allowed. Disclosure is permitted.
         // The canary is derived from the captured request bytes, so the
         // expected value is known before the finding is created.
         let expected = format!("agentbug-canary-{}", hex_digest(b"GET /?q=1 HTTP/1.1"));
-        let response = format!("HTTP/1.1 200 OK\ncontent: {expected}\n<html>body</html>");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>body {expected}</html>"
+        );
         let finding = stored_finding(&store, "s", &response);
         assert!(response.contains(&expected));
         capture_for(&store, &finding, &response, &expected);
@@ -5055,7 +5260,8 @@ Fuzzing is permitted. State changes are allowed. Disclosure is permitted.
         store
             .record_coverage("e", "https://example.com", "GET", "/")
             .unwrap();
-        let response = format!("HTTP/1.1 200 OK\ncontent: {canary}");
+        let response =
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>{canary}</html>");
         let finding = stored_finding(&store, "e", &response);
         capture_for(&store, &finding, &response, &canary);
         let (minted, hash) = capture_evidence(&store, &finding).unwrap();
@@ -5472,6 +5678,44 @@ mod r7a_tests {
     }
 
     #[test]
+    fn ruled_out_control_blocks_promotion() {
+        let db = temp_db("r7a-gate");
+        let store = Store::open(&db).unwrap();
+        let session = "r7a-gate";
+        let canary = "primary-canary";
+        // Without the control pair this primary capture would be promoted.
+        let response =
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>{canary}</html>");
+        let finding = stored_finding(&store, session, &response);
+        capture_for(&store, &finding, &response, canary);
+        store
+            .set_finding_falsification(
+                &finding.id,
+                Some("benign checked"),
+                Some("medium"),
+                Some("static"),
+                Some("if authenticated"),
+                Some("canary_echo"),
+            )
+            .unwrap();
+        add_pair(&store, &finding.id, true);
+
+        let mut trace = TraceRun::new(session);
+        let promoted = verify_findings(&store, session, &RoePolicy::default(), &mut trace).unwrap();
+        assert_eq!(promoted, 0, "ruled-out control is a promotion gate");
+        let updated = store
+            .list_findings(session)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == finding.id)
+            .unwrap();
+        assert_eq!(updated.verdict.as_deref(), Some("ruled_out"));
+        assert!(updated.validated_at.is_none());
+        assert_ne!(updated.status, "validated");
+        assert!(store.verified_findings(session).unwrap().is_empty());
+    }
+
+    #[test]
     fn benign_failure_stays_open_proof_gap() {
         let db = temp_db("r7a-gap");
         let store = Store::open(&db).unwrap();
@@ -5535,6 +5779,35 @@ mod r10_tests {
         assert!(!is_terminal_hypothesis("open"));
         assert!(!is_terminal_hypothesis("open_proof_gap"));
         assert!(!is_terminal_hypothesis("tested"));
+    }
+
+    #[test]
+    fn verification_disproved_does_not_confirm_hypothesis() {
+        let store = Store::open(":memory:").unwrap();
+        let session = store.create_session("goal").unwrap();
+        let hypothesis = store
+            .add_structured_hypothesis(&session.id, "claim", "WSTG-FALS", "claim", "", "")
+            .unwrap();
+        for verdict in ["disproved", "inconclusive"] {
+            let (status, rationale) = verification_hypothesis_status(verdict);
+            assert_eq!(status, "open_proof_gap", "{verdict} is not a confirmation");
+            mark_task_hypotheses(
+                &store,
+                &session.id,
+                "WSTG-FALS",
+                status,
+                rationale,
+                "finding-1",
+            );
+            let rows = store.list_hypotheses(&session.id).unwrap();
+            let updated = rows.iter().find(|row| row.id == hypothesis.id).unwrap();
+            assert_ne!(updated.status, "confirmed-candidate");
+            assert_eq!(updated.status, "open_proof_gap");
+        }
+        assert_eq!(
+            verification_hypothesis_status("upheld").0,
+            "confirmed-candidate"
+        );
     }
 
     #[test]
@@ -5610,8 +5883,176 @@ mod r12_tests {
     use super::tests::{capture_for, temp_db};
     use super::*;
 
+    fn oracle_finding(store: &Store, session: &str, oracle: &str) -> agentbug_store::Finding {
+        let title = format!("Finding {oracle}");
+        let finding = store
+            .add_finding_with_evidence(
+                session,
+                &title,
+                "high",
+                Some("example.com"),
+                Some("idor"),
+                "description",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .set_finding_falsification(
+                &finding.id,
+                Some("benign checked"),
+                Some("high"),
+                Some("static"),
+                Some("if authenticated"),
+                Some(oracle),
+            )
+            .unwrap();
+        finding
+    }
+
+    /// Two tool-minted role markers in authoritative role captures. The bodies
+    /// differ once the markers are removed, so the comparator can confirm.
+    fn attach_comparison_pair(store: &Store, finding_id: &str, left_body: &str, right_body: &str) {
+        let (left_marker, right_marker) = ("sql_true", "sql_false");
+        let request = |marker: &str| {
+            format!("GET /?q=1%20AND%20{marker} HTTP/1.1\r\nX-AgentBug-Role: {marker}\r\n\r\n")
+        };
+        let response =
+            |body: &str| format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n{body}");
+        store
+            .attach_role_capture(
+                finding_id,
+                "paired_benign",
+                request(left_marker).as_bytes(),
+                response(left_body).as_bytes(),
+                "left-canary",
+                Some(left_marker),
+            )
+            .unwrap();
+        store
+            .attach_role_capture(
+                finding_id,
+                "paired_payload",
+                request(right_marker).as_bytes(),
+                response(right_body).as_bytes(),
+                "right-canary",
+                Some(right_marker),
+            )
+            .unwrap();
+    }
+
+    fn find_finding(store: &Store, session: &str, id: &str) -> agentbug_store::Finding {
+        store
+            .list_findings(session)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap()
+    }
+
     #[test]
-    fn non_canary_oracles_are_open_proof_gaps() {
+    fn differential_role_captures_promote() {
+        let db = temp_db("r12-differential-promote");
+        let store = Store::open(&db).unwrap();
+        let session = store.create_session("goal").unwrap();
+        for oracle in ["differential", "comparator"] {
+            let finding = oracle_finding(&store, &session.id, oracle);
+            capture_for(
+                &store,
+                &finding,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>primary-canary</html>",
+                "primary-canary",
+            );
+            attach_comparison_pair(
+                &store,
+                &finding.id,
+                "<html>rows for sql_true</html>",
+                "<html>no rows for sql_false</html>",
+            );
+        }
+        let mut trace = TraceRun::new(&session.id);
+        let promoted =
+            verify_findings(&store, &session.id, &RoePolicy::default(), &mut trace).unwrap();
+        assert_eq!(promoted, 2, "both comparator labels must be replayable");
+        let ids = store
+            .list_findings(&session.id)
+            .unwrap()
+            .into_iter()
+            .map(|finding| finding.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+        for id in ids {
+            let updated = find_finding(&store, &session.id, &id);
+            assert_eq!(updated.status, "validated", "{id} must be promoted");
+            assert!(updated.validated_at.is_some());
+        }
+        assert_eq!(store.verified_findings(&session.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn identical_bodies_are_open_proof_gap() {
+        let db = temp_db("r12-differential-identical");
+        let store = Store::open(&db).unwrap();
+        let session = store.create_session("goal").unwrap();
+        let finding = oracle_finding(&store, &session.id, "differential");
+        attach_comparison_pair(
+            &store,
+            &finding.id,
+            "<html>same rows</html>",
+            "<html>same rows</html>",
+        );
+        let mut trace = TraceRun::new(&session.id);
+        let promoted =
+            verify_findings(&store, &session.id, &RoePolicy::default(), &mut trace).unwrap();
+        assert_eq!(promoted, 0, "identical bodies are not a differential");
+        let updated = find_finding(&store, &session.id, &finding.id);
+        assert_eq!(updated.verdict.as_deref(), Some("open_proof_gap"));
+        assert!(updated
+            .gap_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("missing proof"));
+        assert!(updated.validated_at.is_none());
+    }
+
+    #[test]
+    fn unknown_oracle_with_role_captures_fails_closed() {
+        let db = temp_db("r12-unknown-oracle-with-roles");
+        let store = Store::open(&db).unwrap();
+        let session = store.create_session("goal").unwrap();
+        let finding = oracle_finding(&store, &session.id, "unrecognised_oracle");
+        // A body-reflecting primary capture must not rescue an unknown class
+        // once role captures are present.
+        capture_for(
+            &store,
+            &finding,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>agentbug-canary-abc</html>",
+            "agentbug-canary-abc",
+        );
+        attach_comparison_pair(
+            &store,
+            &finding.id,
+            "<html>rows for sql_true</html>",
+            "<html>no rows for sql_false</html>",
+        );
+        let mut trace = TraceRun::new(&session.id);
+        let promoted =
+            verify_findings(&store, &session.id, &RoePolicy::default(), &mut trace).unwrap();
+        assert_eq!(promoted, 0);
+        let updated = find_finding(&store, &session.id, &finding.id);
+        assert_eq!(updated.verdict.as_deref(), Some("open_proof_gap"));
+        assert!(updated.validated_at.is_none());
+    }
+
+    #[test]
+    fn non_canary_oracles_without_certified_role_sets_are_open_proof_gaps() {
         let db = temp_db("r12-oracles");
         let store = Store::open(&db).unwrap();
         let session = store.create_session("goal").unwrap();
@@ -5646,6 +6087,7 @@ mod r12_tests {
             "oob_hit",
             "browser_deferred",
             "differential",
+            "comparator",
         ] {
             store
                 .set_finding_falsification(

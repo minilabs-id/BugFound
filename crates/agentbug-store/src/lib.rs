@@ -1321,6 +1321,24 @@ impl Store {
         Ok(Some(f))
     }
 
+    /// Locate the row that `add_finding_with_evidence` deduped against, so a
+    /// retry carrying better capture bytes can refresh that row in place.
+    pub fn finding_id_by_dedupe_key(
+        &self,
+        session_id: &str,
+        dedupe_key: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT id FROM findings WHERE session_id=?1 AND dedupe_key=?2
+                 ORDER BY rowid ASC LIMIT 1",
+                params![session_id, dedupe_key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     fn insert_finding(conn: &Connection, f: &Finding) -> Result<()> {
         conn.execute(
             "INSERT INTO findings(id,session_id,title,severity,asset,vuln_type,description,reproduction,impact,remediation,evidence,status,created_at,updated_at,request,response,cvss,cwe,dedupe_key,evidence_hash,validated_at,validation_detail)
@@ -2808,6 +2826,36 @@ impl Store {
         Ok(true)
     }
 
+    /// Verify one finding's evidence as a promotion gate. Unlike
+    /// `verify_evidence`, which is vacuously true when a session has no
+    /// evidence rows, this returns `false` when the finding has no evidence at
+    /// all, and also when any stored SHA-256 no longer matches its bytes.
+    pub fn verify_finding_evidence(&self, finding_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT sha256, request_bytes, response_bytes, artifact_bytes
+             FROM evidence WHERE finding_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![finding_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default(),
+                r.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default(),
+                r.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default(),
+            ))
+        })?;
+        let mut has_evidence = false;
+        for row in rows {
+            has_evidence = true;
+            let (stored, request, response, artifact) = row?;
+            let artifact = (!artifact.is_empty()).then_some(artifact.as_slice());
+            if stored != sha256_evidence_bytes(&request, &response, artifact) {
+                return Ok(false);
+            }
+        }
+        Ok(has_evidence)
+    }
+
     pub fn save_report(
         &self,
         engagement_id: &str,
@@ -3646,12 +3694,13 @@ pub fn persist_tool_result(
     args: &serde_json::Value,
     result: &agentbug_tools::ToolResult,
 ) {
-    if !result.ok {
-        return;
-    }
     // Any tool may produce an authoritative capture (HTTP, PoC replay). Keep
     // it at session scope so a later `save_finding` can bind real bytes to the
     // finding instead of trusting LLM-supplied request/response arguments.
+    // Do this before the failed-result return: an HTTP 4xx/5xx, a blocked
+    // payload or a failed PoC replay is often the actual proof, so discarding
+    // its bytes would make a legitimate finding unverifiable. A capture is
+    // advisory evidence only; nothing is promoted here.
     if let Some((request, response, canary)) = result
         .structured
         .as_ref()
@@ -3660,6 +3709,11 @@ pub fn persist_tool_result(
         let _ =
             store.put_session_capture(session_id, request.as_bytes(), response.as_bytes(), &canary);
     }
+    // Nested `active_scan` captures at `results[].capture` stay advisory-only.
+    // They carry no finding id, and the role-capture schema admits only the
+    // three canonical control roles, so there is no safe per-payload role key
+    // to attach them to from this sink. The primary capture above remains the
+    // only byte source bound to a finding here.
     let effective_args = if args.is_object() {
         args.clone()
     } else if let Some(s) = result.structured.as_ref() {
@@ -3671,13 +3725,25 @@ pub fn persist_tool_result(
     } else {
         serde_json::json!({})
     };
+    let n = tool_name.to_ascii_lowercase().replace('-', "_");
+    // A failed `validate_poc` still carries tool-minted paired controls. Store
+    // them before the failed-result return so paired evidence can be compared;
+    // no finding state is changed here.
+    if n.contains("validat") {
+        if let Some(finding_id) = effective_args.get("finding_id").and_then(|v| v.as_str()) {
+            persist_paired_controls(store, finding_id, result.structured.as_ref());
+        }
+    }
+    if !result.ok {
+        return;
+    }
     // Never persist raw secrets captured in tool arguments/evidence.
     let redacted_args: serde_json::Value =
         serde_json::from_str(&redact(&effective_args.to_string()))
             .unwrap_or_else(|_| effective_args.clone());
     let args = &redacted_args;
-    let n = tool_name.to_ascii_lowercase().replace('-', "_");
-    let is_finding = n.contains("finding");
+    // `validate_finding` is a read-only dry-run; it must never insert a row.
+    let is_finding = n.contains("finding") && !n.contains("validat");
     let is_asset = n.contains("asset");
     let is_artifact = n.contains("artifact");
     if is_finding {
@@ -3703,14 +3769,45 @@ pub fn persist_tool_result(
         let response = args.get("response").and_then(|v| v.as_str());
         let cvss = args.get("cvss").and_then(|v| v.as_str());
         let cwe = args.get("cwe").and_then(|v| v.as_str());
+        // Accept the same aliases as `save_finding` so model-supplied short
+        // field names still reach the canonical DB columns.
+        let text = |key: &str| args.get(key).and_then(|v| v.as_str());
         let falsification = (
-            args.get("counterevidence").and_then(|v| v.as_str()),
-            args.get("confidence").and_then(|v| v.as_str()),
-            args.get("confidence_rationale").and_then(|v| v.as_str()),
-            args.get("severity_change_conditions")
-                .and_then(|v| v.as_str()),
-            args.get("oracle_type").and_then(|v| v.as_str()),
+            text("counterevidence").or_else(|| text("against")),
+            text("confidence"),
+            text("confidence_rationale").or_else(|| text("why")),
+            text("severity_change_conditions").or_else(|| text("breaks_if")),
+            text("oracle_type").or_else(|| text("oracle")),
         );
+        // Mirror `add_finding_with_evidence`'s dedupe key so a duplicate can be
+        // located and its stale primary capture replaced in place.
+        let dedupe_key = format!(
+            "{}|{}|{}",
+            title,
+            asset.unwrap_or_default(),
+            vuln_type.unwrap_or_default()
+        )
+        .to_lowercase();
+        // The authoritative bytes come from the tool's own capture, never from
+        // the LLM-supplied request/response arguments above. Falling back to
+        // the session capture consumes it once, as before.
+        let capture = result
+            .structured
+            .as_ref()
+            .and_then(agentbug_tools::capture_from_structured)
+            .or_else(|| {
+                store
+                    .take_session_capture(session_id)
+                    .ok()
+                    .flatten()
+                    .map(|c| {
+                        (
+                            String::from_utf8_lossy(&c.request_bytes).to_string(),
+                            String::from_utf8_lossy(&c.response_bytes).to_string(),
+                            c.canary,
+                        )
+                    })
+            });
         match store.add_finding_with_evidence(
             session_id,
             title,
@@ -3737,40 +3834,21 @@ pub fn persist_tool_result(
                     falsification.4,
                 );
                 tracing::info!(session=%session_id, title=%title, "finding persisted");
-                // The authoritative bytes come from the tool's capture, never
-                // from the LLM-supplied request/response arguments above.
-                let own_capture = result
-                    .structured
-                    .as_ref()
-                    .and_then(agentbug_tools::capture_from_structured);
-                let capture = if own_capture.is_some() {
-                    own_capture
-                } else {
-                    store
-                        .take_session_capture(session_id)
-                        .ok()
-                        .flatten()
-                        .map(|c| {
-                            (
-                                String::from_utf8_lossy(&c.request_bytes).to_string(),
-                                String::from_utf8_lossy(&c.response_bytes).to_string(),
-                                c.canary,
-                            )
-                        })
-                };
-                if let Some((request, response, canary)) = capture {
-                    if let Err(e) = store.attach_capture(
-                        &finding.id,
-                        request.as_bytes(),
-                        response.as_bytes(),
-                        &canary,
-                    ) {
-                        tracing::warn!(error=%e, session=%session_id, "failed to attach capture");
-                    }
-                }
+                attach_finding_capture(store, session_id, &finding.id, capture);
             }
             Ok(None) => {
-                tracing::info!(session=%session_id, title=%title, "duplicate finding skipped")
+                // Do not create a second row, but a retry with an authoritative
+                // capture is strictly better than the stale one: replace the
+                // primary capture on the existing row instead of dropping it.
+                match store.finding_id_by_dedupe_key(session_id, &dedupe_key) {
+                    Ok(Some(existing_id)) => {
+                        attach_finding_capture(store, session_id, &existing_id, capture);
+                        tracing::info!(session=%session_id, title=%title, "duplicate finding capture refreshed");
+                    }
+                    _ => {
+                        tracing::info!(session=%session_id, title=%title, "duplicate finding skipped")
+                    }
+                }
             }
             Err(e) => tracing::warn!(error=%e, session=%session_id, "failed to persist finding"),
         }
@@ -3852,39 +3930,54 @@ pub fn persist_tool_result(
             session = %session_id,
             "ignoring tool-reported validation; engagement verifier is authoritative"
         );
-        // The paired control bytes come from the tool, never from LLM args.
-        // They are stored as role-tagged captures for the verifier; this path
-        // still never promotes a finding.
-        if let Some(finding_id) = args.get("finding_id").and_then(|v| v.as_str()) {
-            if let Some(paired) = result
-                .structured
-                .as_ref()
-                .and_then(|v| v.get("paired_capture"))
-            {
-                for (role, key) in [("paired_benign", "benign"), ("paired_payload", "payload")] {
-                    if let Some(capture) = paired.get(key) {
-                        let request = capture
-                            .get("request")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let response = capture
-                            .get("response")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let canary = capture.get("canary").and_then(|v| v.as_str()).unwrap_or("");
-                        if !request.is_empty() && !response.is_empty() && !canary.is_empty() {
-                            let _ = store.attach_role_capture(
-                                finding_id,
-                                role,
-                                request.as_bytes(),
-                                response.as_bytes(),
-                                canary,
-                                Some(canary),
-                            );
-                        }
-                    }
-                }
-            }
+    }
+}
+
+/// Persist tool-minted paired controls from a `validate_poc` structured result.
+/// Roles are fixed constants chosen here, never supplied by the model.
+fn persist_paired_controls(store: &Store, finding_id: &str, structured: Option<&Value>) {
+    let Some(paired) = structured.and_then(|v| v.get("paired_capture")) else {
+        return;
+    };
+    for (role, key) in [("paired_benign", "benign"), ("paired_payload", "payload")] {
+        let Some(capture) = paired.get(key) else {
+            continue;
+        };
+        let request = capture
+            .get("request")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let response = capture
+            .get("response")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let canary = capture.get("canary").and_then(|v| v.as_str()).unwrap_or("");
+        if !request.is_empty() && !response.is_empty() && !canary.is_empty() {
+            let _ = store.attach_role_capture(
+                finding_id,
+                role,
+                request.as_bytes(),
+                response.as_bytes(),
+                canary,
+                Some(canary),
+            );
+        }
+    }
+}
+
+/// Attach an authoritative capture to a finding. Re-attaching replaces the
+/// prior primary capture, which is how a deduped retry refreshes stale bytes.
+fn attach_finding_capture(
+    store: &Store,
+    session_id: &str,
+    finding_id: &str,
+    capture: Option<(String, String, String)>,
+) {
+    if let Some((request, response, canary)) = capture {
+        if let Err(e) =
+            store.attach_capture(finding_id, request.as_bytes(), response.as_bytes(), &canary)
+        {
+            tracing::warn!(error=%e, session=%session_id, "failed to attach capture");
         }
     }
 }
@@ -6591,4 +6684,201 @@ fn authorization_snapshot_and_open_rule_round_trip() {
     let rows = store.list_open_authorization_rules("e").unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].state, "pending");
+}
+
+#[test]
+fn persist_tool_result_stores_capture_on_http_error() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("goal").unwrap();
+    // An error-based SQLi probe is typically an HTTP 500 whose body is the
+    // proof. The tool result stays failed, but its capture must survive.
+    persist_tool_result(
+        &store,
+        &session.id,
+        "http_request",
+        &serde_json::json!({"url": "http://127.0.0.1/login"}),
+        &agentbug_tools::ToolResult {
+            ok: false,
+            output: "HTTP 500".to_string(),
+            structured: Some(serde_json::json!({
+                "ok": false,
+                "error": "HTTP 500",
+                "capture": {
+                    "request": "GET /login?id=1' HTTP/1.1",
+                    "response": "HTTP/1.1 500 Internal Server Error\nSQL syntax error",
+                    "canary": "canary-500"
+                }
+            })),
+        },
+    );
+    // No promotion: the failed result must not create or validate a finding.
+    assert!(store.list_findings(&session.id).unwrap().is_empty());
+    let capture = store.take_session_capture(&session.id).unwrap().unwrap();
+    assert_eq!(capture.canary, "canary-500");
+    assert!(String::from_utf8_lossy(&capture.request_bytes).contains("id=1'"));
+    assert!(String::from_utf8_lossy(&capture.response_bytes).contains("SQL syntax error"));
+}
+
+#[test]
+fn failed_validate_poc_still_stores_paired_controls() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("goal").unwrap();
+    let finding = store
+        .add_finding(
+            &session.id,
+            "Candidate",
+            "high",
+            None,
+            None,
+            "description",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    persist_tool_result(
+        &store,
+        &session.id,
+        "validate_poc",
+        &serde_json::json!({"finding_id": finding.id}),
+        &agentbug_tools::ToolResult {
+            ok: false,
+            output: "advisory: not valid".to_string(),
+            structured: Some(serde_json::json!({
+                "advisory": true,
+                "valid": false,
+                "capture": {
+                    "request": "GET /item?id=payload HTTP/1.1",
+                    "response": "HTTP/1.1 500 blocked",
+                    "canary": "payload-canary"
+                },
+                "paired_capture": {
+                    "benign": {
+                        "request": "GET /item?id=benign HTTP/1.1",
+                        "response": "HTTP/1.1 200 fine",
+                        "canary": "benign-canary"
+                    },
+                    "payload": {
+                        "request": "GET /item?id=payload HTTP/1.1",
+                        "response": "HTTP/1.1 500 blocked",
+                        "canary": "payload-canary"
+                    }
+                }
+            })),
+        },
+    );
+    // The advisory failure never stamps validation.
+    let updated = store
+        .list_findings(&session.id)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.id == finding.id)
+        .unwrap();
+    assert!(updated.validated_at.is_none());
+    assert!(store.verified_findings(&session.id).unwrap().is_empty());
+
+    let benign = store
+        .get_role_capture(&finding.id, "paired_benign")
+        .unwrap()
+        .unwrap();
+    assert_eq!(benign.canary, "benign-canary");
+    assert_eq!(benign.response_bytes, b"HTTP/1.1 200 fine");
+    let payload = store
+        .get_role_capture(&finding.id, "paired_payload")
+        .unwrap()
+        .unwrap();
+    assert_eq!(payload.canary, "payload-canary");
+    assert_eq!(payload.response_bytes, b"HTTP/1.1 500 blocked");
+}
+
+#[test]
+fn dedupe_retry_replaces_primary_capture() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("goal").unwrap();
+    let args = serde_json::json!({
+        "title": "SQL Injection",
+        "severity": "high",
+        "asset": "https://example.com/login",
+        "vuln_type": "sqli",
+        "description": "first attempt"
+    });
+    let first = agentbug_tools::ToolResult {
+        ok: true,
+        output: "saved".to_string(),
+        structured: Some(serde_json::json!({
+            "capture": {
+                "request": "old request",
+                "response": "old response",
+                "canary": "old-canary"
+            }
+        })),
+    };
+    persist_tool_result(&store, &session.id, "save_finding", &args, &first);
+    let findings = store.list_findings(&session.id).unwrap();
+    assert_eq!(findings.len(), 1);
+    let finding_id = findings[0].id.clone();
+    assert_eq!(
+        store.get_capture(&finding_id).unwrap().unwrap().canary,
+        "old-canary"
+    );
+
+    let better = agentbug_tools::ToolResult {
+        ok: true,
+        output: "saved".to_string(),
+        structured: Some(serde_json::json!({
+            "capture": {
+                "request": "new request",
+                "response": "new response with error-based proof",
+                "canary": "new-canary"
+            }
+        })),
+    };
+    persist_tool_result(&store, &session.id, "save_finding", &args, &better);
+    let findings = store.list_findings(&session.id).unwrap();
+    assert_eq!(findings.len(), 1, "dedupe must not create a second finding");
+    assert_eq!(findings[0].id, finding_id);
+    let capture = store.get_capture(&finding_id).unwrap().unwrap();
+    assert_eq!(capture.canary, "new-canary");
+    assert_eq!(capture.request_bytes, b"new request");
+    assert!(String::from_utf8_lossy(&capture.response_bytes).contains("error-based proof"));
+}
+
+#[test]
+fn verify_finding_evidence_rejects_missing_evidence() {
+    let store = Store::open(":memory:").unwrap();
+    let session = store.create_session("goal").unwrap();
+    let finding = store
+        .add_finding(
+            &session.id,
+            "Candidate",
+            "high",
+            None,
+            None,
+            "description",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    // The session-wide tamper check keeps its existing vacuous-truth semantics.
+    assert!(store.verify_evidence(&session.id).unwrap());
+    assert!(!store.verify_finding_evidence(&finding.id).unwrap());
+
+    store
+        .add_evidence_bytes(&finding.id, "http", b"GET /", b"HTTP/1.1 200", None)
+        .unwrap();
+    assert!(store.verify_finding_evidence(&finding.id).unwrap());
+
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE evidence SET sha256='tampered' WHERE finding_id=?1",
+            params![finding.id],
+        )
+        .unwrap();
+    }
+    assert!(!store.verify_finding_evidence(&finding.id).unwrap());
+    assert!(!store.verify_evidence(&session.id).unwrap());
 }

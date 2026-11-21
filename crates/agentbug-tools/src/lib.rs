@@ -2131,6 +2131,264 @@ impl Tool for FsWriteTool {
     }
 }
 
+/// Canonical falsification columns, in the order reported to the model. The
+/// engagement layer persists these exact column names.
+const FALSIFICATION_FIELDS: &[&str] = &[
+    "counterevidence",
+    "confidence",
+    "confidence_rationale",
+    "severity_change_conditions",
+    "oracle_type",
+];
+
+/// Model-friendly aliases accepted at the save/validate boundary. Canonical
+/// names always win when both spellings are supplied.
+const FALSIFICATION_ALIASES: &[(&str, &str)] = &[
+    ("against", "counterevidence"),
+    ("why", "confidence_rationale"),
+    ("breaks_if", "severity_change_conditions"),
+    ("oracle", "oracle_type"),
+];
+
+const ORACLE_TYPES: &[&str] = &[
+    "canary_echo",
+    "differential",
+    "state_delta",
+    "timing",
+    "oob_hit",
+    "browser_deferred",
+];
+const REDACTED_CANARY: &str = "<redacted-canary>";
+
+/// Rewrite alias spellings into the canonical store columns before validation
+/// and before handing the finding back to the runner.
+fn canonicalize_finding_input(input: &Value) -> Value {
+    let mut canonical = input.clone();
+    let Some(object) = canonical.as_object_mut() else {
+        return canonical;
+    };
+    for (alias, field) in FALSIFICATION_ALIASES {
+        let field_missing = object
+            .get(*field)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .is_empty();
+        if field_missing {
+            if let Some(value) = object.get(*alias).cloned() {
+                object.insert((*field).to_string(), value);
+            }
+        }
+        object.remove(*alias);
+    }
+    canonical
+}
+
+fn is_known_oracle(oracle: &str) -> bool {
+    ORACLE_TYPES.contains(&oracle)
+}
+
+/// Proof the deterministic verifier still needs for an oracle class. Only
+/// `canary_echo` can be confirmed today; every other class stays an open proof
+/// gap, mirroring the engagement verifier's message.
+fn oracle_proof_gap(oracle: &str) -> Option<&'static str> {
+    match oracle {
+        "canary_echo" => None,
+        "differential" => {
+            Some("cross-owner differential capture with positive and negative ownership controls")
+        }
+        "state_delta" => Some("pre/post state snapshot plus a reset recipe"),
+        "timing" => Some("repeated timing samples with baseline and noise threshold"),
+        "oob_hit" => Some("external DNS/HTTP listener hit bound to the canary"),
+        "browser_deferred" => Some("browser-executed DOM or artifact proof"),
+        _ => Some(
+            "a recognized oracle_type (canary_echo, differential, state_delta, timing, oob_hit, browser_deferred)",
+        ),
+    }
+}
+
+#[derive(Debug)]
+struct FalsificationStatus {
+    missing: Vec<String>,
+    invalid_oracle: bool,
+}
+
+impl FalsificationStatus {
+    fn ready(&self) -> bool {
+        self.missing.is_empty() && !self.invalid_oracle
+    }
+
+    fn paths(&self) -> Vec<String> {
+        if self.invalid_oracle {
+            vec!["oracle_type".to_string()]
+        } else {
+            self.missing.clone()
+        }
+    }
+
+    fn output(&self) -> String {
+        if self.invalid_oracle {
+            "falsification incomplete: invalid oracle_type".to_string()
+        } else {
+            format!("falsification incomplete: {}", self.missing.join(", "))
+        }
+    }
+
+    fn error_structured(&self) -> Value {
+        json!({"error": "falsification_incomplete", "paths": self.paths()})
+    }
+}
+
+/// Single source of truth for the five falsification columns. The save
+/// boundary and the pre-flight validator both call this, so their rejection
+/// messages cannot drift.
+fn check_falsification(input: &Value) -> FalsificationStatus {
+    let missing = FALSIFICATION_FIELDS
+        .iter()
+        .filter(|field| {
+            input
+                .get(**field)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+        })
+        .map(|field| (*field).to_string())
+        .collect::<Vec<_>>();
+    // An absent or empty oracle is already reported as a missing field. A
+    // present but unknown oracle needs the dedicated invalid-oracle message.
+    let invalid_oracle = !missing.iter().any(|field| field == "oracle_type")
+        && input
+            .get("oracle_type")
+            .and_then(Value::as_str)
+            .is_some_and(|oracle| !is_known_oracle(oracle));
+    FalsificationStatus {
+        missing,
+        invalid_oracle,
+    }
+}
+
+/// Replace any tool-minted canary token with an inert placeholder. The real
+/// token is never included in model-visible text.
+fn redact_canary_text(text: &str) -> String {
+    const PREFIX: &str = "agentbug-canary-";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find(PREFIX) {
+        out.push_str(&rest[..index]);
+        let tail = &rest[index + PREFIX.len()..];
+        let token_len = tail
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_'))
+            .count();
+        out.push_str(REDACTED_CANARY);
+        rest = &tail[token_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Scrub canaries recursively before a candidate finding goes back to the model.
+fn redact_canaries(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    let value = if key.eq_ignore_ascii_case("canary") {
+                        Value::String(REDACTED_CANARY.to_string())
+                    } else {
+                        redact_canaries(value)
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(redact_canaries).collect()),
+        Value::String(text) => Value::String(redact_canary_text(text)),
+        _ => value.clone(),
+    }
+}
+
+fn non_empty_value(input: &Value, key: &str) -> bool {
+    match input.get(key) {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(values)) => !values.is_empty(),
+        Some(Value::Object(fields)) => !fields.is_empty(),
+        _ => false,
+    }
+}
+
+/// The deterministic verifier only works with tool-produced captures. LLM
+/// text is advisory, so a capture reference (or a request/response pair) is
+/// the strongest self-report a candidate can make locally.
+fn has_capture_reference(input: &Value) -> bool {
+    ["capture", "captures", "evidence", "capture_id"]
+        .iter()
+        .any(|key| non_empty_value(input, key))
+        || (non_empty_value(input, "request") && non_empty_value(input, "response"))
+}
+
+fn candidate_falsified(input: &Value) -> bool {
+    input
+        .get("falsified")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || matches!(
+            input.get("status").and_then(Value::as_str),
+            Some("ruled_out" | "falsified" | "disproved")
+        )
+}
+
+/// Shared property schema for the finding-producing tools. Descriptions make
+/// the falsification contract (and its accepted aliases) visible to the model.
+fn finding_input_properties() -> Value {
+    json!({
+        "title":{"type":"string"},
+        "severity":{"type":"string","enum":["info","low","medium","high","critical"]},
+        "asset":{"type":"string"},
+        "vuln_type":{"type":"string"},
+        "description":{"type":"string"},
+        "reproduction":{"type":"string"},
+        "impact":{"type":"string"},
+        "remediation":{"type":"string"},
+        "evidence":{"type":"string","description":"Reference to tool-produced capture bytes; the canary itself is never shown to the model."},
+        "request":{"type":"string"},
+        "response":{"type":"string"},
+        "cvss":{"type":"string"},
+        "cwe":{"type":"string"},
+        "counterevidence":{"type":"string","description":"Strongest specific case against the finding: name the control and location actually checked."},
+        "confidence":{
+            "type":"string","enum":["low","medium","high"],
+            "description":"Honest confidence; static-only evidence is at most medium.",
+            "x-enumDescriptions":{
+                "low":"Mostly speculative; no tool-backed observation.",
+                "medium":"Static evidence or partial tool observation; important gaps remain.",
+                "high":"Tool-backed observation plus counterevidence pass; claims are matched by captures."
+            }
+        },
+        "confidence_rationale":{"type":"string","description":"Why this confidence is justified given the evidence and counterevidence."},
+        "severity_change_conditions":{"type":"string","description":"Concrete conditions that would raise or lower the severity."},
+        "oracle_type":{
+            "type":"string","enum":ORACLE_TYPES,
+            "description":"Oracle that matches the captures actually produced; only canary_echo can be auto-confirmed.",
+            "x-enumDescriptions":{
+                "canary_echo":"Tool-minted canary reflected in a 2xx tool-captured response.",
+                "differential":"Cross-owner differential capture with positive and negative ownership controls.",
+                "state_delta":"Pre/post state snapshot plus a reset recipe.",
+                "timing":"Repeated timing samples with baseline and noise threshold.",
+                "oob_hit":"External DNS/HTTP listener hit bound to the canary.",
+                "browser_deferred":"Browser-executed DOM or artifact proof."
+            }
+        },
+        "against":{"type":"string","description":"Alias for counterevidence."},
+        "why":{"type":"string","description":"Alias for confidence_rationale."},
+        "breaks_if":{"type":"string","description":"Alias for severity_change_conditions."},
+        "oracle":{"type":"string","description":"Alias for oracle_type."},
+        "finding_id":{"type":"string","description":"Optional correlation id for validate_finding."}
+    })
+}
+
 #[derive(Default, Clone)]
 pub struct SaveFindingTool {
     pub require_falsification: bool,
@@ -2139,31 +2397,13 @@ pub struct SaveFindingTool {
 #[async_trait]
 impl Tool for SaveFindingTool {
     fn spec(&self) -> ToolSpec {
+        let properties = finding_input_properties();
         ToolSpec {
             name: "save_finding".into(),
-            description: "Record a validated security finding for the current session/report. Provide clear evidence and reproduction steps.".into(),
+            description: r#"Record a validated security finding for the current session/report. Provide clear evidence and reproduction steps. Falsification is mandatory: all five fields (counterevidence, confidence, confidence_rationale, severity_change_conditions, oracle_type) must be NON-EMPTY strings; whitespace-only is rejected. Set oracle_type to the oracle that matches the captures you actually produced - do not declare an oracle the evidence cannot support. The canary is tool-minted by http_request, is never shown to you, and must never be guessed, copied, or repeated in any field. Example: {"title":"Reflected probe on /search","severity":"high","description":"Untrusted query parameter is reflected verbatim in a 2xx HTML response.","evidence":"Tool capture from http_request on /search; benign control did not reflect.","counterevidence":"Checked the output encoder on the same path; the captured response encodes < and > but not the injected marker.","confidence":"high","confidence_rationale":"Tool capture reflects the injected probe while the benign control does not.","severity_change_conditions":"Downgrade to medium if the endpoint requires authentication.","oracle_type":"canary_echo"}. Canonical aliases are accepted: against=counterevidence, why=confidence_rationale, breaks_if=severity_change_conditions, oracle=oracle_type. Call validate_finding first to check the same contract before saving."#.into(),
             input_schema: json!({
                 "type":"object",
-                "properties":{
-                    "title":{"type":"string"},
-                    "severity":{"type":"string","enum":["info","low","medium","high","critical"]},
-                    "asset":{"type":"string"},
-                    "vuln_type":{"type":"string"},
-                    "description":{"type":"string"},
-                    "reproduction":{"type":"string"},
-                    "impact":{"type":"string"},
-                    "remediation":{"type":"string"},
-                    "evidence":{"type":"string"},
-                    "request":{"type":"string"},
-                    "response":{"type":"string"},
-                    "cvss":{"type":"string"},
-                    "cwe":{"type":"string"},
-                    "counterevidence":{"type":"string"},
-                    "confidence":{"type":"string","enum":["low","medium","high"]},
-                    "confidence_rationale":{"type":"string"},
-                    "severity_change_conditions":{"type":"string"},
-                    "oracle_type":{"type":"string","enum":["canary_echo","differential","state_delta","timing","oob_hit","browser_deferred"]}
-                },
+                "properties":properties,
                 "required":["title","severity","description"]
             }),
             risk: "write".into(),
@@ -2172,64 +2412,123 @@ impl Tool for SaveFindingTool {
     async fn run(&self, input: Value) -> Result<ToolResult> {
         let title = input
             .get("title")
-            .and_then(|v| v.as_str())
+            .and_then(Value::as_str)
             .unwrap_or("(untitled)");
         let sev = input
             .get("severity")
-            .and_then(|v| v.as_str())
+            .and_then(Value::as_str)
             .unwrap_or("info");
-        const FALSIFICATION: &[&str] = &[
-            "counterevidence",
-            "confidence",
-            "confidence_rationale",
-            "severity_change_conditions",
-        ];
-        let missing: Vec<&str> = FALSIFICATION
-            .iter()
-            .copied()
-            .filter(|key| {
-                input
-                    .get(key)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .is_empty()
-            })
-            .collect();
+        let canonical = canonicalize_finding_input(&input);
         if self.require_falsification {
-            if let Some(oracle) = input.get("oracle_type").and_then(|v| v.as_str()) {
-                if !matches!(
-                    oracle,
-                    "canary_echo"
-                        | "differential"
-                        | "state_delta"
-                        | "timing"
-                        | "oob_hit"
-                        | "browser_deferred"
-                ) {
-                    return Ok(ToolResult {
-                        ok: false,
-                        output: "falsification incomplete: invalid oracle_type".to_string(),
-                        structured: Some(
-                            json!({"error": "falsification_incomplete", "paths": ["oracle_type"]}),
-                        ),
-                    });
-                }
+            let status = check_falsification(&canonical);
+            if !status.ready() {
+                return Ok(ToolResult {
+                    ok: false,
+                    output: status.output(),
+                    structured: Some(status.error_structured()),
+                });
             }
-        }
-        if self.require_falsification && !missing.is_empty() {
-            return Ok(ToolResult {
-                ok: false,
-                output: format!("falsification incomplete: {}", missing.join(", ")),
-                structured: Some(json!({"error": "falsification_incomplete", "paths": missing})),
-            });
         }
         Ok(ToolResult {
             ok: true,
             output: truncate(&format!(
                 "finding recorded (persisted by runner): [{sev}] {title}"
             )),
-            structured: Some(input),
+            structured: Some(canonical),
+        })
+    }
+}
+
+/// Local, read-only pre-flight check for a candidate finding. It applies the
+/// exact same falsification contract as `save_finding` but never persists a
+/// finding and never touches a validation status.
+#[derive(Default, Clone)]
+pub struct ValidateFindingTool;
+
+#[async_trait]
+impl Tool for ValidateFindingTool {
+    fn spec(&self) -> ToolSpec {
+        let properties = finding_input_properties();
+        ToolSpec {
+            name: "validate_finding".into(),
+            description: r#"Locally validate a candidate finding before calling save_finding. No network, no writes: this tool never persists a finding and never sets a validation status. Supply the same object you would pass to save_finding (plus an optional finding_id for correlation). All five falsification fields must be non-empty strings and oracle_type must match the captures you produced; only canary_echo is auto-confirmable. The canary is tool-minted and never shown to you - do not guess it, and any token found in the candidate is redacted to <redacted-canary> in the result. Returns {"ok":true,"ready":bool,"missing_fields":[...],"declared_oracle":...,"missing_evidence":[...],"falsified":bool,"reasons":[...]}; when fields are missing the {"error":"falsification_incomplete","paths":[...]} shape matches save_finding exactly."#.into(),
+            // No schema-level requirements: fields are enforced in `run` so the
+            // model receives the same structured error it would get from save.
+            input_schema: json!({"type":"object","properties":properties,"required":[]}),
+            risk: "safe".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let canonical = canonicalize_finding_input(&input);
+        let status = check_falsification(&canonical);
+        let oracle = canonical
+            .get("oracle_type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let missing_evidence: Vec<String> = if !status.ready() || oracle.is_empty() {
+            Vec::new()
+        } else {
+            match oracle_proof_gap(oracle) {
+                Some(gap) => vec![gap.to_string()],
+                None if !has_capture_reference(&canonical) => {
+                    vec!["tool-canary reflection in a 2xx response".to_string()]
+                }
+                None => Vec::new(),
+            }
+        };
+        let falsified = candidate_falsified(&canonical);
+        let ready = status.ready() && missing_evidence.is_empty() && !falsified;
+        let mut reasons = Vec::new();
+        if status.invalid_oracle {
+            reasons.push(format!(
+                "oracle_type '{oracle}' is not a recognized oracle class"
+            ));
+        }
+        if !status.missing.is_empty() {
+            reasons.push(format!(
+                "missing falsification fields: {}",
+                status.missing.join(", ")
+            ));
+        }
+        for gap in &missing_evidence {
+            reasons.push(format!("missing evidence for {oracle}: {gap}"));
+        }
+        if falsified {
+            reasons.push("candidate is marked falsified by counterevidence".to_string());
+        }
+        if ready {
+            reasons
+                .push("falsification contract satisfied; save_finding can be called".to_string());
+        }
+        let output = if status.ready() {
+            format!(
+                "finding validation ready={ready} missing_evidence={}",
+                missing_evidence.len()
+            )
+        } else {
+            status.output()
+        };
+        let mut structured = json!({
+            "ok": true,
+            "ready": ready,
+            "missing_fields": status.missing.clone(),
+            "declared_oracle": if oracle.is_empty() { Value::Null } else { json!(oracle) },
+            "missing_evidence": missing_evidence,
+            "falsified": falsified,
+            "reasons": reasons,
+            "candidate": canonical,
+        });
+        if let Some(finding_id) = input.get("finding_id") {
+            structured["finding_id"] = finding_id.clone();
+        }
+        if !status.ready() {
+            structured["error"] = json!("falsification_incomplete");
+            structured["paths"] = json!(status.paths());
+        }
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&redact_canary_text(&output)),
+            structured: Some(redact_canaries(&structured)),
         })
     }
 }
@@ -3921,6 +4220,7 @@ pub fn try_default_registry_with_options(
         }),
         "write",
     );
+    reg.register(Arc::new(ValidateFindingTool));
     reg.register(Arc::new(RecordAssetTool));
     reg.register(Arc::new(SaveArtifactTool::new(cwd)?));
     reg.register(Arc::new(EchoTool));
@@ -8849,4 +9149,239 @@ fn canonical_report_omits_binding_fields_when_absent() {
     let markdown = render_canonical_report(&input);
     assert!(!markdown.contains("Evidence artifact:"));
     assert!(!markdown.contains("Paired-control SHA-256:"));
+}
+
+#[tokio::test]
+async fn save_finding_maps_falsification_aliases_to_canonical_columns() {
+    let tool = SaveFindingTool {
+        require_falsification: true,
+    };
+    let aliased = json!({
+        "title":"t","severity":"high","description":"d",
+        "against":"checked the control",
+        "confidence":"medium",
+        "why":"static and captured evidence agree",
+        "breaks_if":"auth is required",
+        "oracle":"canary_echo"
+    });
+    let result = tool.run(aliased).await.unwrap();
+    assert!(result.ok, "{:?}", result.structured);
+    let saved = result.structured.unwrap();
+    assert_eq!(saved["counterevidence"], json!("checked the control"));
+    assert_eq!(saved["confidence"], json!("medium"));
+    assert_eq!(
+        saved["confidence_rationale"],
+        json!("static and captured evidence agree")
+    );
+    assert_eq!(
+        saved["severity_change_conditions"],
+        json!("auth is required")
+    );
+    assert_eq!(saved["oracle_type"], json!("canary_echo"));
+    for alias in ["against", "why", "breaks_if", "oracle"] {
+        assert!(
+            saved.get(alias).is_none(),
+            "alias {alias} leaked into the saved finding"
+        );
+    }
+
+    // Canonical names keep working and win when both spellings are present.
+    let mixed = json!({
+        "title":"t","severity":"high","description":"d",
+        "counterevidence":"canonical",
+        "against":"alias",
+        "confidence":"low",
+        "confidence_rationale":"canonical rationale",
+        "why":"alias rationale",
+        "severity_change_conditions":"canonical conditions",
+        "breaks_if":"alias conditions",
+        "oracle_type":"differential",
+        "oracle":"canary_echo"
+    });
+    let saved = tool.run(mixed).await.unwrap().structured.unwrap();
+    assert_eq!(saved["counterevidence"], json!("canonical"));
+    assert_eq!(saved["confidence_rationale"], json!("canonical rationale"));
+    assert_eq!(
+        saved["severity_change_conditions"],
+        json!("canonical conditions")
+    );
+    assert_eq!(saved["oracle_type"], json!("differential"));
+}
+
+#[test]
+fn save_finding_schema_documents_falsification_contract() {
+    let spec = SaveFindingTool::default().spec();
+    assert_eq!(spec.risk, "write");
+    assert!(spec.description.contains("NON-EMPTY"));
+    assert!(spec.description.contains("never be guessed"));
+    assert!(spec.description.contains("\"oracle_type\":\"canary_echo\""));
+    let oracle = &spec.input_schema["properties"]["oracle_type"];
+    assert_eq!(oracle["enum"], json!(ORACLE_TYPES));
+    assert!(oracle["x-enumDescriptions"]["canary_echo"].is_string());
+    assert_eq!(
+        spec.input_schema["required"],
+        json!(["title", "severity", "description"])
+    );
+}
+
+#[tokio::test]
+async fn validate_finding_reports_all_missing_fields_with_save_identical_error() {
+    let save = SaveFindingTool {
+        require_falsification: true,
+    };
+    let candidate = json!({"title":"t","severity":"high","description":"d"});
+    let saved = save.run(candidate.clone()).await.unwrap();
+    let validated = ValidateFindingTool.run(candidate).await.unwrap();
+
+    assert!(!saved.ok);
+    assert_eq!(validated.output, saved.output);
+    let structured = validated.structured.unwrap();
+    assert_eq!(structured["ok"], json!(true));
+    assert_eq!(structured["ready"], json!(false));
+    assert_eq!(
+        structured["missing_fields"],
+        json!([
+            "counterevidence",
+            "confidence",
+            "confidence_rationale",
+            "severity_change_conditions",
+            "oracle_type"
+        ])
+    );
+    assert_eq!(structured["error"], json!("falsification_incomplete"));
+    assert_eq!(structured["paths"], saved.structured.unwrap()["paths"]);
+    assert_eq!(structured["declared_oracle"], Value::Null);
+    assert!(!structured["reasons"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn validate_finding_accepts_aliases_and_reports_ready() {
+    let candidate = json!({
+        "title":"t","severity":"high","description":"d",
+        "against":"checked benign control",
+        "confidence":"medium",
+        "why":"tool capture plus control",
+        "breaks_if":"needs authentication",
+        "oracle":"canary_echo",
+        "evidence":"capture from http_request",
+        "capture":{"request":"GET / HTTP/1.1","response":"HTTP/1.1 200 OK","canary":"agentbug-canary-abc"},
+        "finding_id":"f-001"
+    });
+    let result = ValidateFindingTool.run(candidate).await.unwrap();
+    assert!(result.ok);
+    let structured = result.structured.unwrap();
+    assert_eq!(structured["ok"], json!(true));
+    assert_eq!(structured["ready"], json!(true));
+    assert_eq!(structured["missing_fields"], json!([]));
+    assert_eq!(structured["missing_evidence"], json!([]));
+    assert_eq!(structured["falsified"], json!(false));
+    assert_eq!(structured["declared_oracle"], json!("canary_echo"));
+    assert_eq!(structured["finding_id"], json!("f-001"));
+    assert!(structured.get("error").is_none());
+    assert_eq!(
+        structured["candidate"]["capture"]["canary"],
+        json!("<redacted-canary>")
+    );
+}
+
+#[tokio::test]
+async fn validate_finding_redacts_canary_everywhere() {
+    let token = format!("agentbug-canary-{}", "a1b2c3d4".repeat(8));
+    let candidate = json!({
+        "title":"t","severity":"high","description":"d",
+        "counterevidence":"control",
+        "confidence":"high",
+        "confidence_rationale": format!("capture reflected {token}"),
+        "severity_change_conditions":"none",
+        "oracle_type":"canary_echo",
+        "evidence":[{"canary":token}],
+        "request": format!("GET /?canary={token}")
+    });
+    let result = ValidateFindingTool.run(candidate).await.unwrap();
+    let rendered = serde_json::to_string(&result).unwrap();
+    assert!(!rendered.contains(&token), "raw canary leaked: {rendered}");
+    assert!(rendered.contains("<redacted-canary>"));
+}
+
+#[tokio::test]
+async fn unknown_and_empty_oracle_rejected_by_both_tools() {
+    let save = SaveFindingTool {
+        require_falsification: true,
+    };
+    let base = json!({
+        "title":"t","severity":"high","description":"d",
+        "counterevidence":"control",
+        "confidence":"high",
+        "confidence_rationale":"rationale",
+        "severity_change_conditions":"conditions"
+    });
+
+    let mut unknown = base.clone();
+    unknown["oracle_type"] = json!("canary_absent");
+    let saved = save.run(unknown.clone()).await.unwrap();
+    let validated = ValidateFindingTool.run(unknown).await.unwrap();
+    assert_eq!(saved.output, validated.output);
+    assert_eq!(saved.structured.unwrap()["paths"], json!(["oracle_type"]));
+    assert_eq!(
+        validated.structured.unwrap()["paths"],
+        json!(["oracle_type"])
+    );
+
+    let mut empty = base;
+    empty["oracle_type"] = json!("   ");
+    let saved = save.run(empty.clone()).await.unwrap();
+    let validated = ValidateFindingTool.run(empty).await.unwrap();
+    assert_eq!(saved.output, validated.output);
+    assert_eq!(
+        validated.structured.unwrap()["paths"],
+        json!(["oracle_type"])
+    );
+}
+
+#[tokio::test]
+async fn validate_finding_reports_oracle_evidence_gaps() {
+    let candidate = json!({
+        "title":"t","severity":"high","description":"d",
+        "counterevidence":"control",
+        "confidence":"medium",
+        "confidence_rationale":"rationale",
+        "severity_change_conditions":"conditions",
+        "oracle_type":"oob_hit"
+    });
+    let result = ValidateFindingTool.run(candidate).await.unwrap();
+    let structured = result.structured.unwrap();
+    assert_eq!(structured["ready"], json!(false));
+    assert_eq!(structured["falsified"], json!(false));
+    assert!(structured["missing_evidence"].as_array().unwrap().len() == 1);
+    assert!(structured["reasons"].to_string().contains("listener hit"));
+}
+
+#[tokio::test]
+async fn validate_finding_is_registered_as_safe_and_does_not_write() {
+    let dir = std::env::temp_dir().join(format!(
+        "agentbug-validate-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let before: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    let registry = try_default_registry_with_options(&dir, ToolOptions::default()).unwrap();
+    assert_eq!(registry.host_risk("validate_finding"), "safe");
+    let tool = registry.get("validate_finding").unwrap();
+    let spec = tool.spec();
+    assert_eq!(spec.name, "validate_finding");
+    assert_eq!(spec.risk, "safe");
+    assert_eq!(spec.input_schema["required"], json!([]));
+    let result = tool.run(json!({"finding_id":"f-001"})).await.unwrap();
+    let after: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "validate_finding must not write files"
+    );
+    assert_eq!(result.structured.unwrap()["finding_id"], json!("f-001"));
+    let _ = std::fs::remove_dir_all(&dir);
 }

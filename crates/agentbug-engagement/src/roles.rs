@@ -152,15 +152,18 @@ pub fn role_profile(id: RoleId) -> RoleProfile {
 /// filtering is a second independent layer; it never widens the base registry.
 pub fn build_role_tools(base: &ToolRegistry, role: RoleId) -> ToolRegistry {
     let profile = role_profile(role);
+    // An empty allow-list means "inherit the whole ROE-filtered base". The
+    // numeric cap bounds explicit allow-lists only: applying it to an inherited
+    // base would alphabetically truncate the registry before evidence tools
+    // such as `http_probe`, `http_request` and `save_finding` are ever seen.
+    let inherit_base = profile.allow_tools.is_empty();
     let mut scoped = ToolRegistry::new();
     let mut non_terminal = 0usize;
     for spec in base.specs() {
-        if !profile.allow_tools.is_empty()
-            && !profile.allow_tools.iter().any(|name| *name == spec.name)
-        {
+        if !inherit_base && !profile.allow_tools.iter().any(|name| *name == spec.name) {
             continue;
         }
-        if spec.name != SESSION_FINISH_TOOL {
+        if !inherit_base && spec.name != SESSION_FINISH_TOOL {
             if non_terminal >= profile.max_tools {
                 continue;
             }
@@ -183,24 +186,111 @@ pub fn build_role_tools(base: &ToolRegistry, role: RoleId) -> ToolRegistry {
 mod tests {
     use super::*;
 
+    /// A side-effect-free named tool so registry filtering can be exercised
+    /// against a fully controlled base surface.
+    struct NamedTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl agentbug_tools::Tool for NamedTool {
+        fn spec(&self) -> agentbug_tools::ToolSpec {
+            agentbug_tools::ToolSpec::new(self.0, "", serde_json::json!({"type":"object"}))
+        }
+
+        async fn run(
+            &self,
+            _input: serde_json::Value,
+        ) -> anyhow::Result<agentbug_tools::ToolResult> {
+            Ok(agentbug_tools::ToolResult {
+                ok: true,
+                output: String::new(),
+                structured: None,
+            })
+        }
+    }
+
+    fn base_with(names: &[&'static str]) -> ToolRegistry {
+        let mut base = ToolRegistry::new();
+        for name in names {
+            base.register_with_host_risk(std::sync::Arc::new(NamedTool(name)), "safe");
+        }
+        base
+    }
+
+    fn has(scoped: &ToolRegistry, name: &str) -> bool {
+        scoped.get(name).is_some()
+    }
+
+    /// Base with enough alphabetically-earlier tools that the old `max_tools: 5`
+    /// cap would hide the evidence tools under test.
+    fn evidence_base() -> ToolRegistry {
+        base_with(&[
+            "clue_put",
+            "content_discovery",
+            "decode",
+            "dns_lookup",
+            "echo",
+            "http_probe",
+            "http_request",
+            "save_finding",
+            "validate_poc",
+            SESSION_FINISH_TOOL,
+        ])
+    }
+
     #[test]
     fn verification_role_cannot_save_findings_or_validate_poc() {
-        let base = ToolRegistry::new();
-        let scoped = build_role_tools(&base, RoleId::Verification);
-        assert!(!scoped.specs().iter().any(|s| s.name == "save_finding"));
-        assert!(!scoped.specs().iter().any(|s| s.name == "validate_poc"));
+        let scoped = build_role_tools(&evidence_base(), RoleId::Verification);
+        assert!(!has(&scoped, "save_finding"));
+        assert!(!has(&scoped, "validate_poc"));
     }
 
     #[test]
     fn report_role_is_tool_free_except_terminal() {
-        let mut base = ToolRegistry::new();
-        base.register_with_host_risk(
-            std::sync::Arc::new(agentbug_tools::SessionFinishTool),
-            "safe",
-        );
-        let scoped = build_role_tools(&base, RoleId::Report);
+        let scoped = build_role_tools(&evidence_base(), RoleId::Report);
         let names: Vec<String> = scoped.specs().into_iter().map(|s| s.name).collect();
         assert_eq!(names, vec![SESSION_FINISH_TOOL.to_string()]);
+    }
+
+    #[test]
+    fn testing_role_exposes_save_finding_http_request_and_http_probe() {
+        let scoped = build_role_tools(&evidence_base(), RoleId::Testing);
+        for name in ["save_finding", "http_request", "http_probe", "validate_poc"] {
+            assert!(has(&scoped, name), "testing role should expose {name}");
+        }
+    }
+
+    #[test]
+    fn general_role_exposes_save_finding() {
+        let scoped = build_role_tools(&evidence_base(), RoleId::General);
+        assert!(has(&scoped, "save_finding"));
+    }
+
+    #[test]
+    fn empty_allow_tools_inherits_full_base_registry() {
+        let names = [
+            "aaa",
+            "bbb",
+            "ccc",
+            "ddd",
+            "eee",
+            "fff",
+            "ggg",
+            "http_probe",
+            "http_request",
+            "save_finding",
+            SESSION_FINISH_TOOL,
+            "validate_poc",
+        ];
+        assert!(role_profile(RoleId::General).allow_tools.is_empty());
+        assert!(role_profile(RoleId::Testing).allow_tools.is_empty());
+        let base = base_with(&names);
+        let mut expected: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        expected.sort();
+        for role in [RoleId::General, RoleId::Testing] {
+            let scoped = build_role_tools(&base, role);
+            let actual: Vec<String> = scoped.specs().into_iter().map(|s| s.name).collect();
+            assert_eq!(actual, expected, "{role:?} should inherit the whole base");
+        }
     }
 }
 

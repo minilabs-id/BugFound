@@ -84,8 +84,10 @@ fn has_technical_action(line: &str) -> bool {
         .any(|token| lower.contains(token))
 }
 
-/// Explicit reward/report policy signals. These are checked before any
-/// generic prohibition logic: a bounty-amount sentence is not a tool rule.
+/// Explicit reward/report policy signals. These are checked before generic
+/// negative+security heuristics, but after vulnerability-class exclusions: a
+/// bounty-amount sentence is not a tool rule, yet a line naming an excluded
+/// class stays an exclusion even when it also carries reward words.
 const REWARD_SIGNALS: &[&str] = &[
     "bounty",
     "reward",
@@ -124,7 +126,7 @@ const REWARD_SIGNALS: &[&str] = &[
 /// Clearly non-operational prose. Checked before [`OPERATIONAL`] so that a
 /// bare "never"/"avoid" in privacy, marketing, or product copy cannot be
 /// mistaken for a tool rule. Reward/report prose is already covered by
-/// [`REWARD_SIGNALS`], which retains first-place precedence.
+/// [`REWARD_SIGNALS`], which outranks these heuristics.
 const INFORMATIONAL: &[&str] = &[
     // privacy
     "privacy policy",
@@ -206,6 +208,18 @@ pub fn classify_line(line: &str) -> ClassifiedLine<'_> {
             rule_id: "empty_or_short",
         };
     }
+    // Vulnerability-class exclusions are checked first. They are real ROE
+    // restrictions and must not be hidden by reward/report words on the same
+    // line (e.g. "CSRF is not rewarded and is informational").
+    for (needle, rule) in VULN_CLASSES {
+        if has_phrase(&tokens, needle) {
+            return ClassifiedLine {
+                line,
+                class: BriefLineClass::ProhibitedVulnClass,
+                rule_id: rule,
+            };
+        }
+    }
     // Reward/report policy wins over generic negative+security heuristics.
     if REWARD_SIGNALS
         .iter()
@@ -216,15 +230,6 @@ pub fn classify_line(line: &str) -> ClassifiedLine<'_> {
             class: BriefLineClass::ReportOrRewardPolicy,
             rule_id: "reward_or_report_policy",
         };
-    }
-    for (needle, rule) in VULN_CLASSES {
-        if has_phrase(&tokens, needle) {
-            return ClassifiedLine {
-                line,
-                class: BriefLineClass::ProhibitedVulnClass,
-                rule_id: rule,
-            };
-        }
     }
     // Non-operational prose is recognized before generic operational markers,
     // but only when the line carries no technical-action token. This keeps
@@ -302,6 +307,15 @@ mod tests {
     #[test]
     fn cake_csrf_line_is_prohibited_vuln_class() {
         let line = "CSRF-able actions that do not require authentication (or a session) to exploit";
+        let classified = classify_line(line);
+        assert_eq!(classified.class, BriefLineClass::ProhibitedVulnClass);
+        assert_eq!(classified.rule_id, "csrf_without_auth");
+        assert!(!is_abortable(classified.class, true));
+    }
+
+    #[test]
+    fn csrf_exclusion_beats_reward_and_informational_words() {
+        let line = "CSRF is not rewarded and is informational for this program.";
         let classified = classify_line(line);
         assert_eq!(classified.class, BriefLineClass::ProhibitedVulnClass);
         assert_eq!(classified.rule_id, "csrf_without_auth");

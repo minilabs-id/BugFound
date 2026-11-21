@@ -330,7 +330,12 @@ fn permissive_audited_mode_auto_acks_and_forces_incomplete() {
         .expect("BriefIngested event must be emitted");
     let rule_hash = open_traces[0]["rule_hash"].as_str().unwrap();
     let store = Store::open(&paths.db).unwrap();
+    // Config auto-acks live under their own kind; an operator ack kind must not
+    // be present, otherwise a later Strict run could proceed without an operator.
     assert!(store
+        .has_authorization_ack(&program_url, content_hash, "config_auto_roe", rule_hash)
+        .unwrap());
+    assert!(!store
         .has_authorization_ack(&program_url, content_hash, "unparsed_roe", rule_hash)
         .unwrap());
 
@@ -345,6 +350,59 @@ fn permissive_audited_mode_auto_acks_and_forces_incomplete() {
         event,
         EngagementEvent::Finished { summary } if summary.contains(" incomplete with ")
     )));
+}
+
+#[test]
+fn strict_run_after_permissive_auto_ack_still_aborts() {
+    let paths = temp_paths("ack-leak");
+    let brief = brief_with_unparsed();
+
+    // First run in permissive mode auto-records a config-scoped acknowledgement.
+    let (first, _) = run_local_brief(
+        &paths,
+        &brief,
+        EngagementOptions::default(),
+        permissive_options(),
+    );
+    first.expect("first permissive run must succeed");
+
+    // A later strict run on the very same brief must not see the config auto-ack
+    // as operator consent and must therefore fail closed.
+    let (second, events) = run_local_brief(
+        &paths,
+        &brief,
+        EngagementOptions::default(),
+        EngagementRoeOptions::default(),
+    );
+    let error = second.expect_err("config auto-ack must not authorize a strict run");
+    assert!(
+        error.to_string().contains("unparsed ROE constraints"),
+        "{error:#}"
+    );
+    let id = started_id(&events);
+    let open_traces = trace_payloads(&paths.db, id, "authorization.open_rule");
+    assert_eq!(open_traces.len(), 1);
+    assert_eq!(open_traces[0]["acknowledged"], false);
+    assert!(trace_payloads(&paths.db, id, "authorization.ack_applied").is_empty());
+
+    // The auto-ack exists, but only under its distinct config kind.
+    let conn = rusqlite::Connection::open(&paths.db).unwrap();
+    let config_acks: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM authorization_acks WHERE subject_kind='config_auto_roe' AND decision='acknowledged'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(config_acks, 1);
+    let operator_acks: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM authorization_acks WHERE subject_kind='unparsed_roe' AND decision='acknowledged'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(operator_acks, 0);
 }
 
 #[test]
@@ -501,12 +559,15 @@ fn permissive_mode_is_idempotent_across_runs() {
     let conn = rusqlite::Connection::open(&paths.db).unwrap();
     let ack_rows: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM authorization_acks WHERE subject_kind='unparsed_roe' AND decision='acknowledged'",
+            "SELECT COUNT(*) FROM authorization_acks WHERE subject_kind='config_auto_roe' AND decision='acknowledged'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(ack_rows, 1, "a hash-scoped ack must be inserted only once");
+    assert_eq!(
+        ack_rows, 1,
+        "a hash-scoped config ack must be inserted only once"
+    );
 
     for id in [&first_id, &second_id] {
         let outcomes = trace_payloads(&paths.db, id, "engagement.outcome");

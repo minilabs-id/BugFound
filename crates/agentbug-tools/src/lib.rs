@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -524,8 +524,43 @@ fn normalize_scope_target(target: &str) -> String {
     normalize_host(trimmed)
 }
 
+/// Match an IP address against an IPv4 or IPv6 CIDR block. Mirrors
+/// `agentbug_policy::ScopeConfig::cidr_matches` so the tool-side guard and the
+/// policy engine agree on both address families.
+fn ip_in_cidr(ip: IpAddr, cidr: &str) -> bool {
+    let Some((network, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(network) = network.parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u32>() else {
+        return false;
+    };
+    match (network, ip) {
+        (IpAddr::V4(net), IpAddr::V4(addr)) if prefix <= 32 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            u32::from(net) & mask == u32::from(addr) & mask
+        }
+        (IpAddr::V6(net), IpAddr::V6(addr)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(net) & mask == u128::from(addr) & mask
+        }
+        _ => false,
+    }
+}
+
 /// One scope entry against one normalized target. Supports exact hosts,
-/// plain suffixes (including a leading dot), `*.suffix` wildcards and IPv4
+/// plain suffixes (including a leading dot), `*.suffix` wildcards (which also
+/// cover the apex host, matching the policy engine), bare `*`, and IPv4/IPv6
 /// CIDR blocks.
 fn scope_entry_matches(entry: &str, target: &str) -> bool {
     let entry = entry.trim().trim_matches(['[', ']']).to_ascii_lowercase();
@@ -533,12 +568,17 @@ fn scope_entry_matches(entry: &str, target: &str) -> bool {
     if entry.is_empty() {
         return false;
     }
+    // A bare wildcard is the explicit "any target" rule; the policy engine
+    // treats it the same way.
+    if entry == "*" {
+        return true;
+    }
     if entry.contains('/') {
         let network = entry.split('/').next().unwrap_or_default();
-        if network.parse::<Ipv4Addr>().is_ok() || network.parse::<Ipv6Addr>().is_ok() {
+        if network.parse::<IpAddr>().is_ok() {
             return target
-                .parse::<Ipv4Addr>()
-                .map(|ip| ipv4_in_cidr(ip, entry))
+                .parse::<IpAddr>()
+                .map(|ip| ip_in_cidr(ip, entry))
                 .unwrap_or(false);
         }
         // Host-oriented pattern with a path (e.g. "*.api.clockify.me/api/"):
@@ -555,7 +595,7 @@ fn scope_entry_matches(entry: &str, target: &str) -> bool {
         return target == host || target.ends_with(&format!(".{host}"));
     }
     if let Some(suffix) = entry.strip_prefix("*.") {
-        return !suffix.is_empty() && target != suffix && target.ends_with(&format!(".{suffix}"));
+        return !suffix.is_empty() && (target == suffix || target.ends_with(&format!(".{suffix}")));
     }
     if let Some(suffix) = entry.strip_prefix('.') {
         return !suffix.is_empty() && (target == suffix || target.ends_with(&format!(".{suffix}")));
@@ -2565,9 +2605,15 @@ impl ExternalCommandTool {
 /// process-group leader, so `kill(-pid)` signals the whole group; the direct
 /// child is killed afterwards as a best-effort fallback and reaped.
 fn kill_process_tree(child: &mut tokio::process::Child) {
-    let Some(pid) = child.id().map(|pid| pid.to_string()) else {
-        return;
-    };
+    if let Some(pid) = child.id() {
+        kill_process_tree_by_pid(pid);
+    }
+}
+
+/// PID-based variant for the case where the `Child` has already been consumed
+/// by `wait_with_output` but a grandchild still holds the output pipes.
+fn kill_process_tree_by_pid(pid: u32) {
+    let pid = pid.to_string();
     #[cfg(windows)]
     {
         let _ = std::process::Command::new("taskkill")
@@ -2632,12 +2678,26 @@ impl Tool for ExternalCommandTool {
             command.process_group(0);
         }
         let mut child = command.spawn().context("spawn external command")?;
+        let child_pid = child.id();
         // Poll for completion instead of spawn_blocking(output()): on timeout
         // we can now kill and reap the child rather than leaving it running.
         let deadline = Instant::now() + self.timeout;
         let out = loop {
             match child.try_wait().context("poll external command")? {
-                Some(_) => break child.wait_with_output().await.context("collect output")?,
+                Some(_) => {
+                    // The direct child exited, but a grandchild can still hold
+                    // the stdout/stderr pipes open. Bound that drain too, or
+                    // wait_with_output() blocks forever after a clean exit.
+                    match timeout(self.timeout, child.wait_with_output()).await {
+                        Ok(result) => break result.context("collect output")?,
+                        Err(_) => {
+                            if let Some(pid) = child_pid {
+                                kill_process_tree_by_pid(pid);
+                            }
+                            anyhow::bail!("external command timeout");
+                        }
+                    }
+                }
                 None => {
                     if Instant::now() >= deadline {
                         kill_process_tree(&mut child);
@@ -4015,6 +4075,53 @@ pub fn external_tool_availability() -> BTreeMap<String, Option<PathBuf>> {
     out
 }
 
+/// Resolve a configured program to an absolute path with a which-like search
+/// implemented using std. Bare names are searched in `dirs` (normally PATH)
+/// rather than being left for the OS to resolve at spawn time: on Windows the
+/// OS searches the working directory first, which would let a stray binary in
+/// the workspace hijack an operator-configured tool. Unresolvable programs
+/// return `None` so registration can skip them instead of executing the wrong
+/// binary. A configured path (containing a separator) is canonicalized in
+/// place.
+fn resolve_program_in(program: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let path = Path::new(program);
+    if path
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty())
+    {
+        let canonical = std::fs::canonicalize(path).ok()?;
+        return is_executable_file(&canonical).then_some(canonical);
+    }
+
+    let mut extensions: Vec<String> = vec![String::new()];
+    #[cfg(windows)]
+    {
+        let raw = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        extensions.extend(
+            raw.split(';')
+                .filter(|ext| !ext.is_empty())
+                .map(|ext| ext.to_ascii_lowercase()),
+        );
+    }
+    for dir in dirs {
+        for ext in &extensions {
+            let candidate = dir.join(format!("{program}{ext}"));
+            if is_executable_file(&candidate) {
+                return std::fs::canonicalize(&candidate).ok();
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a configured program using the inherited PATH.
+fn resolve_program(program: &str) -> Option<PathBuf> {
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).collect())
+        .unwrap_or_default();
+    resolve_program_in(program, &dirs)
+}
+
 fn register_external_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &ToolOptions) {
     let detected = if options.auto_detect_external {
         Some(external_tool_availability())
@@ -4098,11 +4205,17 @@ fn register_command_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &ToolO
         let Some((program, args)) = parts.split_first() else {
             continue;
         };
+        // Pin the program to an absolute path at registration time. Leaving a
+        // bare name in place would let the OS resolve it per spawn (cwd-first
+        // on Windows), undermining the explicit operator opt-in.
+        let Some(resolved) = resolve_program(program) else {
+            continue;
+        };
         reg.register(Arc::new(
             ExternalCommandTool::new(
                 name,
                 format!("Gated external tool: {name}."),
-                program.clone(),
+                resolved.to_string_lossy().to_string(),
                 args.to_vec(),
                 "network",
                 cwd,
@@ -4971,38 +5084,38 @@ pub fn render_canonical_report(input: &ReportInput) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# {} Ã¢â‚¬â€ Security Assessment Report\n\n",
-        input.engagement
+        inline_view(&input.engagement)
     ));
 
     let verified_count = input.findings.iter().filter(|f| f.verified).count();
     out.push_str("## Executive Summary\n\n");
     out.push_str(&format!(
         "Program: {}\n\nThis report documents {} finding(s), {} verified, from engagement `{}` (report `{}`). Findings include reproduction steps, proof of concept, impact, remediation and SHA-256 evidence hashes.\n\n",
-        input.program,
+        inline_view(&input.program),
         input.findings.len(),
         verified_count,
-        input.engagement,
-        input.report_id
+        inline_view(&input.engagement),
+        inline_view(&input.report_id)
     ));
 
     out.push_str("## Scope & ROE\n\n");
     out.push_str("**In scope**\n\n");
     for entry in &input.scope_in {
-        out.push_str(&format!("- `{entry}`\n"));
+        out.push_str(&format!("- `{}`\n", inline_view(entry)));
     }
     if input.scope_in.is_empty() {
         out.push_str("- (none)\n");
     }
     out.push_str("\n**Out of scope**\n\n");
     for entry in &input.scope_out {
-        out.push_str(&format!("- `{entry}`\n"));
+        out.push_str(&format!("- `{}`\n", inline_view(entry)));
     }
     if input.scope_out.is_empty() {
         out.push_str("- (none)\n");
     }
     out.push_str("\n**Rules of engagement**\n\n");
     for rule in &input.rules {
-        out.push_str(&format!("- {rule}\n"));
+        out.push_str(&format!("- {}\n", inline_view(rule)));
     }
     if input.rules.is_empty() {
         out.push_str("- (none)\n");
@@ -5020,9 +5133,19 @@ pub fn render_canonical_report(input: &ReportInput) -> String {
     }
     for (index, finding) in input.findings.iter().enumerate() {
         let hash = finding.evidence_hash.as_deref().unwrap_or("unavailable");
-        out.push_str(&format!("### F-{:03}: {}\n\n", index + 1, finding.title));
-        out.push_str(&format!("- **ID:** {}\n", finding.id));
-        out.push_str(&format!("- **Severity:** {}\n", finding.severity));
+        // Model-supplied fields are rendered as single lines: a body containing
+        // a newline must not be able to emit a `### F-...` heading that score.py
+        // would count as a separate finding. Evidence fields stay byte-exact.
+        out.push_str(&format!(
+            "### F-{:03}: {}\n\n",
+            index + 1,
+            inline_view(&finding.title)
+        ));
+        out.push_str(&format!("- **ID:** {}\n", inline_view(&finding.id)));
+        out.push_str(&format!(
+            "- **Severity:** {}\n",
+            inline_view(&finding.severity)
+        ));
         out.push_str(&format!(
             "- **CVSS:** {}\n",
             finding
@@ -5032,21 +5155,24 @@ pub fn render_canonical_report(input: &ReportInput) -> String {
         ));
         out.push_str(&format!(
             "- **Vector:** {}\n",
-            finding.vector.as_deref().unwrap_or("N/A")
+            inline_view(finding.vector.as_deref().unwrap_or("N/A"))
         ));
         out.push_str(&format!(
             "- **CWE:** {}\n",
-            finding.cwe.as_deref().unwrap_or("N/A")
+            inline_view(finding.cwe.as_deref().unwrap_or("N/A"))
         ));
         if let Some(rationale) = finding.cwe_rationale.as_deref() {
-            out.push_str(&format!("- **CWE rationale:** {rationale}\n"));
+            out.push_str(&format!(
+                "- **CWE rationale:** {}\n",
+                inline_view(rationale)
+            ));
         }
         if let Some(note) = finding.cvss_note.as_deref() {
-            out.push_str(&format!("- **CVSS note:** {note}\n"));
+            out.push_str(&format!("- **CVSS note:** {}\n", inline_view(note)));
         }
         out.push_str(&format!(
             "- **Asset:** {}\n",
-            finding.asset.as_deref().unwrap_or("N/A")
+            inline_view(finding.asset.as_deref().unwrap_or("N/A"))
         ));
         out.push_str(&format!("- **Verified:** {}\n", finding.verified));
 
@@ -5075,23 +5201,23 @@ pub fn render_canonical_report(input: &ReportInput) -> String {
             out.push_str(&format!("- Response (redacted): `{}`\n", inline_view(v)));
         }
         out.push_str(&format!("- **Evidence SHA-256:** `{hash}`\n\n"));
-        out.push_str(&format!("{}\n\n", finding.description));
+        out.push_str(&format!("{}\n\n", inline_view(&finding.description)));
         out.push_str("#### Steps to Reproduce\n\n");
         out.push_str(&format!(
             "{}\n\n",
-            finding.reproduction.as_deref().unwrap_or("Not provided")
+            inline_view(finding.reproduction.as_deref().unwrap_or("Not provided"))
         ));
         out.push_str("#### Proof of Concept\n\n");
         out.push_str(&format!("Evidence bytes pinned by SHA-256 `{hash}`.\n\n"));
         out.push_str("#### Impact\n\n");
         out.push_str(&format!(
             "{}\n\n",
-            finding.impact.as_deref().unwrap_or("Not provided")
+            inline_view(finding.impact.as_deref().unwrap_or("Not provided"))
         ));
         out.push_str("#### Remediation\n\n");
         out.push_str(&format!(
             "{}\n\n",
-            finding.remediation.as_deref().unwrap_or("Not provided")
+            inline_view(finding.remediation.as_deref().unwrap_or("Not provided"))
         ));
     }
 
@@ -5100,14 +5226,25 @@ pub fn render_canonical_report(input: &ReportInput) -> String {
         out.push_str("- No coverage rows were supplied.\n");
     } else {
         for (target, method, path, status, rationale) in &input.coverage {
-            let method = if method.is_empty() { "ANY" } else { method };
-            let status = if status.is_empty() { "covered" } else { status };
+            let method = if method.is_empty() {
+                "ANY".to_string()
+            } else {
+                inline_view(method)
+            };
+            let status = if status.is_empty() {
+                "covered".to_string()
+            } else {
+                inline_view(status)
+            };
             out.push_str(&format!(
-                "- `{method} {target}{path}` — **{status}**{}\n",
+                "- `{} {}{}` — **{status}**{}\n",
+                method,
+                inline_view(target),
+                inline_view(path),
                 if rationale.is_empty() {
                     String::new()
                 } else {
-                    format!(" ({rationale})")
+                    format!(" ({})", inline_view(rationale))
                 }
             ));
         }
@@ -5119,7 +5256,12 @@ pub fn render_canonical_report(input: &ReportInput) -> String {
         out.push_str("- (none)\n");
     } else {
         for (timestamp, kind, detail) in &input.timeline {
-            out.push_str(&format!("- {timestamp} [{kind}] {detail}\n"));
+            out.push_str(&format!(
+                "- {} [{}] {}\n",
+                inline_view(timestamp),
+                inline_view(kind),
+                inline_view(detail)
+            ));
         }
     }
     out.push('\n');
@@ -6140,13 +6282,26 @@ mod tests {
         assert!(plain.get("dnsx").is_none());
         assert!(plain.get("subfinder").is_none());
 
+        // Configured commands are pinned to a resolvable absolute path at
+        // registration; a bare name that cannot be found is skipped.
+        let program = dir.join(if cfg!(windows) {
+            "nuclei.exe"
+        } else {
+            "nuclei"
+        });
+        std::fs::write(&program, b"fake nuclei").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let mut options = ToolOptions {
             enable_external_tools: true,
             ..ToolOptions::default()
         };
         options
             .external_commands
-            .insert("nuclei".into(), "nuclei -u {url}".into());
+            .insert("nuclei".into(), format!("{} -u {{url}}", program.display()));
         let reg = try_default_registry_with_options(&dir, options).unwrap();
         for name in ["subfinder", "dnsx", "katana", "ffuf", "nuclei"] {
             assert!(reg.get(name).is_some(), "missing {name}");
@@ -6176,7 +6331,8 @@ mod tests {
 
         let wildcard = vec!["*.example.com".to_string()];
         assert!(scope_target_allowed("api.example.com", &wildcard, &empty));
-        assert!(!scope_target_allowed("example.com", &wildcard, &empty));
+        // Parity with ScopeConfig::check_target: a wildcard covers the apex too.
+        assert!(scope_target_allowed("example.com", &wildcard, &empty));
 
         let suffix = vec![".example.com".to_string()];
         assert!(scope_target_allowed("api.example.com", &suffix, &empty));
@@ -6229,6 +6385,39 @@ mod tests {
         assert!(scope_target_allowed("api.clockify.me", &in_scope, &out));
         // A genuinely excluded host remains excluded.
         assert!(!scope_target_allowed("nope.clockify.me", &empty, &out));
+    }
+
+    #[test]
+    fn scope_matcher_has_policy_parity_for_wildcards_and_ipv6() {
+        let empty: Vec<String> = Vec::new();
+
+        // (a) `*.suffix` also covers the apex host, as ScopeConfig::matches does.
+        let wildcard = vec!["*.example.com".to_string()];
+        assert!(scope_target_allowed("example.com", &wildcard, &empty));
+        assert!(scope_target_allowed(
+            "https://example.com/path",
+            &wildcard,
+            &empty
+        ));
+
+        // (b) IPv6 CIDR entries match IPv6 targets, but not IPv4 or other nets.
+        let v6 = vec!["2001:db8::/32".to_string()];
+        assert!(scope_target_allowed("2001:db8::1", &v6, &empty));
+        assert!(scope_target_allowed("[2001:db8::1]", &v6, &empty));
+        assert!(!scope_target_allowed("2001:db9::1", &v6, &empty));
+        assert!(!scope_target_allowed("10.1.2.3", &v6, &empty));
+
+        // (c) A bare `*` allows any target, including a raw IP.
+        let any = vec!["*".to_string()];
+        assert!(scope_target_allowed("anything.example", &any, &empty));
+        assert!(scope_target_allowed("10.1.2.3", &any, &empty));
+
+        // The specificity rule still holds: an exact in-scope asset beats a
+        // bare wildcard out-of-scope rule, but a wildcard alone excludes.
+        let exact = vec!["api.example.com".to_string()];
+        let any_out = vec!["*".to_string()];
+        assert!(scope_target_allowed("api.example.com", &exact, &any_out));
+        assert!(!scope_target_allowed("other.example.com", &empty, &any_out));
     }
 
     #[test]
@@ -6379,6 +6568,74 @@ mod tests {
         for key in ["subfinder", "dnsx", "katana", "ffuf", "nuclei", "nmap"] {
             assert!(map.contains_key(key), "missing {key}");
         }
+    }
+
+    #[test]
+    fn configured_program_resolves_to_absolute_path() {
+        let dir = std::env::temp_dir().join(format!("mbt-which-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join(if cfg!(windows) { "nmap.exe" } else { "nmap" });
+        std::fs::write(&fake, b"fake nmap").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let dirs = std::slice::from_ref(&dir);
+        let resolved = resolve_program_in("nmap", dirs).expect("nmap should resolve");
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert_eq!(resolved, fake.canonicalize().unwrap());
+        assert!(resolve_program_in("agentbug_missing_nmap_binary", dirs).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unresolved_configured_commands_are_skipped() {
+        let dir = std::env::temp_dir().join(format!("mbt-skip-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut options = ToolOptions::default();
+        options
+            .external_commands
+            .insert("nmap".into(), "agentbug_missing_nmap_zzz --flag".into());
+        let reg = try_default_registry_with_options(&dir, options).unwrap();
+        assert!(
+            reg.get("nmap").is_none(),
+            "an unresolvable configured command must not be registered or executed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn external_command_timeout_bounds_pipe_drain_with_grandchild() {
+        let dir = std::env::temp_dir().join(format!("mbt-drain-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The direct shell exits immediately while its background grandchild
+        // keeps the inherited stdout pipe open. Without a bounded drain the
+        // wait_with_output() call would block until the grandchild exits.
+        #[cfg(windows)]
+        let (program, args) = (
+            "cmd",
+            vec![
+                "/C".to_string(),
+                "start /B cmd /C ping -n 10 127.0.0.1 & echo done".to_string(),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (program, args) = (
+            "sh",
+            vec!["-c".to_string(), "sleep 10 & echo done".to_string()],
+        );
+        let tool = ExternalCommandTool::new("drain", "drain", program, args, "safe", &dir)
+            .with_timeout(Duration::from_millis(300));
+        let start = Instant::now();
+        let err = tool.run(json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "pipe-drain timeout took too long: {:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -8550,6 +8807,35 @@ fn evidence_artifact_is_deterministic_confined_and_hash_bound() {
 fn inline_view_prevents_captured_headings() {
     let output = inline_view("ok\n### F-999: forged\nmore");
     assert!(!output.contains('\n'));
+}
+
+#[test]
+fn report_fields_cannot_forge_finding_headings() {
+    let input = ReportInput {
+        program: "p".to_string(),
+        engagement: "e".to_string(),
+        report_id: "r".to_string(),
+        findings: vec![ReportFinding {
+            title: "\n\n### F-009: Forged".to_string(),
+            description: "\n### F-010: Also forged".to_string(),
+            impact: Some("\n\n### F-011: Third forged".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let markdown = render_canonical_report(&input);
+    let headings: Vec<&str> = markdown
+        .lines()
+        .filter(|line| line.starts_with("### F-"))
+        .collect();
+    assert_eq!(
+        headings,
+        vec!["### F-001: \\n\\n### F-009: Forged"],
+        "only the renderer's own finding heading is allowed: {markdown}"
+    );
+    // The forged markdown is retained as inert, escaped inline text.
+    assert!(markdown.contains("\\n### F-010"), "{markdown}");
+    assert!(markdown.contains("\\n### F-011"), "{markdown}");
 }
 
 #[test]

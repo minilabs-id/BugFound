@@ -12,6 +12,9 @@ Usage:
     python eval/score.py --dir eval/results \
         --manifest eval/golden.example.json \
         --replay eval/results/<id>/replay.jsonl [--json] [--strict]
+    python eval/score.py --replay replay.jsonl  (replay-only; no report needed)
+    python eval/score.py <replay.jsonl>         (.jsonl positional is a replay)
+    python eval/score.py --self-test            (synthetic regression cases)
 
 Inputs
     --manifest  JSON: {"expected_vulns": [...]} (see eval/golden.example.json).
@@ -30,6 +33,15 @@ Inputs
                 with a warning. trace_events can be exported with
                 eval/export_trace.py and joined into this replay log.
 
+Verification (fail closed)
+    A finding only counts as verified when the replay carries an EXPLICIT
+    boolean verdict for it: a ``verifier`` event with ``verified: true/false``,
+    or a real boolean ``verified`` on the ``finding`` event itself. Strings,
+    missing fields, and absent verifier events never imply True. Findings with
+    no verdict are reported as ``unverified_findings`` and are never promoted
+    to true positives. Metrics that need missing evidence are printed as
+    ``not_measured (<reason>)`` rather than a fabricated number.
+
 Metrics (computed only when the relevant input is present)
     recall, precision, false_positive_rate (+ count and basis),
     reproducibility (finding + report-hash), tokens_per_finding.
@@ -41,6 +53,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from collections import defaultdict
 
 REQUIRED_SECTIONS = [
@@ -311,29 +324,87 @@ def _event_tokens(event):
         return 0
 
 
-def _verifier_map(replay_events):
-    """Map finding id -> deterministic verifier verdict from trace events."""
-    verdicts = {}
+def _explicit_verdict(event):
+    """Return True/False only from a real boolean verdict field, else None.
+
+    Missing fields, strings, and other values are NOT verification evidence.
+    This is the boundary that stops absent data from being read as ``verified``.
+    """
+    for name in ("verified", "verdict"):
+        value = event.get(name)
+        if isinstance(value, bool):
+            return value
+    return None
+
+
+def _verdict_maps(replay_events):
+    """Build (by_id, by_identifier, explicit_count) verdict maps.
+
+    Both ``verifier`` events and ``finding`` events with a real boolean
+    ``verified`` contribute. A verifier event without an explicit boolean is
+    ignored: it verifies nothing.
+    """
+    by_id = {}
+    by_identifier = defaultdict(set)
+    count = 0
     for event in replay_events:
-        if event["kind"] != "verifier":
+        if event["kind"] not in ("verifier", "finding"):
             continue
-        finding_id = event.get("finding_id") or event.get("id")
-        if finding_id is None:
+        verdict = _explicit_verdict(event)
+        if verdict is None:
             continue
-        verdicts[str(finding_id)] = not _is_false(
-            event.get("verified", event.get("verdict", True))
+        count += 1
+        finding_id = (
+            event.get("finding_id") or event.get("id") or event.get("candidate")
         )
-    return verdicts
+        if finding_id is not None:
+            by_id[str(finding_id)] = verdict
+        identifiers = identifiers_from([
+            finding_id, event.get("type"), event.get("cwe"), event.get("candidate")
+        ])
+        for identifier in identifiers:
+            by_identifier[identifier].add(verdict)
+    return by_id, by_identifier, count
+
+
+def _resolve_verdict(identifiers, finding_id, by_id, by_identifier):
+    """Resolve an explicit verdict for a reported finding, or None.
+
+    Conflicting verdicts for the same identifier also resolve to None so that
+    ambiguity can never be promoted to a true positive.
+    """
+    if finding_id is not None and str(finding_id) in by_id:
+        return by_id[str(finding_id)]
+    values = set()
+    for identifier in identifiers:
+        values.update(by_identifier.get(identifier, ()))
+    if len(values) == 1:
+        return next(iter(values))
+    return None
+
+
+def _status(measured, reason=""):
+    return {
+        "status": "measured" if measured else "not_measured",
+        "reason": "" if measured else reason,
+    }
 
 
 def compute_metrics(results, ground_truth, replay_events):
-    """Compute detection/reproducibility metrics dicts; values may be None."""
+    """Compute detection/reproducibility metrics dicts; values may be None.
+
+    Only findings carrying an explicit boolean verdict can become true or false
+    positives. Findings without one are counted in ``unverified_findings`` and
+    never inflate detection metrics. Metrics lacking required evidence are
+    reported as not_measured with a reason in ``measurement_status``.
+    """
     index = defaultdict(set)
     for entry in ground_truth:
         for identifier in entry["identifiers"]:
             index[identifier].add(entry["key"])
 
-    verdicts = _verifier_map(replay_events)
+    verdict_by_id, verdict_by_identifier, verdict_count = _verdict_maps(replay_events)
+
     reported = []
     for result in results:
         reported.extend(result.get("reported", []))
@@ -341,43 +412,75 @@ def compute_metrics(results, ground_truth, replay_events):
         if event["kind"] != "finding":
             continue
         finding_id = event.get("id") or event.get("finding_id")
-        verdict = event.get("verified")
-        if verdict is None and finding_id is not None and str(finding_id) in verdicts:
-            verdict = verdicts[str(finding_id)]
         identifiers = identifiers_from(
             [finding_id, event.get("type"), event.get("cwe")]
             + list(event.get("aliases") or [])
         )
+        own_verdict = _explicit_verdict(event)
         reported.append({
             "identifiers": identifiers,
-            "verified": not _is_false(verdict if verdict is not None else True),
+            "finding_id": str(finding_id) if finding_id is not None else None,
+            "verdict": (
+                own_verdict if own_verdict is not None
+                else _resolve_verdict(
+                    identifiers, finding_id, verdict_by_id, verdict_by_identifier
+                )
+            ),
             "source": "replay",
         })
     for item in reported:
+        if item["source"] == "report":
+            # Report headings carry no structured verdict; inherit one only if
+            # the replay explicitly verified a matching finding.
+            item["verdict"] = _resolve_verdict(
+                item["identifiers"], None, verdict_by_id, verdict_by_identifier
+            )
+
+    for item in reported:
         item["keys"] = _match_keys(item["identifiers"], index)
-        if _is_false(item.get("verified", True)):
+        if item["verdict"] is False:
+            # An explicit rejection invalidates any ground-truth match.
             item["keys"] = set()
     reported = _dedupe(reported)
 
     truth_keys = {entry["key"] for entry in ground_truth}
-    true_positives = [item for item in reported if item["keys"]]
+    verified = [item for item in reported if item["verdict"] is True]
+    rejected = [item for item in reported if item["verdict"] is False]
+    unverified = [item for item in reported if item["verdict"] is None]
+    true_positives = [item for item in verified if item["keys"]]
     false_positives = [
         item for item in reported
-        if not item["keys"] or _is_false(item.get("verified", True))
+        if item["verdict"] is not None and not item["keys"]
     ]
+
+    status = {}
+    if not truth_keys:
+        detection_reason = "no ground-truth manifest supplied"
+    elif verdict_count == 0:
+        detection_reason = "no explicit verifier verdicts in replay"
+    else:
+        detection_reason = ""
+    detection_ready = not detection_reason
+
     covered = set()
     for item in true_positives:
         covered.update(item["keys"])
+    recall = len(covered & truth_keys) / len(truth_keys) if detection_ready else None
+    status["recall"] = _status(detection_ready, detection_reason)
 
-    recall = len(covered & truth_keys) / len(truth_keys) if truth_keys else None
     denominator = len(true_positives) + len(false_positives)
-    # Without ground truth there is no such thing as a true positive: leave the
-    # metric unavailable instead of printing a misleading 0.000.
-    precision = len(true_positives) / denominator if truth_keys and denominator else None
+    if not detection_ready:
+        precision_reason = detection_reason
+    elif not denominator:
+        precision_reason = "no verified findings to score"
+    else:
+        precision_reason = ""
+    precision = len(true_positives) / denominator if not precision_reason else None
+    status["precision"] = _status(not precision_reason, precision_reason)
 
-    # FPR: explicit tested hypotheses first, then deterministic verifier
-    # rejections, then failed actions that carry a hypothesis identifier. A
-    # bare failed tool call (e.g. fs_read) is not a security negative.
+    # FPR: explicit tested hypotheses first, then verifier rejections, then
+    # failed actions carrying a hypothesis identifier. A bare failed tool call
+    # (e.g. fs_read) is not a security negative.
     tested_negatives = []
     verifier_negatives = []
     action_negatives = []
@@ -387,12 +490,10 @@ def compute_metrics(results, ground_truth, replay_events):
             identifiers = identifiers_from([event.get("type"), event.get("id"), event.get("cwe")])
             if identifiers:
                 tested_negatives.append(identifiers)
-        elif kind == "verifier" and _is_false(
-            event.get("verified", event.get("verdict", True))
-        ):
+        elif kind == "verifier" and _explicit_verdict(event) is False:
             identifiers = identifiers_from([
-                event.get("type"), event.get("cwe"),
-                event.get("id"), event.get("finding_id"),
+                event.get("type"), event.get("cwe"), event.get("id"),
+                event.get("finding_id"), event.get("candidate"),
             ])
             if identifiers:
                 verifier_negatives.append(identifiers)
@@ -405,7 +506,7 @@ def compute_metrics(results, ground_truth, replay_events):
 
     reported_identifiers = [item["identifiers"] for item in reported]
     negatives = []
-    fpr_basis = "unavailable"
+    fpr_basis = "not_measured"
     for candidates, basis in (
         (tested_negatives, "replay_tested_hypotheses"),
         (verifier_negatives, "replay_verifier_verdicts"),
@@ -415,18 +516,26 @@ def compute_metrics(results, ground_truth, replay_events):
             negatives = candidates
             fpr_basis = basis
             break
-    if negatives:
+    fpr = None
+    if detection_ready and negatives:
         fp_negatives = sum(
             1 for identifiers in negatives
             if any(identifiers & candidate for candidate in reported_identifiers)
         )
         tn = len(negatives) - fp_negatives
         fpr = fp_negatives / (fp_negatives + tn) if (fp_negatives + tn) else None
-    elif precision is not None:
+    elif detection_ready and precision is not None:
         fpr = 1.0 - precision
         fpr_basis = "reported_findings_fdr_proxy"
+    if not detection_ready:
+        fpr_reason = detection_reason
+    elif fpr is None:
+        fpr_reason = "no negative hypotheses or verified findings"
+        fpr_basis = "not_measured"
     else:
-        fpr = None
+        fpr_reason = ""
+    status["false_positive_rate"] = _status(not fpr_reason, fpr_reason)
+    status["false_positive_count"] = _status(detection_ready, detection_reason)
 
     # Reproducibility: findings reproduced in every run and modal report hash.
     runs = defaultdict(lambda: {"findings": set(), "hashes": []})
@@ -435,15 +544,16 @@ def compute_metrics(results, ground_truth, replay_events):
         if kind not in ("run_start", "finding", "report"):
             continue
         run_id = str(event.get("run_id") or "default")
+        run = runs[run_id]  # count run_start boundaries even without findings/hashes
         if kind == "finding":
             identifiers = identifiers_from(
                 [event.get("id"), event.get("type"), event.get("cwe")]
             )
             keys = _match_keys(identifiers, index)
             marker = "gt:" + ",".join(sorted(keys)) if keys else "raw:" + "|".join(sorted(identifiers))
-            runs[run_id]["findings"].add(marker)
+            run["findings"].add(marker)
         elif kind == "report" and event.get("sha256"):
-            runs[run_id]["hashes"].append(str(event["sha256"]))
+            run["hashes"].append(str(event["sha256"]))
     run_count = len(runs)
     finding_repro = None
     hash_repro = None
@@ -464,20 +574,46 @@ def compute_metrics(results, ground_truth, replay_events):
     if finding_repro is not None or hash_repro is not None:
         parts = [value for value in (finding_repro, hash_repro) if value is not None]
         reproducibility = sum(parts) / len(parts)
-
-    # Tokens per valid finding (API usage from replay; no len/4 estimates).
-    usage_events = [event for event in replay_events if event["kind"] == "usage"]
-    total_tokens = sum(_event_tokens(event) for event in usage_events)
-    valid_findings = len(true_positives) if truth_keys else len(reported)
-    tokens_per_finding = (
-        total_tokens / valid_findings if usage_events and valid_findings else None
+    if run_count < 2:
+        repro_reason = "fewer than 2 runs observed in replay"
+    elif reproducibility is None:
+        repro_reason = "no per-run findings or report hashes"
+    else:
+        repro_reason = ""
+    status["reproducibility"] = _status(not repro_reason, repro_reason)
+    status["reproducibility_findings"] = _status(
+        finding_repro is not None, "" if finding_repro is not None else repro_reason or "no per-run findings"
     )
+    status["reproducibility_report_hash"] = _status(
+        hash_repro is not None, "" if hash_repro is not None else repro_reason or "no report hashes"
+    )
+
+    # Tokens per verified finding (API usage from replay; no len/4 estimates).
+    usage_events = [event for event in replay_events if event["kind"] == "usage"]
+    total_tokens = sum(_event_tokens(event) for event in usage_events) if usage_events else None
+    valid_findings = len(true_positives)
+    tokens_per_finding = (
+        total_tokens / valid_findings
+        if total_tokens and valid_findings else None
+    )
+    if not usage_events:
+        tpf_reason = "no token usage events in replay"
+    elif not total_tokens:
+        tpf_reason = "usage events carried no token counts"
+    elif not truth_keys:
+        tpf_reason = "no ground-truth manifest supplied"
+    elif not valid_findings:
+        tpf_reason = "no verified true positives to normalise by"
+    else:
+        tpf_reason = ""
+    status["tokens_per_finding"] = _status(not tpf_reason, tpf_reason)
+    status["total_tokens"] = _status(bool(usage_events), "no token usage events in replay")
 
     return {
         "recall": recall,
         "precision": precision,
         "false_positive_rate": fpr,
-        "false_positive_count": len(false_positives),
+        "false_positive_count": len(false_positives) if detection_ready else None,
         "false_positive_basis": fpr_basis,
         "reproducibility": reproducibility,
         "reproducibility_findings": finding_repro,
@@ -486,21 +622,27 @@ def compute_metrics(results, ground_truth, replay_events):
         "ground_truth_count": len(truth_keys),
         "reported_findings": len(reported),
         "true_positives": len(true_positives),
+        "verified_findings": len(verified),
+        "rejected_findings": len(rejected),
+        "unverified_findings": len(unverified),
+        "explicit_verdicts_in_replay": verdict_count,
         "total_tokens": total_tokens,
         "valid_findings": valid_findings,
         "tokens_per_finding": tokens_per_finding,
-        "metrics_available": {
-            "recall": bool(truth_keys),
-            "precision": bool(truth_keys),
-            "false_positive_rate": fpr is not None,
-            "reproducibility": run_count >= 2,
-            "tokens_per_finding": any(event["kind"] == "usage" for event in replay_events),
-        },
+        "measurement_status": status,
+        "metrics_available": {name: value["status"] == "measured" for name, value in status.items()},
     }
 
 
 def _format(value):
     return "n/a" if value is None else ("%.3f" % value if isinstance(value, float) else str(value))
+
+
+def _format_metric(name, metrics):
+    status = metrics.get("measurement_status", {}).get(name)
+    if status and status["status"] == "not_measured":
+        return "not_measured (%s)" % status["reason"]
+    return _format(metrics[name])
 
 
 def print_summary(results, metrics, notes):
@@ -527,13 +669,122 @@ def print_summary(results, metrics, notes):
         "reproducibility_report_hash",
         "tokens_per_finding",
     ):
-        print("  %-28s %s" % (name, _format(metrics[name])))
+        print("  %-28s %s" % (name, _format_metric(name, metrics)))
     print("  %-28s %s" % ("false_positive_basis", metrics["false_positive_basis"]))
     print("  %-28s %s" % ("ground_truth", metrics["ground_truth_count"]))
     print("  %-28s %s" % ("reported_findings", metrics["reported_findings"]))
+    print("  %-28s %s" % ("verified_findings", metrics["verified_findings"]))
+    print("  %-28s %s" % ("rejected_findings", metrics["rejected_findings"]))
+    print("  %-28s %s" % ("unverified_findings", metrics["unverified_findings"]))
     for note in notes:
         print("  NOTE: %s" % note)
     print("\nNo benchmark results are asserted here. Record real results in eval/results/.")
+
+
+SELF_TEST_REPORT = """## Executive Summary
+Synthetic report used by --self-test only.
+## Scope & ROE
+Synthetic.
+## Methodology
+Synthetic.
+## Findings
+### [High] Genuine reflected XSS
+Severity: High
+**Type:** reflected XSS
+CWE-79
+Steps to reproduce, proof of concept, impact and remediation.
+### [High] Forged SQL injection (no verifier evidence)
+Severity: High
+**Type:** SQL injection
+CWE-89
+Steps to reproduce, proof of concept, impact and remediation.
+## Coverage
+Synthetic.
+## Timeline
+Synthetic.
+## Appendices
+Synthetic.
+"""
+
+
+def self_test():
+    """Run synthetic replay JSONL cases; return 0 only if every assertion holds."""
+    checks = []
+
+    def check(name, condition):
+        checks.append((name, bool(condition)))
+
+    def load(events, directory, label):
+        path = os.path.join(directory, label + ".jsonl")
+        with open(path, "w", encoding="utf-8") as handle:
+            for event in events:
+                handle.write(json.dumps(event) + "\n")
+        replay, warnings = load_replay(path)
+        check("%s jsonl loads without warnings" % label, not warnings)
+        return replay
+
+    xss = {"key": "xss", "identifiers": identifiers_from(["xss", "CWE-79"])}
+    sqli = {"key": "sqli", "identifiers": identifiers_from(["sqli", "CWE-89"])}
+
+    with tempfile.TemporaryDirectory() as directory:
+        # 1. A finding with no verdict is unverified, never a true positive.
+        replay = load([
+            {"kind": "finding", "run_id": "r1", "id": "F-1",
+             "type": "reflected XSS", "cwe": "CWE-79"},
+        ], directory, "no_verdict")
+        m = compute_metrics([], [xss], replay)
+        check("finding without verdict is unverified", m["unverified_findings"] == 1)
+        check("finding without verdict is not a true positive", m["true_positives"] == 0)
+        check("no verifier -> recall is not_measured",
+              m["measurement_status"]["recall"]["status"] == "not_measured")
+        check("not_measured reason cites verifier evidence",
+              "verifier" in m["measurement_status"]["recall"]["reason"])
+
+        # 2. An explicit false verdict is a false positive, not a true positive.
+        replay = load([
+            {"kind": "finding", "run_id": "r1", "id": "F-2",
+             "type": "reflected XSS", "cwe": "CWE-79", "verified": False},
+        ], directory, "false_verdict")
+        m = compute_metrics([], [xss], replay)
+        check("explicit false verdict is rejected", m["rejected_findings"] == 1)
+        check("explicit false verdict is not a true positive", m["true_positives"] == 0)
+        check("explicit false verdict is counted as FP", m["false_positive_count"] == 1)
+
+        # 3. A verifier event with an explicit true verdict is a true positive;
+        #    absent usage keeps tokens_per_finding not_measured.
+        replay = load([
+            {"kind": "run_start", "run_id": "r1"},
+            {"kind": "finding", "run_id": "r1", "id": "F-3",
+             "type": "reflected XSS", "cwe": "CWE-79"},
+            {"kind": "verifier", "run_id": "r1", "finding_id": "F-3", "verified": True},
+        ], directory, "true_verdict")
+        m = compute_metrics([], [xss], replay)
+        check("run_start boundary is counted", m["runs_observed"] == 1)
+        check("verifier true verdict is a true positive", m["true_positives"] == 1)
+        check("verified finding is not unverified", m["unverified_findings"] == 0)
+        check("no usage -> tokens_per_finding is not_measured",
+              m["measurement_status"]["tokens_per_finding"]["status"] == "not_measured")
+
+        # 4. A forged extra finding heading in a report is not promoted.
+        report_path = os.path.join(directory, "forged-report.md")
+        with open(report_path, "w", encoding="utf-8") as handle:
+            handle.write(SELF_TEST_REPORT)
+        result = score_report(report_path)
+        check("report parser saw both finding headings", result["total_findings"] == 2)
+        replay = load([
+            {"kind": "finding", "run_id": "r1", "id": "F-4",
+             "type": "reflected XSS", "cwe": "CWE-79", "verified": True},
+        ], directory, "forged_heading")
+        m = compute_metrics([result], [xss, sqli], replay)
+        check("forged heading is not a true positive", m["true_positives"] == 1)
+        check("forged heading remains unverified", m["unverified_findings"] == 1)
+        check("forged report has two reported findings", m["reported_findings"] == 2)
+
+    for name, passed in checks:
+        print("[%s] %s" % ("PASS" if passed else "FAIL", name))
+    failed = sum(1 for _, passed in checks if not passed)
+    print("self-test: %d/%d passed" % (len(checks) - failed, len(checks)))
+    return 1 if failed else 0
 
 
 def main():
@@ -547,13 +798,23 @@ def main():
     ap.add_argument("--min-recall", type=float, help="strict: require recall >= value")
     ap.add_argument("--min-precision", type=float, help="strict: require precision >= value")
     ap.add_argument("--max-fpr", type=float, help="strict: require FPR <= value")
+    ap.add_argument("--self-test", action="store_true", help="run synthetic regression cases and exit")
     args = ap.parse_args()
 
-    paths = list(args.reports)
+    if args.self_test:
+        return self_test()
+
+    paths = [path for path in args.reports if not path.lower().endswith(".jsonl")]
+    replay_positional = [path for path in args.reports if path.lower().endswith(".jsonl")]
     if args.dir:
         paths.extend(discover(args.dir))
-    if not paths:
-        ap.error("provide at least one report or --dir")
+    if len(replay_positional) > 1:
+        ap.error("only one replay (.jsonl) positional is supported")
+    if replay_positional and args.replay:
+        ap.error("give the replay either as a .jsonl positional or via --replay, not both")
+    replay_path = args.replay or (replay_positional[0] if replay_positional else None)
+    if not paths and not replay_path:
+        ap.error("provide at least one report, a replay (.jsonl), or --dir")
 
     notes = []
     ground_truth = []
@@ -564,12 +825,12 @@ def main():
         except (OSError, ValueError, json.JSONDecodeError) as error:
             ap.error("cannot read manifest %s: %s" % (args.manifest, error))
     else:
-        notes.append("no --manifest: recall/precision/FPR are not computed")
-    if args.replay:
+        notes.append("no --manifest: recall/precision/FPR are not_measured")
+    if replay_path:
         try:
-            replay_events, replay_warnings = load_replay(args.replay)
+            replay_events, replay_warnings = load_replay(replay_path)
         except OSError as error:
-            ap.error("cannot read replay %s: %s" % (args.replay, error))
+            ap.error("cannot read replay %s: %s" % (replay_path, error))
         notes.extend(replay_warnings[:10])
         if not replay_events:
             notes.append("replay contained no usable events")

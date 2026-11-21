@@ -78,7 +78,21 @@ def normalize_tokens(payload):
         return 0, 0
 
 
+def _explicit_bool(payload, *names):
+    """Return a real boolean from named fields only; never coerce strings.
+
+    Verification evidence must be explicit. A string such as "result":
+    "completed" must not become ``verified: true`` in the exported replay.
+    """
+    for name in names:
+        value = payload.get(name)
+        if isinstance(value, bool):
+            return value
+    return None
+
+
 def _verdict(payload):
+    """Loose success parsing for tool actions only, never for verification."""
     for name in ("verified", "verdict", "ok", "success", "result"):
         if name in payload:
             value = payload[name]
@@ -112,7 +126,7 @@ def event_from_row(row):
             event["id"] = payload.get("finding_id") or payload.get("finding")
         if not event.get("type"):
             event["type"] = payload.get("vuln_type") or payload.get("class")
-        verdict = _verdict(payload)
+        verdict = _explicit_bool(payload, "verified", "verdict")
         if verdict is not None:
             event["verified"] = verdict
 
@@ -124,8 +138,9 @@ def event_from_row(row):
         # `finding_id`. Keep both additive mappings so score.py sees the verdict.
         event["candidate"] = payload.get("candidate") or payload.get("finding_id") or ""
         event["finding_id"] = payload.get("finding_id") or payload.get("candidate") or event.get("id")
-        verdict = _verdict(payload)
-        event["verified"] = verdict if verdict is not None else False
+        verdict = _explicit_bool(payload, "verified", "verdict")
+        if verdict is not None:
+            event["verified"] = verdict
 
     if kind == "action":
         verdict = _verdict(payload)

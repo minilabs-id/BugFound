@@ -3285,7 +3285,7 @@ fn build_canonical_report(
         })
         .collect();
     let timeline = store
-        .list_all_events(500)
+        .list_events(context.engagement_id, 500)
         .unwrap_or_default()
         .into_iter()
         .map(|event| {

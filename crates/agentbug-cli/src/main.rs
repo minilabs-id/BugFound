@@ -1227,16 +1227,7 @@ path = ".agentbug/agentbug.db"
                 }
             };
 
-            {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
-                if let Ok(runtime) = runtime {
-                    runtime.block_on(async {
-                        let _ = monitor.stop().await;
-                    });
-                }
-            }
+            let _ = monitor.stop();
             match worker.join() {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {

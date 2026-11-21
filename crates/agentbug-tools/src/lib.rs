@@ -537,16 +537,26 @@ pub fn scope_target_allowed(target: &str, in_scope: &[String], out_of_scope: &[S
     if target.is_empty() {
         return false;
     }
-    if out_of_scope
+    let in_matches: Vec<&String> = in_scope
         .iter()
-        .any(|entry| scope_entry_matches(entry, &target))
+        .filter(|entry| scope_entry_matches(entry, &target))
+        .collect();
+    let out_matches: Vec<&String> = out_of_scope
+        .iter()
+        .filter(|entry| scope_entry_matches(entry, &target))
+        .collect();
+    // A specifically named in-scope asset wins over a broad out-of-scope
+    // wildcard (mirrors agentbug-policy::check_target).
+    if in_matches.iter().any(|entry| !entry.contains('*'))
+        && !out_matches.is_empty()
+        && out_matches.iter().all(|entry| entry.contains('*'))
     {
+        return true;
+    }
+    if !out_matches.is_empty() {
         return false;
     }
-    in_scope.is_empty()
-        || in_scope
-            .iter()
-            .any(|entry| scope_entry_matches(entry, &target))
+    in_scope.is_empty() || !in_matches.is_empty()
 }
 
 /// Resolve a trusted host. Trust only bypasses the syntactic `.local`/

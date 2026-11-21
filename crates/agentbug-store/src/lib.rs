@@ -589,6 +589,17 @@ impl Store {
             "ALTER TABLE sessions ADD COLUMN resume_attempts INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        for column in [
+            "requirement_id TEXT NOT NULL DEFAULT ''",
+            "claim TEXT NOT NULL DEFAULT ''",
+            "preconditions TEXT NOT NULL DEFAULT ''",
+            "oracle_type TEXT NOT NULL DEFAULT ''",
+            "rationale TEXT NOT NULL DEFAULT ''",
+            "evidence_ref TEXT NOT NULL DEFAULT ''",
+            "updated_at TEXT",
+        ] {
+            let _ = conn.execute(&format!("ALTER TABLE hypotheses ADD COLUMN {column}"), []);
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })

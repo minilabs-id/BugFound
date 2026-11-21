@@ -308,7 +308,7 @@ impl Monitor {
         Ok(())
     }
 
-    pub async fn stop(&self) -> Result<()> {
+    pub fn stop(&self) -> Result<()> {
         {
             let mut state = self.inner.state.lock().unwrap();
             if *state == MonitorState::Stopped {

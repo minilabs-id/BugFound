@@ -329,3 +329,17 @@ No effectiveness number may be asserted until those artifacts exist.
   platform adapters, safe-harbor typing, auto-submit.
 
 All results remain construction evidence. No benchmark claim is asserted.
+
+
+### Live evaluation — CAKE.com 2026-11-21 (construction evidence)
+- Fixed from live run: missing hypotheses ALTER migrations, nested tokio runtime
+  in monitor stop, tool-layer scope specificity (exact in-scope asset beats
+  wildcard out-of-scope), and engagement-scoped report timeline.
+- Run e43c21f9: 9 tasks planned, 2/9 evidenced, 0 findings, coverage 0,
+  outcome `incomplete`, report sha256 9d80aad765bd7e8367153c3c70be58eed5d77f96542c6811d123c18fdf07a235.
+- Root causes still open: LLM extraction target key `name` rejected by the
+  intentionally narrow policy target list (security gate), path-bearing scope
+  patterns (`*.api.clockify.me/api/`) don't match host keys, and 6/9 playbooks
+  failed on upstream LLM POST errors. No benchmark claim is asserted.
+- All fixes must keep existing tests green; speculative loosening of the narrow
+  policy target key list was reverted.

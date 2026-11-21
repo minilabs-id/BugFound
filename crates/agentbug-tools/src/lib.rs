@@ -3884,10 +3884,12 @@ pub fn try_default_registry_with_options(
     reg.register_alias("dns", dns.clone());
     reg.register_alias("dns_lookup", dns.clone());
     reg.register_alias("dns_resolve", dns);
+    // Command adapters must exist before the ExternalBackedTools that hold a
+    // registry snapshot, otherwise a configured backend is invisible to them.
+    register_command_adapters(&mut reg, cwd, &options);
     if options.enable_external_tools {
         register_external_adapters(&mut reg, cwd, &options);
     }
-    register_command_adapters(&mut reg, cwd, &options);
 
     // New built-in tools. These are always present; network/intrusive ones
     // that depend on an external binary return a gated result when absent.

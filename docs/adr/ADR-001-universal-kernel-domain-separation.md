@@ -1,19 +1,20 @@
 # ADR-001: Universal Kernel vs Bug Bounty Domain Separation
 
-- Status: Accepted (R1). Core seam implemented in R2; physical crate split deferred.
+- Decision: 2026-11-20 (incremental kernel/domain seam; physical crate split is a later stage).
 - Date: 2026-11-20
-- Basis: `docs/research/01..16`, `docs/roadmap/AGENTBUG_MASTER_PLAN.md`
+- Basis: `docs/research/01..16`, `docs/roadmap/BUGFOUND_MASTER_PLAN.md`
 
 ## Context
 
-AgentBug is intended as a reusable, LLM-agnostic Universal Agent Kernel with a
+BugFound is intended as a reusable, LLM-agnostic Universal Agent Kernel with a
 separate Bug Bounty Domain Engine layered on top (`README.md:3-5`,
 `docs/architecture.md:5-10`, research `12_architecture_comparison.md:45-54`).
-Today there is no seam: `agentbug-core` depends concretely on `agentbug-llm`,
-`agentbug-tools`, `agentbug-policy`, `agentbug-store` and contains bounty-only
-logic (`persist_bounty_tool_result`, WSTG `prioritize_targets`, scope-bound
-`goal_digest`, finding/asset stall guards, domain-injected system prompt).
-"Universal kernel" is currently a label, not an architecture.
+At the time of the decision there was no seam: `bugfound-core` depended
+concretely on `bugfound-llm`, `bugfound-tools`, `bugfound-policy`,
+`bugfound-store` and contained bounty-only logic (`persist_bounty_tool_result`,
+WSTG `prioritize_targets`, scope-bound `goal_digest`, finding/asset stall guards,
+domain-injected system prompt). "Universal kernel" was a label, not an
+architecture.
 
 ## Problem
 
@@ -23,21 +24,20 @@ enforce a boundary that does not exist.
 
 ## Alternatives considered
 
-1. Big-bang rewrite into `agentbug-kernel` + `agentbug-domain` crates —
-   rejected: violates "refactor boundaries, not behavior" and risks 217 green
-   tests.
+1. Big-bang rewrite into `bugfound-kernel` + `bugfound-domain` crates —
+   rejected: violates "refactor boundaries, not behavior".
 2. Feature-flag `domain` module inside core — rejected: leaves dependency
    inversion and CI enforcement unsolved.
-3. **Incremental seam via injected traits + domain Observer/Planner, then
-   physical crate split — accepted.**
+3. Incremental seam via injected traits + domain Observer/Planner, then a
+   physical crate split — selected.
 4. Do nothing and rename core "kernel" — rejected by master plan principle 3.
 
-## Recommendation
+## Decision
 
-Declare the target boundary now: **kernel** = session/step/runner/LLM/tool
+Declare the target boundary: **kernel** = session/step/runner/LLM/tool
 registry/permission abstractions; **domain** = ROE/scope/WSTG/findings/evidence/
 report/verifier. The kernel must not depend on the domain; the domain depends
-on kernel abstractions. New workspace crates are a subsequent phase (R2).
+on kernel abstractions. New workspace crates are a subsequent stage.
 
 ## Technical justification
 
@@ -47,21 +47,40 @@ on kernel abstractions. New workspace crates are a subsequent phase (R2).
 - `docs/research/11_current_gap_analysis.md:182-191` prescribes a four-step seam
   and a CI dependency check: core must not import domain types or mention
   `finding|scope|cvss|cwe|WSTG`.
-- `docs/research/12_architecture_comparison.md:30` verdict: "must refactor."
+- `docs/research/12_architecture_comparison.md:30` records a "must refactor"
+  finding.
 
 ## Trade-offs
 
 - Pro: reusable/testable kernel; domain changes stop rippling; CI-enforceable.
-- Con: Observer/Planner indirection in a currently simple runner; R2 regression
-  risk across 217 tests; temporary duplication during migration.
+- Con: Observer/Planner indirection in a simple runner; regression risk across
+  the migration; temporary duplication during the move.
 
-## Implementation consequences (R2, not R1)
+## Consequences — current code mechanism
+
+- `bugfound-kernel-traits` defines `GoalLock`, `PromptContributor`,
+  `ToolResultSink`, `ProgressObserver`, the `Domain` bundle trait and a
+  `KernelDomain` default adapter.
+- `Runner` holds `Arc<dyn Domain>` with a `with_domain(...)` builder;
+  `Runner::new` keeps its five-argument signature. Kernel call sites go through
+  the ports.
+- `bugfound-engagement::domain::BountyDomain` supplies scope-bound digest,
+  scope prompt, tool-result persistence and progress counting.
+- `prioritize_targets` lives in `bugfound-engagement`; CLI imports it there.
+- `persist_tool_result` and `domain_progress_count` live in `bugfound-store`,
+  which owns the domain tables; the kernel calls them through the default
+  adapter.
+- CI enforces the boundary: `bugfound-core/src` must not contain domain
+  vocabulary and `cargo tree -p bugfound-core` must not contain domain crates.
+- Verify the workspace checks with the commands in `docs/PRODUCTION_PLAN.md` §2.
+
+### Boundary changes this decision calls for
 
 - Replace `persist_bounty_tool_result` (core `lib.rs:377-549`, wrapper `:709-717`,
   call sites `:574,1561,1673,1958`) with a generic `ToolResultSink` supplied by
-  `agentbug-engagement`.
+  `bugfound-engagement`.
 - Move `prioritize_targets` (`:165-201`) to domain Planner; caller
-  `agentbug-cli/src/main.rs:979`.
+  `bugfound-cli/src/main.rs:979`.
 - Generalize `goal_digest` (`:70-76`) to a `GoalLock` trait; domain owns scope
   digest.
 - Move domain prompt injection (`:718-722,1248-1249,1298-1307`) to a domain
@@ -73,45 +92,26 @@ on kernel abstractions. New workspace crates are a subsequent phase (R2).
   (`policy/src/lib.rs:38-54,168-223,341-363`) to domain crates; split domain
   tables in `store/src/lib.rs:270-380`.
 - Invert dependency directions in `core/Cargo.toml:19-22` and
-  `tools/Cargo.toml:18`; add CI dependency check.
-
-## R2 implementation result (2026-11-20)
-
-- Added `agentbug-kernel-traits` with `GoalLock`, `PromptContributor`,
-  `ToolResultSink`, `ProgressObserver`, the `Domain` bundle trait, and a
-  `KernelDomain` default adapter.
-- `Runner` holds `Arc<dyn Domain>` with a `with_domain(...)` builder;
-  `Runner::new` keeps its five-argument signature. All kernel call sites now go
-  through the ports.
-- `agentbug-engagement::domain::BountyDomain` supplies scope-bound digest,
-  scope prompt, tool-result persistence and progress counting.
-- `prioritize_targets` moved to `agentbug-engagement`; CLI imports it there.
-- `persist_tool_result` and `domain_progress_count` moved to `agentbug-store`,
-  which already owns the domain tables; the kernel only calls them through the
-  default adapter.
-- CI enforces the boundary: `agentbug-core/src` must not contain domain
-  vocabulary and `cargo tree -p agentbug-core` must not contain domain crates.
-- All 217 tests green; `cargo clippy --workspace --all-targets -- -D warnings`
-  green.
+  `tools/Cargo.toml:18`; add a CI dependency check.
 
 ### Deliberate deviations (recorded, not hidden)
 
 - `extract_policy_target` and its aliases stay in core: they are neutral JSON
   key/shell token helpers with five hot kernel call sites and no domain types.
-- Domain tool implementations and WSTG/CWE knowledge stay in `agentbug-tools`
-  this phase; moving them would require promoting private helpers or creating a
-  tools -> engagement cycle. They are Stage 2.
+- Domain tool implementations and WSTG/CWE knowledge stay in `bugfound-tools`
+  this stage; moving them would require promoting private helpers or creating a
+  tools -> engagement cycle.
 - The store still owns domain tables and the one SQLite connection; the
-  table-level split is Stage 2. Moving them would change DDL and config serde
-  compatibility with no kernel-purity gain.
+  table-level split would change DDL and config serde compatibility with no
+  kernel-purity gain.
 - Scope policy types (`ScopeConfig`, `parse_scope_brief`) stay in
-  `agentbug-policy` for now; the widest fan-out (CLI/desktop/engagement) is
-  Stage 2.
+  `bugfound-policy` for now; the widest fan-out (CLI/desktop/engagement) is a
+  later stage.
 
 ## What would invalidate this decision
 
 - A requirement that the kernel natively understand findings/ROE.
-- Evidence that indirection costs more than reuse benefit (all deployments
+- Evidence that indirection costs more than its reuse benefit (all deployments
   bounty-only) — then downgrade "universal" to branding.
-- Failure of the R2 exit criterion: core still mentions domain types or the
-  dependency graph points kernel -> domain.
+- A failed boundary check: core still mentions domain types or the dependency
+  graph points kernel -> domain.

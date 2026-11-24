@@ -1,16 +1,21 @@
-﻿# OpenCode Source Analysis - Patterns for a Rust-Native Agent Kernel (AgentBug)
+# OpenCode Source Analysis - Patterns for a Rust-Native Agent Kernel (BugFound)
+
+> **About these notes.** These are point-in-time analyses of third-party reference
+> projects, kept for design input. They describe the reference projects at the
+> snapshots examined and are not claims about the current BugFound code; verify
+> current behavior in `crates/`.
 
 **Research basis:** ACTUAL source code, not documentation.
 **Reference:** `research/opencode` at commit `d643c875879feef6198d28307a5592a46c6fd56d`
 **Product under study:** OpenCode (`packages/core`, `packages/ai`, `packages/schema`), an Effect-TS ("effect-smol" / Effect v4) coding-agent harness.
-**Target:** `crates/agentbug-*` Rust-native agent kernel.
+**Target:** `crates/bugfound-*` Rust-native agent kernel.
 **Method:** Read-only source inspection. Patterns are extracted and translated into recommendations; no code is copied.
 
 ---
 
 ## 0. Scope, file inventory, and how to read this document
 
-All paths are absolute from the reference checkout root `D:\Github\Agent Bug Bounty\research\opencode`. Line numbers are 1-based and refer to the exact commit above.
+All paths are absolute from the reference checkout root `D:\Github\BugFound\research\opencode`. Line numbers are 1-based and refer to the exact commit above.
 
 Analyzed files (primary), with line counts:
 
@@ -46,7 +51,7 @@ Analyzed files (primary), with line counts:
 | `packages/schema/src/agent.ts`, `permission.ts`, `session.ts`, `tool.ts`, `session-id.ts` | - | Canonical schemas |
 | `packages/ai/src/llm.ts`, `provider-error.ts`, `effect.ts` | - | Provider abstraction, streaming, error classification |
 
-Each component below records: **source**, **main structures**, **execution path**, **dependencies**, **responsibilities**, **strengths**, **weaknesses**, and a concrete **adapt-to-AgentBug recommendation**.
+Each component below records: **source**, **main structures**, **execution path**, **dependencies**, **responsibilities**, **strengths**, **weaknesses**, and a concrete **adapt-to-BugFound recommendation**.
 
 ---
 
@@ -107,7 +112,7 @@ Weaknesses to avoid or compensate: extreme complexity (compaction alone is about
 - Transient `let` flags (`recoverOverflow`, `recoverContinuation`, `retryAttempt`) accumulate loop state; a bug in one branch can silently disable recovery.
 - Relies on Effect fibers/Deferred/FiberMap for coordination that must be re-engineered in Rust.
 
-**Adapt to AgentBug:** AgentBug's `run_loop` (`crates/agentbug-core/src/lib.rs:1750-1929`) already follows "one call per step, reload history" - keep that. Add: (a) an explicit `DrainResult`-style state machine so a Session can be handed between workers without losing the step counter; (b) a distinct **admission** phase (append to inbox durably) and **delivery** phase (promote at a boundary) with `steer`/`queue` semantics, instead of the current single `drain_inbox()` at the top of the loop (`lib.rs:628-650,1775`); (c) a boot-time "settle stale" sweep that publishes a terminal tool result for any unfinished tool call (mirrors `settleStaleToolCalls`, `llm.ts:419-442`).
+**Adapt to BugFound:** BugFound's `run_loop` (`crates/bugfound-core/src/lib.rs:1750-1929`) already follows "one call per step, reload history" - keep that. Add: (a) an explicit `DrainResult`-style state machine so a Session can be handed between workers without losing the step counter; (b) a distinct **admission** phase (append to inbox durably) and **delivery** phase (promote at a boundary) with `steer`/`queue` semantics, instead of the current single `drain_inbox()` at the top of the loop (`lib.rs:628-650,1775`); (c) a boot-time "settle stale" sweep that publishes a terminal tool result for any unfinished tool call (mirrors `settleStaleToolCalls`, `llm.ts:419-442`).
 
 ### 2.2 The Step - one model call, tool execution, cancellation, outcomes
 
@@ -140,7 +145,7 @@ Weaknesses to avoid or compensate: extreme complexity (compaction alone is about
 - `classifyToolExits` treats user declines as typed failures but other tool failures as defects - a subtle distinction documented in comments (`:344-345`).
 - Error taxonomy is provider-specific in places (e.g. "rotate-and-retry-full" is a proxy concept).
 
-**Adapt to AgentBug:** In Rust, model this as a `StepOutcome` enum returned by a `run_step()` async fn, with a `CancellationToken` passed to tools and a two-phase stop: signal -> bounded `tokio::time::timeout` wait -> abort. Persist a distinct terminal record for every tool call (including `missing_result` and `interrupted`). Keep the cooperative-then-forced stop; AgentBug's current `check_stop` only checks at step boundaries (`lib.rs:816-828`), which lets a long-running tool ignore a stop until it ends.
+**Adapt to BugFound:** In Rust, model this as a `StepOutcome` enum returned by a `run_step()` async fn, with a `CancellationToken` passed to tools and a two-phase stop: signal -> bounded `tokio::time::timeout` wait -> abort. Persist a distinct terminal record for every tool call (including `missing_result` and `interrupted`). Keep the cooperative-then-forced stop; BugFound's current `check_stop` only checks at step boundaries (`lib.rs:816-828`), which lets a long-running tool ignore a stop until it ends.
 
 ### 2.3 Request assembly and hooks
 
@@ -158,7 +163,7 @@ Weaknesses to avoid or compensate: extreme complexity (compaction alone is about
 
 **Weaknesses:** deep-copying tool schemas per request for hook isolation is expensive; the hook contract is large and untyped at the edge.
 
-**Adapt to AgentBug:** Centralize request assembly in `agentbug-llm` as a pure `build_request(session, agent, history, tools, budget) -> LlmRequest` function; keep a single `RequestContext` with typed extension points instead of mutable hook events. Adopt the explicit per-request output token budget formula (`outputLimit`) - AgentBug currently uses a coarse `max_estimated_tokens` total-session cap (`lib.rs:1819-1836`) with no per-call fitting to the model window.
+**Adapt to BugFound:** Centralize request assembly in `bugfound-llm` as a pure `build_request(session, agent, history, tools, budget) -> LlmRequest` function; keep a single `RequestContext` with typed extension points instead of mutable hook events. Adopt the explicit per-request output token budget formula (`outputLimit`) - BugFound currently uses a coarse `max_estimated_tokens` total-session cap (`lib.rs:1819-1836`) with no per-call fitting to the model window.
 
 ### 2.4 Retry and provider error classification
 
@@ -171,7 +176,7 @@ Weaknesses to avoid or compensate: extreme complexity (compaction alone is about
 
 **Weaknesses:** regex-heavy and provider-specific; a constant maintenance burden.
 
-**Adapt to AgentBug:** AgentBug has `error::AgentError::classify` (`lib.rs:1856`) and a cooldown on 429/403 (`:1050-1105`). Formalize a Rust `LlmErrorKind { ContextOverflow, PayloadTooLarge, RateLimited, Auth, ContentPolicy, Server, Transport, Unknown }` enum in `agentbug-llm`, and bind behavior explicitly: ContextOverflow -> compaction, RateLimited/Server/Unknown -> retry with backoff, Auth/ContentPolicy -> terminal. Carry a typed `retryable` and `recovery_hint` so the runner never re-derives intent from strings.
+**Adapt to BugFound:** BugFound has `error::AgentError::classify` (`lib.rs:1856`) and a cooldown on 429/403 (`:1050-1105`). Formalize a Rust `LlmErrorKind { ContextOverflow, PayloadTooLarge, RateLimited, Auth, ContentPolicy, Server, Transport, Unknown }` enum in `bugfound-llm`, and bind behavior explicitly: ContextOverflow -> compaction, RateLimited/Server/Unknown -> retry with backoff, Auth/ContentPolicy -> terminal. Carry a typed `retryable` and `recovery_hint` so the runner does not re-derive intent from strings.
 
 ---
 
@@ -198,7 +203,7 @@ Other notable operations: `compact` admits a compaction control item and wakes (
 
 **Weaknesses:** the facade is large; `forSession` rebinds every operation by hand (`:343-398`); "view"/"rename" semantics rely on projector details not visible here.
 
-**Adapt to AgentBug:** Keep a single `Session` service with a `for_session(id)` handle, but generate the bound handle via a trait/macro or a small struct with methods taking `&self` rather than listing 20 closures. Pin down idempotency rules now: AgentBug should use `(session_id, item_id, type)` as the idempotency key for prompt admission, and expose `resume:false` admit-only as an explicit API for background/subagent work.
+**Adapt to BugFound:** Keep a single `Session` service with a `for_session(id)` handle, but generate the bound handle via a trait/macro or a small struct with methods taking `&self` rather than listing 20 closures. Pin down idempotency rules now: BugFound should use `(session_id, item_id, type)` as the idempotency key for prompt admission, and expose `resume:false` admit-only as an explicit API for background/subagent work.
 
 ### 3.2 Durable inbox - admission and delivery modes
 
@@ -220,7 +225,7 @@ Other notable operations: `compact` admits a compaction control item and wakes (
 
 **Weaknesses:** the promotion rules are spread across `inbox.ts`, `llm.ts`, and AGENTS.md; implementing them correctly requires understanding all three.
 
-**Adapt to AgentBug:** Add `delivery` to AgentBug's inbox items (`crates/agentbug-core/src/inbox.rs`, currently 260 lines) with `steer`/`queue`/`control` kinds. At each Step boundary, promote all steers in order, then at most one queue item only when idle; allow cancel/steer mutation while pending. This is a concrete upgrade over the current "drain everything at the top of the loop" behavior (`lib.rs:628-650`).
+**Adapt to BugFound:** Add `delivery` to BugFound's inbox items (`crates/bugfound-core/src/inbox.rs`, currently 260 lines) with `steer`/`queue`/`control` kinds. At each Step boundary, promote all steers in order, then at most one queue item only when idle; allow cancel/steer mutation while pending. This is a concrete upgrade over the current "drain everything at the top of the loop" behavior (`lib.rs:628-650`).
 
 ### 3.3 Process-local execution and the run coordinator
 
@@ -246,7 +251,7 @@ Other notable operations: `compact` admits a compaction control item and wakes (
 
 **Weaknesses:** `holder`-based late binding between the report coordinator and run coordinator is subtle (`:88-102`); `awaitIdle` re-checks after each Deferred to catch late doorbells (`:170-175`) - a Rust port must preserve that detail.
 
-**Adapt to AgentBug:** AgentBug already has `ExecutionCoordinator` (`crates/agentbug-core/src/execution.rs`, 243 lines) with leases, cancel, and stop-ack. Upgrade it with: (a) a **coalescing doorbell** (`pending_wake: Option<Scope>`) so a wake arriving during a drain triggers another drain rather than being lost; (b) `await_idle` that re-checks after each join; (c) an explicit `draining` set distinct from `active` (settlement window); (d) keep the write-ahead claim semantics - AgentBug's `claim_session`/`release_claim` already mirror this well (`lib.rs:688-707,1215-1233`).
+**Adapt to BugFound:** BugFound already has `ExecutionCoordinator` (`crates/bugfound-core/src/execution.rs`, 243 lines) with leases, cancel, and stop-ack. Upgrade it with: (a) a **coalescing doorbell** (`pending_wake: Option<Scope>`) so a wake arriving during a drain triggers another drain rather than being lost; (b) `await_idle` that re-checks after each join; (c) an explicit `draining` set distinct from `active` (settlement window); (d) keep the write-ahead claim semantics - BugFound's `claim_session`/`release_claim` already mirror this well (`lib.rs:688-707,1215-1233`).
 
 ### 3.4 Persistence, history boundaries, and crash recovery
 
@@ -262,7 +267,7 @@ Other notable operations: `compact` admits a compaction control item and wakes (
 
 **Weaknesses:** the event-sourced read model (`projector.ts`) is large; correctness depends on the projector being deterministic and idempotent. `resumeSuspendedSessions` assumes the previous owner is dead - guaranteed only by the managed-server protocol (`:72-79`).
 
-**Adapt to AgentBug:** AgentBug has `recover_stale_sessions()` (`lib.rs:670-686`) using `mark_stale_running_interrupted`. Add a durable **resume-attempt counter** per session with a bound (OpenCode's 10) so repeated crashes cannot loop forever, and a synthetic "continue after restart" message. Keep an explicit `Boundary`-like parameter when reading history after compaction, so native/provider checkpoints are only replayed on the model that produced them.
+**Adapt to BugFound:** BugFound has `recover_stale_sessions()` (`lib.rs:670-686`) using `mark_stale_running_interrupted`. Add a durable **resume-attempt counter** per session with a bound (OpenCode's 10) so repeated crashes cannot loop forever, and a synthetic "continue after restart" message. Keep an explicit `Boundary`-like parameter when reading history after compaction, so native/provider checkpoints are only replayed on the model that produced them.
 
 ### 3.5 Event bus and observability
 
@@ -278,7 +283,7 @@ Other notable operations: `compact` admits a compaction control item and wakes (
 
 **Weaknesses:** volatile subscribe means a reconnecting client must replay the log; projection idempotency is a distributed-correctness burden.
 
-**Adapt to AgentBug:** AgentBug has `EventBus::global().publish_json` plus durable `store.add_event` (`lib.rs:611-623`) - the right shape. Add: monotonic per-session event sequence numbers, typed event names (instead of free-form strings), and OpenTelemetry `tracing` spans with `gen_ai.*` fields so model time, tool time, and cost are separately measurable.
+**Adapt to BugFound:** BugFound has `EventBus::global().publish_json` plus durable `store.add_event` (`lib.rs:611-623`) - the right shape. Add: monotonic per-session event sequence numbers, typed event names (instead of free-form strings), and OpenTelemetry `tracing` spans with `gen_ai.*` fields so model time, tool time, and cost are separately measurable.
 
 ---
 
@@ -297,7 +302,7 @@ Other notable operations: `compact` admits a compaction control item and wakes (
 
 **Weaknesses:** `select` touches many services; a slow MCP/instruction source delays every step (mitigated only by unbounded concurrency).
 
-**Adapt to AgentBug:** Introduce a `ContextBuilder` that produces an immutable `AgentContext {system_parts, history, tool_snapshot, resolved_model, permissions}` in two stages (`select` = cheap capability resolution; `load` = history + model). Preserve the "instructions ordered from most-shared to least-shared" rule - AgentBug's system prompt is currently assembled ad hoc in `run_goal` (`lib.rs:1298-1318`), with no cache-prefix discipline.
+**Adapt to BugFound:** Introduce a `ContextBuilder` that produces an immutable `AgentContext {system_parts, history, tool_snapshot, resolved_model, permissions}` in two stages (`select` = cheap capability resolution; `load` = history + model). Preserve the "instructions ordered from most-shared to least-shared" rule - BugFound's system prompt is currently assembled ad hoc in `run_goal` (`lib.rs:1298-1318`), with no cache-prefix discipline.
 
 ### 4.2 System prompt composition
 
@@ -311,7 +316,7 @@ Other notable operations: `compact` admits a compaction control item and wakes (
 
 **Weaknesses:** string templating with a single `OPENCODE_TOOL_GUIDANCE` placeholder is brittle as guidance grows.
 
-**Adapt to AgentBug:** Generate a structured system prompt from typed sections (identity, harness rules, tool-specific guidance derived from the *filtered* tool list, engagement scope) and hash/cache it per tool-set. AgentBug currently appends the engagement scope to a hardcoded string (`lib.rs:1298-1304`).
+**Adapt to BugFound:** Generate a structured system prompt from typed sections (identity, harness rules, tool-specific guidance derived from the *filtered* tool list, engagement scope) and hash/cache it per tool-set. BugFound currently appends the engagement scope to a hardcoded string (`lib.rs:1298-1304`).
 
 ### 4.3 History to LLM messages
 
@@ -326,7 +331,7 @@ Other notable operations: `compact` admits a compaction control item and wakes (
 
 **Weaknesses:** complex heuristics with many message-type branches; attachments and media must be consistent with the separate media-budget pass in `model-request.ts`.
 
-**Adapt to AgentBug:** Isolate a pure `history_to_messages(history, target_model) -> Vec<ChatMessage>` function in `agentbug-llm` and test it heavily: (a) truncate after the last completed tool on a failed step, (b) drop calls that never ran, (c) mark which provider metadata is model-scoped. AgentBug's `build_llm_messages` (referenced `lib.rs:1798`) should gain these rules before adding multi-provider/subagent support.
+**Adapt to BugFound:** Isolate a pure `history_to_messages(history, target_model) -> Vec<ChatMessage>` function in `bugfound-llm` and test it heavily: (a) truncate after the last completed tool on a failed step, (b) drop calls that never ran, (c) mark which provider metadata is model-scoped. BugFound's `build_llm_messages` (referenced `lib.rs:1798`) should gain these rules before adding multi-provider/subagent support.
 
 ### 4.4 Compaction, token budgeting, and background summarization
 
@@ -353,7 +358,7 @@ Other notable operations: `compact` admits a compaction control item and wakes (
 
 **Weaknesses:** very high complexity and many magic numbers; depends on provider-specific overflow phrasing and cache TTL; the "kept tail by reference" reconstruction couples compaction and history tightly.
 
-**Adapt to AgentBug:** Adopt the *shape* in stages: (1) a deterministic `ContextBudget {ceiling, reserve, keep, estimate}` with `float | measured` token accounting (AgentBug currently estimates tokens as `len/4` with a total-session cap, `lib.rs:144-146,1819-1836`); (2) a structured summary template and a `compaction` LLM flow; (3) store a summary message plus a `keepID` reference and rebuild the tail from the event log; (4) only then add background precompute. Do NOT copy the overflow regex soup - keep the typed `LlmErrorKind` from section 2.4.
+**Adapt to BugFound:** Adopt the *shape* in stages: (1) a deterministic `ContextBudget {ceiling, reserve, keep, estimate}` with `float | measured` token accounting (BugFound currently estimates tokens as `len/4` with a total-session cap, `lib.rs:144-146,1819-1836`); (2) a structured summary template and a `compaction` LLM flow; (3) store a summary message plus a `keepID` reference and rebuild the tail from the event log; (4) only then add background precompute. Do NOT copy the overflow regex soup - keep the typed `LlmErrorKind` from section 2.4.
 
 ---
 
@@ -380,7 +385,7 @@ Other notable operations: `compact` admits a compaction control item and wakes (
 
 **Weaknesses:** Code Mode (tools invoked as generated TypeScript programs) adds substantial complexity; definition caching has a five-entry LRU with identity invalidation (`:480`, `:312-315`).
 
-**Adapt to AgentBug:** AgentBug's `ToolRegistry` (`agentbug-tools`) should expose `snapshot(permissions, model) -> ToolSnapshot` that returns both the JSON schemas sent to the LLM and a `dispatch(call, ctx)` closure bound to that snapshot, so a tool removed mid-run cannot be executed by an old request. Keep validation at registration and execution boundaries but make it a single typed `ToolSpec` with `input_schema: serde_json::Value` plus a Rust-side decoder.
+**Adapt to BugFound:** BugFound's `ToolRegistry` (`bugfound-tools`) should expose `snapshot(permissions, model) -> ToolSnapshot` that returns both the JSON schemas sent to the LLM and a `dispatch(call, ctx)` closure bound to that snapshot, so a tool removed mid-run cannot be executed by an old request. Keep validation at registration and execution boundaries but make it a single typed `ToolSpec` with `input_schema: serde_json::Value` plus a Rust-side decoder.
 
 ### 5.2 Validation and result serialization boundary
 
@@ -396,13 +401,13 @@ Other notable operations: `compact` admits a compaction control item and wakes (
 
 **Weaknesses:** supports a wide schema zoo (Effect Schema, Standard Schema, raw JSON Schema); the normalization code is intricate.
 
-**Adapt to AgentBug:** Keep a strict boundary in `agentbug-tools`: `execute()` should return `Result<ToolOutput, ToolError>` for *all* failures (never panic/poison the step), with validation errors rendered into the tool result text so the model can self-correct. Normalize JSON Schema once at registration and freeze it (do not regenerate per request) to keep request bytes stable.
+**Adapt to BugFound:** Keep a strict boundary in `bugfound-tools`: `execute()` should return `Result<ToolOutput, ToolError>` for *all* failures (do not panic/poison the step), with validation errors rendered into the tool result text so the model can self-correct. Normalize JSON Schema once at registration and freeze it (do not regenerate per request) to keep request bytes stable.
 
 ### 5.3 Permissions inside tool calls
 
 Tool execution consults `Permission.Service` via `executeTool`: file paths, shell commands, and `subagent` are all permission actions. The `Permission.invocation(context)` helper (`permission.ts:39-44`) stamps the tool call's `messageID` and call `id` as the request source. A decline is tunneled as a **defect** so a tool cannot catch it and return model-visible output; it is recovered only at `SessionModelRequest.executeTool` (`model-request.ts:441-459`). A decline *with feedback* becomes a typed `CorrectedError` that the leaf turns into a tool failure so the model can continue (`permission.ts:69-75,300-312`).
 
-**Adapt to AgentBug:** Mirror this: a hard denial must not be convertible into a tool result that the model can argue with; it should abort the step. A "corrected/try-again-with-feedback" reply should be delivered as a tool result. AgentBug's guarded calls already write `DENIED ...` into the tool message (`lib.rs:971-1006`) - consider separating hard-deny (terminal) from feedback (continuable) to avoid leaking authority to the model.
+**Adapt to BugFound:** Mirror this: a hard denial must not be convertible into a tool result that the model can argue with; it should abort the step. A "corrected/try-again-with-feedback" reply should be delivered as a tool result. BugFound's guarded calls already write `DENIED ...` into the tool message (`lib.rs:971-1006`) - consider separating hard-deny (terminal) from feedback (continuable) to avoid leaking authority to the model.
 
 ---
 
@@ -426,7 +431,7 @@ Tool execution consults `Permission.Service` via `executeTool`: file paths, shel
 
 **Weaknesses:** the built-ins are defined in a plugin via mutation callbacks, so the effective definition is spread across schema defaults, the plugin, and user config.
 
-**Adapt to AgentBug:** Define agents as declarative config (`AgentSpec {id, mode, system_prompt?, model?, tool_allow/deny, max_steps, permissions}`) in `agentbug-core` or config, with built-ins shipped as data files. AgentBug's `AgentConfig` (`lib.rs:306-375`) already carries `mode`, `system_prompt`, `max_steps`, and budgets; extend it with `tool_permissions` and `model` reference, and add `hidden`/`subagent` modes. Keep the default "deny `.env`" style baseline.
+**Adapt to BugFound:** Define agents as declarative config (`AgentSpec {id, mode, system_prompt?, model?, tool_allow/deny, max_steps, permissions}`) in `bugfound-core` or config, with built-ins shipped as data files. BugFound's `AgentConfig` (`lib.rs:306-375`) already carries `mode`, `system_prompt`, `max_steps`, and budgets; extend it with `tool_permissions` and `model` reference, and add `hidden`/`subagent` modes. Keep the default "deny `.env`" style baseline.
 
 ### 6.2 Subagent delegation tool and lifecycle
 
@@ -447,7 +452,7 @@ Tool execution consults `Permission.Service` via `executeTool`: file paths, shel
 
 **Weaknesses:** everything is background - no synchronous handoff mode; depth default of 1 limits useful hierarchies; the `<subagent>` message format is a textual protocol.
 
-**Adapt to AgentBug:** AgentBug has no subagents yet. Implement them as child sessions in `agentbug-store` with `parent_id`, reusing the existing `ExecutionCoordinator` and inbox. Port: (a) depth cap (config, default 1), (b) `agent.mode` gate (cannot spawn a primary as subagent), (c) a `subagent` permission action, (d) explicit model precedence override > agent > parent, (e) a completion synthetic message with a typed metadata envelope (not just text). Reuse `request_stop`/leases for cancellation.
+**Adapt to BugFound:** BugFound has no subagents yet. Implement them as child sessions in `bugfound-store` with `parent_id`, reusing the existing `ExecutionCoordinator` and inbox. Port: (a) depth cap (config, default 1), (b) `agent.mode` gate (cannot spawn a primary as subagent), (c) a `subagent` permission action, (d) explicit model precedence override > agent > parent, (e) a completion synthetic message with a typed metadata envelope (not just text). Reuse `request_stop`/leases for cancellation.
 
 ---
 
@@ -471,13 +476,13 @@ Tool execution consults `Permission.Service` via `executeTool`: file paths, shel
 
 **Weaknesses:** the "defect tunnel" for declines (`:300-312`) is a subtle control-flow trick that must be carefully reproduced; `evaluate` is O(n) linear scan per resource; `ignoresCase` is platform-specific.
 
-**Adapt to AgentBug:** AgentBug has `agentbug-policy` (`PolicyEngine`, `Decision::{Allow,Deny,Ask}`, `Mode`, scopes/approvals) and already does careful approval parking (`lib.rs:885-969`). Port these specific patterns: (1) **last-match-wins wildcard rules** merged agent-then-session; (2) **batch rejection/feedback** across all tool calls in one assistant message; (3) **"always" saves a durable allow rule** (AgentBug has `Approval`/`list_approved_targets` but no generic rule save); (4) an explicit **unattended** policy for scheduled/background work; (5) keep the hard-decline-vs-feedback distinction (section 5.3).
+**Adapt to BugFound:** BugFound has `bugfound-policy` (`PolicyEngine`, `Decision::{Allow,Deny,Ask}`, `Mode`, scopes/approvals) and already does careful approval parking (`lib.rs:885-969`). Port these specific patterns: (1) **last-match-wins wildcard rules** merged agent-then-session; (2) **batch rejection/feedback** across all tool calls in one assistant message; (3) **"always" saves a durable allow rule** (BugFound has `Approval`/`list_approved_targets` but no generic rule save); (4) an explicit **unattended** policy for scheduled/background work; (5) keep the hard-decline-vs-feedback distinction (section 5.3).
 
 ### 7.1 Scope boundaries in practice
 
 Agent permissions are the real tool boundary: `explore` is deny-all-plus-explicit-allows (read-only + web), `title`/`summary` are deny-all, `general` denies question and nested subagents. Permission actions observed in source include: `read`, `edit`, `write`, `shell`, `grep`, `glob`, `webfetch`, `websearch`, `external_directory`, `question`, `subagent`, `execute` (Code Mode), plus tool names. File actions are path-resource rules; shell is a tool action; Code Mode can be wholly disabled via a `deny *` on `execute` (`tool.ts:472-478`).
 
-**Adapt to AgentBug:** Extend `agentbug-policy::ActionRequest` to carry `{tool, risk, target, session, agent}` and evaluate wildcard rules over `action:resource`, so the same engine governs tool access, file paths, shell, network targets, and delegation. This unifies AgentBug's current separate `policy.evaluate` + `budget_gate` + `auto_approve_tools` paths (`lib.rs:910-968`).
+**Adapt to BugFound:** Extend `bugfound-policy::ActionRequest` to carry `{tool, risk, target, session, agent}` and evaluate wildcard rules over `action:resource`, so the same engine governs tool access, file paths, shell, network targets, and delegation. This unifies BugFound's current separate `policy.evaluate` + `budget_gate` + `auto_approve_tools` paths (`lib.rs:910-968`).
 
 ---
 
@@ -496,7 +501,7 @@ Agent permissions are the real tool boundary: `explore` is deny-all-plus-explici
 
 **Weaknesses:** very large provider surface; lazy imports and async catalog population add startup complexity.
 
-**Adapt to AgentBug:** Define a Rust `Llm` trait (already exists: `agentbug-llm::Llm`, used at `lib.rs:579`) with `stream_chat(&Request) -> Stream<ChatEvent>` as the primitive, plus `resolve_model() -> ModelInfo{limits, cost, capabilities, compaction}`. Keep an OpenAI-compatible adapter first; add variants/capabilities to `ModelInfo` so compaction and transport decisions are data-driven. Avoid an in-memory `loop` in the kernel - AgentBug's single-call-per-step already matches OpenCode's production path.
+**Adapt to BugFound:** Define a Rust `Llm` trait (already exists: `bugfound-llm::Llm`, used at `lib.rs:579`) with `stream_chat(&Request) -> Stream<ChatEvent>` as the primitive, plus `resolve_model() -> ModelInfo{limits, cost, capabilities, compaction}`. Keep an OpenAI-compatible adapter first; add variants/capabilities to `ModelInfo` so compaction and transport decisions are data-driven. Avoid an in-memory `loop` in the kernel - BugFound's single-call-per-step already matches OpenCode's production path.
 
 ### 8.2 Configuration, plugins, and hot reload
 
@@ -510,7 +515,7 @@ Agent permissions are the real tool boundary: `explore` is deny-all-plus-explici
 
 **Weaknesses:** the hook surface is enormous and loosely typed; `awaitActivation` points must be remembered at every boundary.
 
-**Adapt to AgentBug:** Keep the extension surface small initially: a `ToolRegistry` trait object and a `Policy` trait object, with typed extension hooks only where needed (before/after tool, classify-error). If hot reload is required, snapshot the config into an `Arc<Config>` per Step (like OpenCode's tool snapshot) rather than mutating shared state mid-Step.
+**Adapt to BugFound:** Keep the extension surface small initially: a `ToolRegistry` trait object and a `Policy` trait object, with typed extension hooks only where needed (before/after tool, classify-error). If hot reload is required, snapshot the config into an `Arc<Config>` per Step (like OpenCode's tool snapshot) rather than mutating shared state mid-Step.
 
 ### 8.3 Observability and recovery summary
 
@@ -518,25 +523,25 @@ Agent permissions are the real tool boundary: `explore` is deny-all-plus-explici
 - Durable events: every meaningful transition has an event (`SessionEvent.*`, `Permission.Event.*`, `Agent.Event.*`), persisted with sequence numbers and optionally an atomic local projection (`bus.ts`).
 - Recovery: stale compaction/tool settlement (`llm.ts:389-442`), write-ahead claims + bounded resume (`restart.ts`), native/textual compaction replay boundaries (`history.ts`).
 
-**Adapt to AgentBug:** AgentBug already persists events and uses `tracing`; add per-session sequence numbers, gen_ai span attributes, and the boot-time stale-settlement pass. These are high-value, low-risk wins.
+**Adapt to BugFound:** BugFound already persists events and uses `tracing`; add per-session sequence numbers, gen_ai span attributes, and the boot-time stale-settlement pass. These are high-value, low-risk wins.
 
 ---
 
-## 9. Cross-cutting assessment and prioritized adapt-to-AgentBug roadmap
+## 9. Cross-cutting assessment and prioritized adapt-to-BugFound roadmap
 
-### 9.1 What AgentBug already does that matches OpenCode (keep these)
+### 9.1 What BugFound already does that matches OpenCode (keep these)
 
 - Single LLM call per step with history reloaded from the store (`lib.rs:1750-1798`).
 - Durable event log plus an in-process event bus (`lib.rs:611-623`).
 - Execution claims/leases, cross-process stop flag, stale-session recovery (`lib.rs:688-707,805-828,670-686`).
 - A unified policy/guard chain with approval parking, budget gates, duplicate-call guard, target cooldowns, and injection detection (`lib.rs:885-969`).
-- Compaction scaffolding (`crates/agentbug-core/src/compaction.rs`, 225 lines) and inbox/execution/step modules already split out.
+- Compaction scaffolding (`crates/bugfound-core/src/compaction.rs`, 225 lines) and inbox/execution/step modules already split out.
 
 ### 9.2 Highest-value patterns to adopt (ordered)
 
-| Priority | Pattern | Evidence | AgentBug action |
+| Priority | Pattern | Evidence | BugFound action |
 | --- | --- | --- | --- |
-| P0 | Typed LLM error taxonomy with recovery hints | `provider-error.ts:198-260`, `step.ts:198-259` | `LlmErrorKind` enum in `agentbug-llm`; bind ContextOverflow to compaction, RateLimit/Server/Unknown to backoff, Auth/Policy to terminal. |
+| P0 | Typed LLM error taxonomy with recovery hints | `provider-error.ts:198-260`, `step.ts:198-259` | `LlmErrorKind` enum in `bugfound-llm`; bind ContextOverflow to compaction, RateLimit/Server/Unknown to backoff, Auth/Policy to terminal. |
 | P0 | Cooperative tool cancellation with bounded grace | `step.ts:106-117,372-401` | `CancellationToken` + `timeout(5s)` then abort; persist a terminal record for every tool call. |
 | P0 | Admission vs delivery with steer/queue/control | `inbox.ts:52-57,176-282`, `llm.ts:71-76` | Add `delivery` to `inbox.rs`; promote steers first, one queue item only at idle; allow cancel/steer while pending. |
 | P1 | Doorbell/coalescing execution coordinator | `run-coordinator.ts:73-144,170-175` | Add `pending_wake` to `ExecutionCoordinator`; re-drain on late wake; re-check in `await_idle`. |
@@ -551,14 +556,14 @@ Agent permissions are the real tool boundary: `explore` is deny-all-plus-explici
 
 ### 9.3 Design cautions when translating Effect patterns to Rust
 
-- Effect **fibers + Deferred + uninterruptibleMask** have no direct std equivalent. Use `tokio::task::JoinHandle`/`AbortHandle`, `tokio::sync::Oneshot`/`Notify`, and explicit state machines; do not try to replicate mask semantics implicitly - make terminal settlement an explicit async step that always runs.
+- Effect **fibers + Deferred + uninterruptibleMask** have no direct std equivalent. Use `tokio::task::JoinHandle`/`AbortHandle`, `tokio::sync::Oneshot`/`Notify`, and explicit state machines; do not try to replicate mask semantics implicitly - make terminal settlement an explicit async step that runs deterministically.
 - The "defect tunnel" for permission declines (`permission.ts:300-312`, `model-request.ts:441-459`) relies on Effect's error channel. In Rust, encode this as a dedicated enum variant that `?` cannot accidentally convert into a tool result.
-- Event-sourced projections require idempotent, deterministic reducers. If AgentBug keeps direct `store.add_message` writes, document that it is a hybrid (durable log for audit + direct read-model writes) and ensure every write path emits the corresponding event.
+- Event-sourced projections require idempotent, deterministic reducers. If BugFound keeps direct `store.add_message` writes, document that it is a hybrid (durable log for audit + direct read-model writes) and ensure every write path emits the corresponding event.
 - Do not copy the compaction heuristics verbatim; implement the *invariants* (reserve headroom, newest exchange never omitted, prompt-cache prefix stability, typed overflow classification).
 
 ### 9.4 One-paragraph takeaway
 
-OpenCode's kernel is strongest where it is explicit about boundaries: Step = one model call from reloaded history; admission is not delivery; a per-session doorbell owns execution; permissions are ordered rules with a safe ask default; tool execution is a typed, validated boundary; and context compaction is a cache-aware, budgeted, crash-recoverable subsystem. AgentBug already has the skeleton (per-step loop, store, claims, policy, compaction module). The most valuable next moves are not more features but **more explicit state machines and typed boundaries** around cancellation, inbox delivery, error classification, and permission replies - then subagents and background summarization can be layered on the same durable primitives.
+OpenCode's kernel is strongest where it is explicit about boundaries: Step = one model call from reloaded history; admission is not delivery; a per-session doorbell owns execution; permissions are ordered rules with a safe ask default; tool execution is a typed, validated boundary; and context compaction is a cache-aware, budgeted, crash-recoverable subsystem. BugFound already has the skeleton (per-step loop, store, claims, policy, compaction module). The most valuable next moves are not more features but **more explicit state machines and typed boundaries** around cancellation, inbox delivery, error classification, and permission replies - then subagents and background summarization can be layered on the same durable primitives.
 
 ---
 

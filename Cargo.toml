@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/agentbug-core",
-  "crates/agentbug-kernel-traits",
-  "crates/agentbug-llm",
-  "crates/agentbug-tools",
-  "crates/agentbug-policy",
-  "crates/agentbug-store",
-  "crates/agentbug-cli",
-  "crates/agentbug-desktop",
-  "crates/agentbug-engagement",
-  "crates/agentbug-proxy",
-  "crates/agentbug-collaborator",
+  "crates/bugfound-core",
+  "crates/bugfound-kernel-traits",
+  "crates/bugfound-llm",
+  "crates/bugfound-tools",
+  "crates/bugfound-policy",
+  "crates/bugfound-store",
+  "crates/bugfound-cli",
+  "crates/bugfound-desktop",
+  "crates/bugfound-engagement",
+  "crates/bugfound-proxy",
+  "crates/bugfound-collaborator",
 ]
 
 [workspace.package]

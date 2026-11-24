@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AgentBug benchmark driver. DRY RUN BY DEFAULT.
+# BugFound benchmark driver. DRY RUN BY DEFAULT.
 # Preview commands with no flags; actually execute with --execute.
 set -euo pipefail
 
@@ -9,7 +9,7 @@ if [[ ! -f "$TARGETS_FILE" ]]; then
   TARGETS_FILE="$SCRIPT_DIR/targets.example.yml"
 fi
 RESULTS_DIR="$SCRIPT_DIR/results"
-AGENTBUG="${AGENTBUG:-agentbug}"
+BUGFOUND="${BUGFOUND:-bugfound}"
 EXECUTE=0
 ALLOW_REMOTE=0
 
@@ -21,7 +21,7 @@ Options:
   --execute          Actually run the engagements (default: dry run only).
   --targets FILE     Target inventory YAML (default: eval/targets.yml, then example).
   --results DIR      Output directory (default: eval/results).
-  --agentbug BIN      AgentBug binary (default: agentbug from PATH).
+  --bugfound BIN      BugFound binary (default: bugfound from PATH).
   --allow-remote     Permit non-loopback/non-private URLs (unsafe; benchmark use only).
   -h, --help         Show this help.
 
@@ -36,7 +36,7 @@ while [[ $# -gt 0 ]]; do
     --allow-remote) ALLOW_REMOTE=1; shift ;;
     --targets) TARGETS_FILE="${2:?--targets needs a file}"; shift 2 ;;
     --results) RESULTS_DIR="${2:?--results needs a directory}"; shift 2 ;;
-    --agentbug) AGENTBUG="${2:?--agentbug needs a binary}"; shift 2 ;;
+    --bugfound) BUGFOUND="${2:?--bugfound needs a binary}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -111,7 +111,7 @@ for row in "${ROWS[@]}"; do
     continue
   fi
 
-  cmd=("$AGENTBUG" engage --url "$url" --cwd "$cwd")
+  cmd=("$BUGFOUND" engage --url "$url" --cwd "$cwd")
   echo "[$id] ${cmd[*]}"
   echo "        report -> $report   log -> $log"
 

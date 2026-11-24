@@ -1,16 +1,21 @@
 # 09 — PortSwigger Academy mirror → internal evaluation lab & golden dataset
 
-**Status:** research/design note only. **No benchmark result is asserted in this document.** The mirror is a community write-up collection — neither licensed target content nor a testbed. Nothing from it is copied into AgentBug code; all schemas and harness changes below are proposed designs.
+> **About these notes.** These are point-in-time analyses of third-party reference
+> projects, kept for design input. They describe the reference projects at the
+> snapshots examined and are not claims about the current BugFound code; verify
+> current behavior in `crates/`.
+
+**Status:** research/design note only. The mirror is a community write-up collection — neither licensed target content nor a testbed. Nothing from it is copied into BugFound code; all schemas and harness changes below are proposed designs.
 
 ## 0. Provenance and limits of the source
 
-- Mirror root: `D:\Github\Agent Bug Bounty\research\portswigger-academy`
-- Upstream: `https://github.com/frank-leitner/portswigger-websecurity-academy` — explicitly a **community write-up mirror, not official PortSwigger content** (`D:\Github\Agent Bug Bounty\research\README.md:39`).
+- Mirror root: `D:\Github\BugFound\research\portswigger-academy`
+- Upstream: `https://github.com/frank-leitner/portswigger-websecurity-academy` — explicitly a **community write-up mirror, not official PortSwigger content** (`D:\Github\BugFound\research\README.md:39`).
 - Verified HEAD via read-only `git log -1`: `d01874157191b49bcba642771b0a9d3b2e3f69f4` (short `d018741`), 2023-02-05, *"Update description. Ensure script runs on Windows WSL"* — matches the stated commit.
 - `research\README.md:3-5` — shallow clones, do not commit `research/`, local reference only; `:45-46` requires license/attribution checks before reuse.
 - The README goal (`:9-15`) is Burp Suite Certified Practitioner preparation: *understand why the solution works* and *create proofs-of-concept*. That is pedagogically different from an evaluator needing unbiased ground truth — a key limitation when mining this for a benchmark.
 
-**Consequence:** use the mirror for (a) vulnerability taxonomy, (b) tiering, (c) PoC/oracle patterns, (d) known pitfalls. Do **not** use PortSwigger Academy labs as benchmark targets: `D:\Github\Agent Bug Bounty\docs\evaluation.md:2-6,105-110` restrict benchmarks to local, licensed testbeds and refuse non-loopback URLs.
+**Consequence:** use the mirror for (a) vulnerability taxonomy, (b) tiering, (c) PoC/oracle patterns, (d) known pitfalls. Do **not** use PortSwigger Academy labs as benchmark targets: `D:\Github\BugFound\docs\evaluation.md:2-6,105-110` restrict benchmarks to local, licensed testbeds and refuse non-loopback URLs.
 
 ## 1. What the material actually contains (measured)
 
@@ -52,7 +57,7 @@ Companion `README.md:17-87` shows the reasoning chain ( hypothesize `SELECT * FR
 
 ### 2.3 Oracle taxonomy actually present
 
-| Oracle type | Where | What proves success | AgentBug support today |
+| Oracle type | Where | What proves success | BugFound support today |
 | --- | --- | --- | --- |
 | **In-band success banner** | 110 script.py files, e.g. `09_…_SSRF\Basic_SSRF_against_the_local_server\script.py:28-32` | `Congratulations, you solved the lab!` in page body | Direct analogue of canary echo + 2xx verifier |
 | **State delta** | Same SSRF script `:24-26`: POST `stockApi=http://localhost/admin/delete?username=carlos`, then banner | Target-side mutation (user deleted) | **Not modelled** — verifier only checks response bytes/canary |
@@ -68,29 +73,29 @@ Companion `README.md:17-87` shows the reasoning chain ( hypothesize `SELECT * FR
 - **CSRF tokens:** the login-bypass script must harvest and replay `csrf` — naive single-request PoCs fail.
 - **Encoding:** `01-sqli\…\README.md:49-53` — browser auto-encodes; Burp requires `CTRL-u`.
 - **Noise and lockout bypass:** `02-authentication\Username_enumeration_via_response_timing\README.md:32-45` — initial timing attack inconclusive, brute-force lockout bypassed with unique `X-Forwarded-For` per request; only an "absurdly long password" produced a usable signal.
-- **Self-graded marker:** 110 scripts treat a page string as truth. AgentBug already rejects this pattern: `is_self_graded_marker()` at `crates\agentbug-engagement\src\lib.rs:2260-2263` refuses an `<html` echo without the canary.
+- **Self-graded marker:** 110 scripts treat a page string as truth. BugFound already rejects this pattern: `is_self_graded_marker()` at `crates\bugfound-engagement\src\lib.rs:2260-2263` refuses an `<html` echo without the canary.
 - **Partial coverage:** 48 Collaborator write-ups vs 0 OOB scripts — the hardest oracles are manual/interactive, so an automated evaluator must not infer "no script = no finding".
 
-### 2.5 Evidence expectations in the mirror vs AgentBug
+### 2.5 Evidence expectations in the mirror vs BugFound
 
-Mirror evidence = annotated request/response screenshots plus a runnable script and a success banner (`\templates\README.md:13-33`). AgentBug's contract is stricter and already documented:
+Mirror evidence = annotated request/response screenshots plus a runnable script and a success banner (`\templates\README.md:13-33`). BugFound's contract is stricter and already documented:
 
 - `docs\report-format.md:133-147` — every finding needs Severity, CVSS v3.1 vector, CWE, deterministic steps, PoC derived from **tool-captured bytes**, impact, remediation, SHA-256 over raw `request||response||canary`, redacted views.
-- `crates\agentbug-engagement\src\lib.rs:2119-2156` — canary minted by the tool or derived from captured request bytes; `capture_evidence()` stores bytes; LLM-supplied `finding.request/response` never consulted.
-- `lib.rs:2158-2249` — `verify_findings()` promotes only when an authoritative capture contains the canary **and** a 2xx status **and** evidence digests still verify, with ROE-based rejection.
+- `crates\bugfound-engagement\src\lib.rs:2119-2156` — canary minted by the tool or derived from captured request bytes; `capture_evidence()` stores bytes; LLM-supplied `finding.request/response` never consulted.
+- `lib.rs:2158-2249` — `verify_findings()` promotes only when a tool capture contains the canary **and** a 2xx status **and** evidence digests still verify, with ROE-based rejection.
 - `docs\evaluation.md:73-91` — replay JSONL must carry `run_start`, `action`, `finding`, `verifier`, `usage`, `report`; "a run without a replay log is not a valid result".
 
-## 3. Mapping to AgentBug today
+## 3. Mapping to BugFound today
 
 ### 3.1 What aligns
 
-| Mirror concept | AgentBug surface (evidence) |
+| Mirror concept | BugFound surface (evidence) |
 | --- | --- |
 | 22 topics / Apprentice–Practitioner–Expert | 9 WSTG playbooks at `lib.rs:1899-1939` (`wstg-info`, `wstg-config`, `wstg-authz`, `wstg-auth`, `wstg-session`, `wstg-injection`, `wstg-business`, `wstg-api`, `wstg-client`), planned as durable tasks + hypotheses at `:839-852` |
 | Difficulty tiers | No tier field anywhere in `eval/`; **gap** |
 | CWE classification | `map_cwe()` `lib.rs:2077-2117` (CWE-89/79/352/918/22/78/502/611/601/434/384/287/639/284/200/451/362/770/307) and `docs\report-format.md:168-186` |
 | CVSS v3.1 | `cvss_base()` `lib.rs:1945-2039`, `severity_from_score()` `:2065-2075`, FIRST bands `docs\report-format.md:149-160` |
-| WSTG source of truth | `D:\Github\Agent Bug Bounty\research\owasp-wstg\stable\4-Web_Application_Security_Testing\01-Information_Gathering` … `12-API_Testing` (12 categories) |
+| WSTG source of truth | `D:\Github\BugFound\research\owasp-wstg\stable\4-Web_Application_Security_Testing\01-Information_Gathering` … `12-API_Testing` (12 categories) |
 | Canary/oracle | `lib.rs:2119-2263`; docs `evaluation.md:81-84` |
 | Golden data | `eval\golden.example.json:1-24` (sqli/xss/idor with id, cwe, endpoint, aliases) |
 | Local targets | `eval\targets.example.yml:1-29` (Juice Shop, DVWA, Vulhub nginx parser, HTB-like VM, XBOW-style task) |
@@ -172,51 +177,51 @@ Per expected-vuln entry:
 3. **Target + endpoint binding.** Add `target_id` to manifest, `finding`, `verifier`, `report` events; key matching per target; consume `endpoint` in `load_manifest()`.
 4. **Repetition driver.** Add `-Repeat 3` (POSIX `--repeat 3`) to `eval\run_benchmark.ps1` / `.sh`, producing `eval/results/<id>/run-1..3/` with shared manifest and merged replay, so N≥3 reproducibility (`docs\evaluation.md:100`) is actually obtainable.
 5. **Honest FPR.** Emit `tested` events for negative controls; keep `false_positive_basis` (`score.py:408-429`); refuse threshold enforcement when basis is `reported_findings_fdr_proxy`.
-6. **Baseline lane.** Run the same tasks with a bare loop (no scope engine/coverage ledger/verifier/evidence pipeline) per `docs\evaluation.md:62-71`; store under `eval/results/<id>/baseline/`, never mix into AgentBug aggregates.
+6. **Baseline lane.** Run the same tasks with a bare loop (no scope engine/coverage ledger/verifier/evidence pipeline) per `docs\evaluation.md:62-71`; store under `eval/results/<id>/baseline/`, never mix into BugFound aggregates.
 7. **Tier-stratified reporting.** Report recall/precision per tier A/B/C and per WSTG class, with `not_applicable` counts for deferred browser/OOB tasks (do not count as misses).
 8. **Golden-record validation command.** A strict mode that rejects records missing `oracle`, `reset`, `negative_controls`, `cvss_v3_1`, or whose vectors fail the `CVSS_RE` grammar (`score.py:85-87`), before any run is scored.
 
-## 6. How to avoid claiming results without data (non-negotiable)
+## 6. How to avoid claiming results without data
 
-- `docs\evaluation.md:3` — "internal plan and operator-run harness, **not a set of recorded results**"; `:123-125` — no recall/precision/FPR/timing figure is claimed; scorer always emits `claim: scaffolding only — no benchmark results asserted` (implemented at `eval\score.py:599`).
-- `eval\README.md:3-6,109-113` — metrics with absent inputs are `null`/`n/a`, never guessed; no result asserted.
+- `docs\evaluation.md:3` — "internal plan and operator-run harness, **not a set of recorded results**"; `:123-125` — no recall/precision/FPR/timing figure is claimed; scorer emits a `claim` field in its JSON output (implemented at `eval\score.py:599`).
+- `eval\README.md:3-6,109-113` — metrics with absent inputs are `null`/`n/a` and are not guessed.
 - `eval\results\README.md:3-7,41-44` — results are operator-recorded evidence, not CI output; recompute from report + manifest + replay.
-- `eval\results\example-synthetic\README.md:3-7,22-23` — the fixture's `score.json` (recall 1.0, precision 1.0, FPR 0.0, tokens/finding 1500) is invented arithmetic and **skipped by `--dir`** via `example-*`; never quote it.
-- `docs\REMAINING_GAPS.md:16,18,47-50` — performance benchmark, baseline, browser, clustering and submission are deferred; `eval/` remains scaffolding.
+- `eval\results\example-synthetic\README.md:3-7,22-23` — the fixture's `score.json` (recall 1.0, precision 1.0, FPR 0.0, tokens/finding 1500) is invented arithmetic used to check scorer arithmetic and is **skipped by `--dir`** via `example-*`.
+- `docs\REMAINING_GAPS.md:16,18,47-50` — performance benchmark, baseline, browser, clustering and submission are deferred; `eval/` holds a scorer, an exporter and an invented fixture.
 - `docs\engagement.md:192-196` — a replay log is an audit aid, not proof of validity; without ground truth it cannot establish recall/precision.
 
 **Reporting rule for any future write-up:** assert a number only when the corresponding `eval/results/<target>/{report.md,manifest.json,replay.jsonl,score.json,run.log}` set exists, the score was recomputed with the exact command in `eval\results\README.md:36-39`, the run count meets the metric's minimum, and the claim states target IDs, tier mix, model, budget and date. Otherwise write "not measured".
 
 ## 7. Exact evidence index
 
-- `D:\Github\Agent Bug Bounty\research\README.md` — lines 3-5, 37-39, 45-46
-- `D:\Github\Agent Bug Bounty\research\portswigger-academy\README.md` — lines 3-15, 17-48, 54-64
-- `D:\Github\Agent Bug Bounty\research\portswigger-academy\create.py` — lines 41-76
-- `D:\Github\Agent Bug Bounty\research\portswigger-academy\.templates\README.md` — lines 1-33
-- `D:\Github\Agent Bug Bounty\research\portswigger-academy\.templates\script.py` — lines 1-44
-- `D:\Github\Agent Bug Bounty\research\portswigger-academy\01-sqli\SQL_injection_vulnerability_allowing_login_bypass\README.md` — lines 17-87
-- `D:\Github\Agent Bug Bounty\research\portswigger-academy\01-sqli\SQL_injection_vulnerability_allowing_login_bypass\script.py` — lines 14-61
-- `D:\Github\Agent Bug Bounty\research\portswigger-academy\02-authentication\Username_enumeration_via_response_timing\README.md` — lines 21-76
-- `D:\Github\Agent Bug Bounty\research\portswigger-academy\09_server_side_request_forgery_SSRF\Basic_SSRF_against_the_local_server\script.py` — lines 24-32
-- `D:\Github\Agent Bug Bounty\research\portswigger-academy\09_server_side_request_forgery_SSRF\Blind_SSRF_with_out-of-band_detection\README.md` — lines 5-27
-- `D:\Github\Agent Bug Bounty\research\portswigger-academy\11_cross_site_scripting_XSS\Exploiting_cross-site_scripting_to_steal_cookies\README.md` — lines 5-43
-- `D:\Github\Agent Bug Bounty\research\owasp-wstg\stable\4-Web_Application_Security_Testing\` — categories 01–12
-- `D:\Github\Agent Bug Bounty\crates\agentbug-engagement\src\lib.rs` — lines 839-852, 1899-1939, 1945-2117, 2119-2263, 2265-2374, 2419-2495
-- `D:\Github\Agent Bug Bounty\docs\evaluation.md` — lines 1-6, 14-27, 28-43, 45-60, 62-71, 73-91, 93-103, 105-110, 112-125
-- `D:\Github\Agent Bug Bounty\docs\report-format.md` — lines 1-9, 51-97, 133-160, 162-189
-- `D:\Github\Agent Bug Bounty\docs\engagement.md` — lines 102-122, 173-196
-- `D:\Github\Agent Bug Bounty\docs\REMAINING_GAPS.md` — lines 9-21, 23-50
-- `D:\Github\Agent Bug Bounty\eval\golden.example.json` — lines 1-24
-- `D:\Github\Agent Bug Bounty\eval\targets.example.yml` — lines 1-29
-- `D:\Github\Agent Bug Bounty\eval\score.py` — lines 46-109, 112-134, 155-240, 243-288, 329-499, 539-628
-- `D:\Github\Agent Bug Bounty\eval\run_benchmark.ps1` — lines 13-15, 71-99, 101-129, 132-220
-- `D:\Github\Agent Bug Bounty\eval\README.md` — lines 1-23, 82-119
-- `D:\Github\Agent Bug Bounty\eval\results\README.md` — lines 1-58
-- `D:\Github\Agent Bug Bounty\eval\results\example-synthetic\README.md` — lines 1-23
-- `D:\Github\Agent Bug Bounty\eval\results\example-synthetic\score.json` — synthetic fixture only (claim field: `scaffolding only — no benchmark results asserted`)
+- `D:\Github\BugFound\research\README.md` — lines 3-5, 37-39, 45-46
+- `D:\Github\BugFound\research\portswigger-academy\README.md` — lines 3-15, 17-48, 54-64
+- `D:\Github\BugFound\research\portswigger-academy\create.py` — lines 41-76
+- `D:\Github\BugFound\research\portswigger-academy\.templates\README.md` — lines 1-33
+- `D:\Github\BugFound\research\portswigger-academy\.templates\script.py` — lines 1-44
+- `D:\Github\BugFound\research\portswigger-academy\01-sqli\SQL_injection_vulnerability_allowing_login_bypass\README.md` — lines 17-87
+- `D:\Github\BugFound\research\portswigger-academy\01-sqli\SQL_injection_vulnerability_allowing_login_bypass\script.py` — lines 14-61
+- `D:\Github\BugFound\research\portswigger-academy\02-authentication\Username_enumeration_via_response_timing\README.md` — lines 21-76
+- `D:\Github\BugFound\research\portswigger-academy\09_server_side_request_forgery_SSRF\Basic_SSRF_against_the_local_server\script.py` — lines 24-32
+- `D:\Github\BugFound\research\portswigger-academy\09_server_side_request_forgery_SSRF\Blind_SSRF_with_out-of-band_detection\README.md` — lines 5-27
+- `D:\Github\BugFound\research\portswigger-academy\11_cross_site_scripting_XSS\Exploiting_cross-site_scripting_to_steal_cookies\README.md` — lines 5-43
+- `D:\Github\BugFound\research\owasp-wstg\stable\4-Web_Application_Security_Testing\` — categories 01–12
+- `D:\Github\BugFound\crates\bugfound-engagement\src\lib.rs` — lines 839-852, 1899-1939, 1945-2117, 2119-2263, 2265-2374, 2419-2495
+- `D:\Github\BugFound\docs\evaluation.md` — lines 1-6, 14-27, 28-43, 45-60, 62-71, 73-91, 93-103, 105-110, 112-125
+- `D:\Github\BugFound\docs\report-format.md` — lines 1-9, 51-97, 133-160, 162-189
+- `D:\Github\BugFound\docs\engagement.md` — lines 102-122, 173-196
+- `D:\Github\BugFound\docs\REMAINING_GAPS.md` — lines 9-21, 23-50
+- `D:\Github\BugFound\eval\golden.example.json` — lines 1-24
+- `D:\Github\BugFound\eval\targets.example.yml` — lines 1-29
+- `D:\Github\BugFound\eval\score.py` — lines 46-109, 112-134, 155-240, 243-288, 329-499, 539-628
+- `D:\Github\BugFound\eval\run_benchmark.ps1` — lines 13-15, 71-99, 101-129, 132-220
+- `D:\Github\BugFound\eval\README.md` — lines 1-23, 82-119
+- `D:\Github\BugFound\eval\results\README.md` — lines 1-58
+- `D:\Github\BugFound\eval\results\example-synthetic\README.md` — lines 1-23
+- `D:\Github\BugFound\eval\results\example-synthetic\score.json` — synthetic fixture only (the scorer emits a `claim` field)
 
 ---
 
 ## Summary
 
-The mirror (commit `d018741`) is 157 write-ups / 140 PoC scripts across 22 topic folders, tiered Apprentice→Expert. Its transferable value is the **oracle taxonomy and pitfalls**, not target data. A dominant pattern — 110 scripts grading on a `Congratulations` banner, with state-delta, timing and OOB cases left manual — reveals that AgentBug's current canary-echo verifier covers only the easiest tier; state, timing, OOB and browser classes are ungradable today. I proposed a tiered local lab (scenarios 1–15 mapped to WSTG 01–12, CWE and CVSS v3.1), a golden-record schema adding `target_id`, endpoint binding, oracle type, reset recipe, tier, and negative controls, plus eight prioritized harness fixes (multi-oracle verifier, currently-declared-but-missing metrics, target binding, N≥3 driver, honest FPR, baseline lane, tier-stratified reporting, schema validation). The document explicitly forbids quoting results without operator-recorded artifacts, citing `docs\evaluation.md:123-125`, `eval\results\README.md` and the deliberately skipped `example-synthetic` fixture.
+The mirror (commit `d018741`) is 157 write-ups / 140 PoC scripts across 22 topic folders, tiered Apprentice→Expert. Its transferable value is the **oracle taxonomy and pitfalls**, not target data. A dominant pattern — 110 scripts grading on a `Congratulations` banner, with state-delta, timing and OOB cases left manual — reveals that BugFound's current canary-echo verifier covers only the easiest tier; state, timing, OOB and browser classes are ungradable today. I proposed a tiered local lab (scenarios 1–15 mapped to WSTG 01–12, CWE and CVSS v3.1), a golden-record schema adding `target_id`, endpoint binding, oracle type, reset recipe, tier, and negative controls, plus eight prioritized harness fixes (multi-oracle verifier, currently-declared-but-missing metrics, target binding, N≥3 driver, honest FPR, baseline lane, tier-stratified reporting, schema validation). The document explicitly forbids quoting results without operator-recorded artifacts, citing `docs\evaluation.md:123-125`, `eval\results\README.md` and the deliberately skipped `example-synthetic` fixture.

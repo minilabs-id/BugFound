@@ -1,22 +1,27 @@
-﻿# 05 - MCP as a blueprint for AgentBug provider abstraction and dynamic tools
+# 05 - MCP as a blueprint for BugFound provider abstraction and dynamic tools
+
+> **About these notes.** These are point-in-time analyses of third-party reference
+> projects, kept for design input. They describe the reference projects at the
+> snapshots examined and are not claims about the current BugFound code; verify
+> current behavior in `crates/`.
 
 Status: research notes. Patterns only, no code has been copied.
 
-Reference repository: D:\Github\Agent Bug Bounty\research\mcp
+Reference repository: D:\Github\BugFound\research\mcp
 (modelcontextprotocol/specification), commit
 8a18b4b3292b9f9b3aee73f6325f9f62f19a89f9.
 
 Spec revisions consulted: 2026-07-28 (the current stable revision at that
 commit) and draft (direction only). Every path beginning "research/mcp/" is
 relative to the reference root above; every other path is relative to
-D:\Github\Agent Bug Bounty. Line numbers are from those exact files.
+D:\Github\BugFound. Line numbers are from those exact files.
 
 ---
 
 ## Executive summary
 
 The 2026-07-28 MCP revision is a stateless, per-request, capability-negotiated
-JSON-RPC protocol. Its most transferable ideas for AgentBug are not the wire
+JSON-RPC protocol. Its most transferable ideas for BugFound are not the wire
 format itself but four architectural patterns:
 
 1. Capability negotiation and discovery as data, not handshakes. Every request
@@ -38,9 +43,9 @@ format itself but four architectural patterns:
    behavior are forbidden; SSRF guidance mandates private-range blocking and
    DNS pinning.
 
-AgentBug already independently reimplements several of these patterns well:
+BugFound already independently reimplements several of these patterns well:
 untrusted-tool-output wrapping, SSRF defenses, scope policy, rate limiting and
-authoritative capture canaries. Its actual gaps are concentrated in (a) the
+capture canaries. Its actual gaps are concentrated in (a) the
 Llm trait being an OpenAI-shaped single-endpoint interface with a side-channel
 for token usage, (b) two divergent ToolSpec types with lossy conversion and no
 schema validation, (c) a static in-process registry whose "plugins" are
@@ -51,7 +56,7 @@ decision input even though MCP explicitly warns that such hints are untrusted.
 A critical trajectory note: as of 2026-07-28 MCP deprecates sampling and roots
 in favor of direct LLM-provider integration and passing paths via tool
 parameters/resource URIs, and replaces server-initiated requests with the
-multi-round-trip request (MRTR) pattern. AgentBug should borrow the
+multi-round-trip request (MRTR) pattern. BugFound should borrow the
 cross-provider request/response shape from sampling but the interactive
 control-flow from MRTR/elicitation, and must not build new features on the
 deprecated primitives.
@@ -88,7 +93,7 @@ deprecated primitives.
   authenticated principal, a short TTL and a request identifier to bound replay
   (.../basic/patterns/mrtr.mdx:231-243, :269-272).
 
-Pattern for AgentBug: a tool/plugin should be able to suspend and ask the host
+Pattern for BugFound: a tool/plugin should be able to suspend and ask the host
 for more information (user confirmation, credentials, another model call)
 without the plugin holding a durable session of its own. The host owns the
 human-in-the-loop and replays state; state blobs must be bound to the session
@@ -117,7 +122,7 @@ and expire.
   (.../architecture/index.mdx:117-175; .../server/tools.mdx:45-74;
   .../client/elicitation.mdx:49-81).
 
-Pattern for AgentBug: discovery returns a descriptor -- identity, supported
+Pattern for BugFound: discovery returns a descriptor -- identity, supported
 protocol/handler versions, declared capabilities, operator-facing instructions,
 cache lifetime -- and capability use is gated on what the other side actually
 declared, per interaction, not on a startup assumption.
@@ -127,11 +132,11 @@ declared, per interaction, not on a startup assumption.
 The spec defines an explicit control hierarchy
 (research/mcp/docs/specification/2026-07-28/server/index.mdx:15-21):
 
-| Primitive | Control | AgentBug analogue |
+| Primitive | Control | BugFound analogue |
 | --- | --- | --- |
-| Prompts | User-controlled templates | system prompt assembled in crates/agentbug-core/src/lib.rs:1298-1304 (host-controlled) |
+| Prompts | User-controlled templates | system prompt assembled in crates/bugfound-core/src/lib.rs:1298-1304 (host-controlled) |
 | Resources | Application-controlled context | durable store / findings / artifacts |
-| Tools | Model-controlled actions | ToolRegistry (crates/agentbug-tools/src/lib.rs:111-151) |
+| Tools | Model-controlled actions | ToolRegistry (crates/bugfound-tools/src/lib.rs:111-151) |
 
 - Tools are discovered with tools/list (paginated, cacheable) and invoked with
   tools/call; the advertised set may vary by the authorization presented on the
@@ -172,7 +177,7 @@ The spec defines an explicit control hierarchy
   notifications/tools/list_changed notification on a subscriptions/listen
   stream (.../server/tools.mdx:236-248, :250-278).
 
-Pattern for AgentBug: one normalized tool descriptor with a stable identity,
+Pattern for BugFound: one normalized tool descriptor with a stable identity,
 input and output schemas, display metadata and hint annotations; results carry
 both a text rendering and validated structured data; tool names are namespaced
 by origin; schema validation is a boundary responsibility with SSRF/DoS guards.
@@ -205,9 +210,9 @@ by origin; schema validation is a boundary responsibility with SSRF/DoS guards.
   first-class outcome (:434-467). Security rules bind requests to user
   identity and defend against phishing (:593-671).
 
-Pattern for AgentBug: model requests should express preferences, never vendor
+Pattern for BugFound: model requests should express preferences, not vendor
 model IDs; user approval should be a typed outcome (approve / decline / cancel),
-not a binary gate; secrets must never transit the model-visible tool channel.
+not a binary gate; secrets should not transit the model-visible tool channel.
 
 ### 1.6 Transports and extensions
 
@@ -225,7 +230,7 @@ not a binary gate; secrets must never transit the model-visible tool channel.
   the extensions capability map (.../index.mdx:75-89;
   .../basic/versioning.mdx:80-127).
 
-Pattern for AgentBug: keep the agent core independent of how a tool provider is
+Pattern for BugFound: keep the agent core independent of how a tool provider is
 reached; define a thin connector boundary with explicit cancellation and
 metadata propagation, and let optional capabilities be advertised rather than
 assumed.
@@ -258,12 +263,12 @@ assumed.
   consent before forwarding to a third-party authorization server
   (security-considerations.mdx:107-114;
   docs/docs/2026-07-28/tutorials/security/security_best_practices.mdx:27-282).
-- SSRF guidance mirrors AgentBug's own HTTP hardening: enforce HTTPS, block
+- SSRF guidance mirrors BugFound's own HTTP hardening: enforce HTTPS, block
   private/loopback/link-local/metadata ranges (including IPv4-mapped IPv6 and
   numeric encodings), do not blindly follow redirects, pin DNS to avoid
   TOCTOU/DNS-rebinding, and prefer egress proxies
   (security_best_practices.mdx:355-507). Note the spec warns "avoid implementing
-  IP validation manually" because of encoding tricks -- AgentBug's hand-written
+  IP validation manually" because of encoding tricks -- BugFound's hand-written
   parser is unusually thorough but is exactly the kind of code this guidance
   cautions about.
 - State handles must not be treated as authentication; bind them to the verified
@@ -277,12 +282,12 @@ validated at a single choke point.
 
 ---
 
-## 3. Current AgentBug architecture (evidence)
+## 3. Current BugFound architecture (evidence)
 
 ### 3.1 Llm trait and client -- an OpenAI-shaped interface
 
 - LlmConfig is a single endpoint: base_url, api_key, optional default_model,
-  timeout_ms (crates/agentbug-llm/src/lib.rs:16-39). validate_base_url only
+  timeout_ms (crates/bugfound-llm/src/lib.rs:16-39). validate_base_url only
   checks http/https + host (:41-54).
 - ChatMessage is flat strings plus OpenAI-style tool_calls (:56-67); ToolSpec is
   {name, description, parameters} (:69-74); ToolCall is {id, name, arguments}
@@ -306,7 +311,7 @@ validated at a single choke point.
 
 - Tools-side ToolSpec is {name, description, input_schema, risk} with a free-form
   risk string (:30-36); ToolResult is {ok, output, structured} (:38-44);
-  HttpCapture + capture_from_structured provide a canary-backed authoritative
+  HttpCapture + capture_from_structured provide a canary-backed
   evidence channel (:46-74).
 - ToolOptions is an operator-supplied config struct (proxy, trusted local
   targets, enable_external_tools, external_commands, scope_in/out, auto-detect,
@@ -331,7 +336,7 @@ validated at a single choke point.
 ### 3.3 Runner wiring and policy
 
 - Runner holds Arc<dyn Llm>, a ToolRegistry, a PolicyEngine, AgentConfig and an
-  owner id (crates/agentbug-core/src/lib.rs:577-609).
+  owner id (crates/bugfound-core/src/lib.rs:577-609).
 - Tool metadata is used for security decisions: is_network_tool inspects the
   risk string and tool-name substrings (:762-771); budget_gate (:773-803);
   auto_approve_allowed treats certain risk values as dangerous (:854-883);
@@ -341,12 +346,12 @@ validated at a single choke point.
   resolution calls resolve_model() once at session start (:1274-1290).
 - Tools are converted to the LLM spec inline in the runner, dropping risk and
   any other metadata (:1838-1847), and again in a duplicate helper
-  build_tool_specs (crates/agentbug-core/src/step.rs:53-64, itself marked
+  build_tool_specs (crates/bugfound-core/src/step.rs:53-64, itself marked
   additive while the runner "keeps its own inline implementation" at :1-3).
 - Tool results are flattened to text: tool_message_text emits a single
   untrusted_tool_output string built only from result.output; the structured
-  field is never surfaced to the model or schema-validated
-  (crates/agentbug-core/src/lib.rs:1517-1523). Errors from guards are returned
+  field is not surfaced to the model or schema-validated
+  (crates/bugfound-core/src/lib.rs:1517-1523). Errors from guards are returned
   as free-form text (:971-1006, :2076-2080), so the model has no typed
   "correctable error" channel.
 - Approval is a durable park/resume with four guard markers
@@ -354,54 +359,54 @@ validated at a single choke point.
   accept/decline/cancel and no integrity-protected, expiring request state for
   plugin-initiated input.
 - Execution coordination is process-global and session-keyed, with wake
-  coalescing, interruption and stop-ack (crates/agentbug-core/src/execution.rs:
+  coalescing, interruption and stop-ack (crates/bugfound-core/src/execution.rs:
   12-18, :45-75, :100-181).
 - Policy is local config: Mode::{Ask, FullAuto}, Decision::{Allow, Ask, Deny},
   scope matching, allowed/denied tools and budgets
-  (crates/agentbug-policy/src/lib.rs:5-20, :38-166, :225-253).
+  (crates/bugfound-policy/src/lib.rs:5-20, :38-166, :225-253).
 - Wiring happens at startup in CLI/desktop; the single LlmConfig and single
   ToolOptions are constructed once and passed in
-  (crates/agentbug-cli/src/main.rs:548-586;
-  crates/agentbug-desktop/src/worker.rs:85-110). Workspace dependencies contain
+  (crates/bugfound-cli/src/main.rs:548-586;
+  crates/bugfound-desktop/src/worker.rs:85-110). Workspace dependencies contain
   no JSON Schema validator and no provider SDKs (Cargo.toml:19-40).
 
 ---
 
 ## 4. Concrete gaps and how MCP informs them
 
-| # | Gap in AgentBug (evidence) | MCP pattern to borrow (evidence) | Direction |
+| # | Gap in BugFound (evidence) | MCP pattern to borrow (evidence) | Direction |
 | --- | --- | --- | --- |
-| G1 | Provider interface is one OpenAI-compatible endpoint; chat hard-codes /chat/completions and the function envelope; ChatResponse lacks stop reason, content blocks and tool-choice (agentbug-llm/src/lib.rs:16-39, :242-297, :83-88). | Cross-API sampling model: content blocks, toolChoice modes, stopReason, parallel tool use, strict tool_use/tool_result balance (client/sampling.mdx:375-487, :643-659). | Define a provider-neutral request/response model with thin adapters; never expose function-shaped structs in the core trait. |
-| G2 | Model resolution = configured string or first id from /v1/models (agentbug-llm/src/lib.rs:150-240). | Preference-based selection: normalized cost/speed/intelligence priorities + advisory hints resolved by the host (client/sampling.mdx:559-604). | Let callers express a ModelPreference; each provider adapter maps it to a concrete model. |
-| G3 | Token usage travels through Arc<Mutex<Option<TokenUsage>>> (agentbug-llm/src/lib.rs:114-139, :312-323, :366-376), unsafe under concurrent calls and absent from ChatResponse. | Usage belongs to the response envelope; MCP results are self-contained (basic/index.mdx:55-85, :182-209). | Return usage in the response; delete the mutex side channel. |
-| G4 | Two divergent ToolSpec types and two lossy conversions that drop risk, schema metadata and any future fields (agentbug-tools/src/lib.rs:69-74 vs 30-36; agentbug-core/src/lib.rs:1838-1847; agentbug-core/src/step.rs:53-64). | One Tool descriptor with inputSchema, outputSchema, annotations, _meta (server/tools.mdx:280-332; schema.ts:1983-2030). | Unify on one internal descriptor; provider-specific mapping lives at the adapter edge. |
-| G5 | ToolResult.structured is never sent to the model and no output schema exists; results are flattened (agentbug-tools/src/lib.rs:38-44; agentbug-core/src/lib.rs:1517-1523). | structuredContent + outputSchema with client-side validation (server/tools.mdx:404-507, :509-631). | Validate and surface structured output; keep the untrusted text wrapper for prose. |
-| G6 | input_schema is a raw json! value; LLM arguments go straight to tool.run() with no schema validation (agentbug-tools/src/lib.rs:613 etc.; agentbug-core/src/lib.rs:1948); no JSON Schema dependency (Cargo.toml:19-40). | 2020-12 default dialect, validation on both sides, $ref/DoS guards (basic/index.mdx:247-318; server/tools.mdx:787-803). | Validate arguments at the tool boundary and outputs against outputSchema, with the spec's SSRF/DoS constraints. |
-| G7 | ToolRegistry is a static in-process map; "external tools" are PATH scans and command templates; no discovery, namespace, versioning, listChanged or async registration (agentbug-tools/src/lib.rs:111-151, :2149-2272). | server/discover + paginated tools/list + listChanged notifications; server-scoped names with prefix disambiguation (server/discover.mdx:7-86; server/tools.mdx:45-74, :236-248, :309-332). | Introduce a tool-provider boundary with a discovery descriptor (versions, capabilities, instructions, TTL), namespaced tool ids and dynamic list/invoke. |
-| G8 | Self-reported risk string drives approvals and budget classification, including for command-backed adapters (agentbug-tools/src/lib.rs:31-36, :2089-2131; agentbug-core/src/lib.rs:762-771, :854-883). | All ToolAnnotations (incl. title, hints) are untrusted; clients must not make tool-use decisions on them from untrusted servers (schema.ts:1904-1915; server/tools.mdx:304-307). | Treat risk as a hint only; keep authorization in a host-owned policy keyed by tool origin/identity, not by a tool-provided string. |
-| G9 | Single host API key is the only credential; third-party tool calls inherit no scoped identity (agentbug-llm/src/lib.rs:16-24; agentbug-cli/src/main.rs:549-561). | Audience-bound tokens, RFC 8707 resource indicators, least-privilege scopes, step-up, token-passthrough forbidden, per-client consent (basic/authorization/index.mdx:97-134, :215-317, :345-425; security-considerations.mdx:107-131; security_best_practices.mdx:27-353). | Separate LLM-provider credentials from tool-provider credentials; scoped, non-transferable tokens; never forward the host key to a plugin/upstream. |
-| G10 | No handshake: capabilities are assumed at startup in CLI/desktop; no optional-feature negotiation or instructions field (agentbug-cli/src/main.rs:548-586; agentbug-desktop/src/worker.rs:85-110). | Per-request capability metadata, server/discover, open extensions map with fallback (basic/index.mdx:366-393; server/discover.mdx:33-59; basic/versioning.mdx:80-127). | Add a discovery/descriptor step and gate optional features on declared capabilities with explicit fallback. |
-| G11 | Approval is binary park/resume with free-form text; no typed decline/cancel; no integrity-protected expiring state for plugin-initiated input (agentbug-core/src/lib.rs:51-65, :971-1006, :2000-2075). | MRTR requestState (HMAC/AEAD + principal + TTL + request id) and elicitation accept/decline/cancel (basic/patterns/mrtr.mdx:231-243, :249-257; client/elicitation.mdx:434-467, :593-671). | Model interactive tool flows as suspend/resume with typed outcomes and bounded, authenticated state; secrets via out-of-band URL, never in tool args. |
-| G12 | Only local subprocess bindings exist for external tools (agentbug-tools/src/lib.rs:2249-2272). | Transport is a binding with metadata mirroring and explicit cancellation; stdio and Streamable HTTP are standard (basic/transports/index.mdx:7-25, :38-58, :60-79). | Put a connector trait under the registry so stdio/HTTP/in-process providers share one contract. |
-| G13 | Guard denials are text strings; no stable model-correctable error category (agentbug-core/src/lib.rs:971-1006, :2076-2080). | Split protocol errors from isError:true execution errors intended for self-correction (server/tools.mdx:738-785). | Add a normalized error taxonomy and surface correctable errors to the model without leaking policy internals. |
+| G1 | Provider interface is one OpenAI-compatible endpoint; chat hard-codes /chat/completions and the function envelope; ChatResponse lacks stop reason, content blocks and tool-choice (bugfound-llm/src/lib.rs:16-39, :242-297, :83-88). | Cross-API sampling model: content blocks, toolChoice modes, stopReason, parallel tool use, strict tool_use/tool_result balance (client/sampling.mdx:375-487, :643-659). | Define a provider-neutral request/response model with thin adapters; do not expose function-shaped structs in the core trait. |
+| G2 | Model resolution = configured string or first id from /v1/models (bugfound-llm/src/lib.rs:150-240). | Preference-based selection: normalized cost/speed/intelligence priorities + advisory hints resolved by the host (client/sampling.mdx:559-604). | Let callers express a ModelPreference; each provider adapter maps it to a concrete model. |
+| G3 | Token usage travels through Arc<Mutex<Option<TokenUsage>>> (bugfound-llm/src/lib.rs:114-139, :312-323, :366-376), unsafe under concurrent calls and absent from ChatResponse. | Usage belongs to the response envelope; MCP results are self-contained (basic/index.mdx:55-85, :182-209). | Return usage in the response; delete the mutex side channel. |
+| G4 | Two divergent ToolSpec types and two lossy conversions that drop risk, schema metadata and any future fields (bugfound-tools/src/lib.rs:69-74 vs 30-36; bugfound-core/src/lib.rs:1838-1847; bugfound-core/src/step.rs:53-64). | One Tool descriptor with inputSchema, outputSchema, annotations, _meta (server/tools.mdx:280-332; schema.ts:1983-2030). | Unify on one internal descriptor; provider-specific mapping lives at the adapter edge. |
+| G5 | ToolResult.structured is not sent to the model and no output schema exists; results are flattened (bugfound-tools/src/lib.rs:38-44; bugfound-core/src/lib.rs:1517-1523). | structuredContent + outputSchema with client-side validation (server/tools.mdx:404-507, :509-631). | Validate and surface structured output; keep the untrusted text wrapper for prose. |
+| G6 | input_schema is a raw json! value; LLM arguments go straight to tool.run() with no schema validation (bugfound-tools/src/lib.rs:613 etc.; bugfound-core/src/lib.rs:1948); no JSON Schema dependency (Cargo.toml:19-40). | 2020-12 default dialect, validation on both sides, $ref/DoS guards (basic/index.mdx:247-318; server/tools.mdx:787-803). | Validate arguments at the tool boundary and outputs against outputSchema, with the spec's SSRF/DoS constraints. |
+| G7 | ToolRegistry is a static in-process map; "external tools" are PATH scans and command templates; no discovery, namespace, versioning, listChanged or async registration (bugfound-tools/src/lib.rs:111-151, :2149-2272). | server/discover + paginated tools/list + listChanged notifications; server-scoped names with prefix disambiguation (server/discover.mdx:7-86; server/tools.mdx:45-74, :236-248, :309-332). | Introduce a tool-provider boundary with a discovery descriptor (versions, capabilities, instructions, TTL), namespaced tool ids and dynamic list/invoke. |
+| G8 | Self-reported risk string drives approvals and budget classification, including for command-backed adapters (bugfound-tools/src/lib.rs:31-36, :2089-2131; bugfound-core/src/lib.rs:762-771, :854-883). | All ToolAnnotations (incl. title, hints) are untrusted; clients must not make tool-use decisions on them from untrusted servers (schema.ts:1904-1915; server/tools.mdx:304-307). | Treat risk as a hint only; keep authorization in a host-owned policy keyed by tool origin/identity, not by a tool-provided string. |
+| G9 | Single host API key is the only credential; third-party tool calls inherit no scoped identity (bugfound-llm/src/lib.rs:16-24; bugfound-cli/src/main.rs:549-561). | Audience-bound tokens, RFC 8707 resource indicators, least-privilege scopes, step-up, token-passthrough forbidden, per-client consent (basic/authorization/index.mdx:97-134, :215-317, :345-425; security-considerations.mdx:107-131; security_best_practices.mdx:27-353). | Separate LLM-provider credentials from tool-provider credentials; scoped, non-transferable tokens; do not forward the host key to a plugin/upstream. |
+| G10 | No handshake: capabilities are assumed at startup in CLI/desktop; no optional-feature negotiation or instructions field (bugfound-cli/src/main.rs:548-586; bugfound-desktop/src/worker.rs:85-110). | Per-request capability metadata, server/discover, open extensions map with fallback (basic/index.mdx:366-393; server/discover.mdx:33-59; basic/versioning.mdx:80-127). | Add a discovery/descriptor step and gate optional features on declared capabilities with explicit fallback. |
+| G11 | Approval is binary park/resume with free-form text; no typed decline/cancel; no integrity-protected expiring state for plugin-initiated input (bugfound-core/src/lib.rs:51-65, :971-1006, :2000-2075). | MRTR requestState (HMAC/AEAD + principal + TTL + request id) and elicitation accept/decline/cancel (basic/patterns/mrtr.mdx:231-243, :249-257; client/elicitation.mdx:434-467, :593-671). | Model interactive tool flows as suspend/resume with typed outcomes and bounded, authenticated state; secrets via out-of-band URL, not in tool args. |
+| G12 | Only local subprocess bindings exist for external tools (bugfound-tools/src/lib.rs:2249-2272). | Transport is a binding with metadata mirroring and explicit cancellation; stdio and Streamable HTTP are standard (basic/transports/index.mdx:7-25, :38-58, :60-79). | Put a connector trait under the registry so stdio/HTTP/in-process providers share one contract. |
+| G13 | Guard denials are text strings; no stable model-correctable error category (bugfound-core/src/lib.rs:971-1006, :2076-2080). | Split protocol errors from isError:true execution errors intended for self-correction (server/tools.mdx:738-785). | Add a normalized error taxonomy and surface correctable errors to the model without leaking policy internals. |
 
-### What AgentBug already does that aligns with MCP
+### What BugFound already does that aligns with MCP
 
 - Untrusted-output framing: tool_message_text wraps output as untrusted data
-  (agentbug-core/src/lib.rs:1517-1523) -- matches the "validate results before
+  (bugfound-core/src/lib.rs:1517-1523) -- matches the "validate results before
   passing to LLM" and untrusted-annotation rules (server/tools.mdx:787-803,
   :304-307).
 - SSRF defenses: blocked ranges, numeric-host decoding, no-redirect clients and
-  DNS pinning (agentbug-tools/src/lib.rs:210-250, :259-324, :760-780,
+  DNS pinning (bugfound-tools/src/lib.rs:210-250, :259-324, :760-780,
   :520-539) -- mirror security_best_practices.mdx:355-507.
 - Scope policy and rate limiting: ScopeConfig.check_target
-  (agentbug-policy/src/lib.rs:138-165), scope_target_allowed
-  (agentbug-tools/src/lib.rs:479-494), obey_rate_limit (:807-831) and
-  duplicates/cooldowns (agentbug-core/src/lib.rs:241-263, :939-960) -- mirror
+  (bugfound-policy/src/lib.rs:138-165), scope_target_allowed
+  (bugfound-tools/src/lib.rs:479-494), obey_rate_limit (:807-831) and
+  duplicates/cooldowns (bugfound-core/src/lib.rs:241-263, :939-960) -- mirror
   least-privilege scopes and "servers must rate limit tool invocations"
   (server/tools.mdx:787-793).
-- Authoritative capture canary (agentbug-tools/src/lib.rs:940-960,
-  agentbug-core/src/lib.rs:450-463) is an AgentBug-specific strengthening:
+- Capture canary (bugfound-tools/src/lib.rs:940-960,
+  bugfound-core/src/lib.rs:450-463) is an BugFound-specific strengthening:
   MCP's structuredContent is server-produced and has no equivalent anti-spoof
   canary; keep this when adding structured results.
 
@@ -412,8 +417,8 @@ validated at a single choke point.
 1. Provider-neutral LLM port. Replace the current trait surface with a
    request/response model expressed in content blocks, ModelPreference,
    ToolChoice, StopReason, structured usage and typed errors. Concrete providers
-   become adapters that translate to/from their wire format; the core never
-   constructs an OpenAI-shaped payload. Keep resolve_model behind the adapter
+   become adapters that translate to/from their wire format; the core does not
+   construct an OpenAI-shaped payload. Keep resolve_model behind the adapter
    and resolve preferences there.
 2. One tool descriptor, many bindings. A normalized descriptor (identity,
    namespace/origin, version, display metadata, inputSchema, outputSchema, hint
@@ -423,9 +428,9 @@ validated at a single choke point.
    descriptor and cache TTL. Names are namespaced by origin.
 3. Boundary validation. Validate every model-produced argument against the
    tool's input schema before execution; validate tool output against its
-   output schema; bound schema depth/composition and never fetch remote $refs.
+   output schema; bound schema depth/composition and do not fetch remote $refs.
 4. Host-owned authorization. Move risk classification out of the tool's
-   self-report and into host policy keyed by verified tool origin and operation.
+   self-report and into host policy keyed by tool origin and operation.
    Treat all plugin-supplied metadata as untrusted. Keep the existing scope,
    budget, cooldown and injection guards, but express their denials as typed,
    model-correctable errors.
@@ -445,7 +450,7 @@ validated at a single choke point.
 
 ## 6. Evidence index (quick reference)
 
-MCP reference root: D:\Github\Agent Bug Bounty\research\mcp\, commit
+MCP reference root: D:\Github\BugFound\research\mcp\, commit
 8a18b4b3292b9f9b3aee73f6325f9f62f19a89f9:
 
 - schema/2026-07-28/schema.ts:712-787, 789-879, 1904-1958, 1983-2030, 2523
@@ -472,16 +477,16 @@ MCP reference root: D:\Github\Agent Bug Bounty\research\mcp\, commit
   355-507, 522-563
 - docs/specification/2026-07-28/deprecated.mdx:22-41
 
-AgentBug current code root: D:\Github\Agent Bug Bounty\:
+BugFound current code root: D:\Github\BugFound\:
 
-- crates/agentbug-llm/src/lib.rs:9-112, 114-148, 150-240, 242-458
-- crates/agentbug-tools/src/lib.rs:30-151, 165-250, 259-324, 415-539,
+- crates/bugfound-llm/src/lib.rs:9-112, 114-148, 150-240, 242-458
+- crates/bugfound-tools/src/lib.rs:30-151, 165-250, 259-324, 415-539,
   597-643, 737-780, 807-865, 992-1168, 1173-1317, 1517-1776, 2026-2281
-- crates/agentbug-core/src/lib.rs:51-88, 577-609, 762-969, 971-1006,
+- crates/bugfound-core/src/lib.rs:51-88, 577-609, 762-969, 971-1006,
   1235-1356, 1517-1561, 1810-2098
-- crates/agentbug-core/src/step.rs:1-64
-- crates/agentbug-core/src/execution.rs:12-238
-- crates/agentbug-policy/src/lib.rs:5-20, 38-166, 225-253
-- crates/agentbug-cli/src/main.rs:548-586
-- crates/agentbug-desktop/src/worker.rs:85-110
+- crates/bugfound-core/src/step.rs:1-64
+- crates/bugfound-core/src/execution.rs:12-238
+- crates/bugfound-policy/src/lib.rs:5-20, 38-166, 225-253
+- crates/bugfound-cli/src/main.rs:548-586
+- crates/bugfound-desktop/src/worker.rs:85-110
 - Cargo.toml:19-40

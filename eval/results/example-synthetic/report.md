@@ -1,4 +1,4 @@
-# AgentBug Engagement Report — SYNTHETIC EXAMPLE
+# BugFound Engagement Report — SYNTHETIC EXAMPLE
 
 - Engagement ID: example-synthetic
 - Program URL: http://127.0.0.1:8080/ (invented local testbed)
@@ -110,5 +110,5 @@ by replaying the stored request bytes and checking that the marker is escaped.
 
 ### Appendix E — Reproduction command
 
-`agentbug engage --url http://127.0.0.1:8080/ --cwd <engagement-dir>` (not run
+`bugfound engage --url http://127.0.0.1:8080/ --cwd <engagement-dir>` (not run
 for this fixture).

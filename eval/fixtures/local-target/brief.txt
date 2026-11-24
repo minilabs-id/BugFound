@@ -1,4 +1,4 @@
-Program: AgentBug Local Construction Lab
+Program: BugFound Local Construction Lab
 Program URL: http://127.0.0.1:8099/
 
 In scope:

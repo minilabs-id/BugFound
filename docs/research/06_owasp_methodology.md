@@ -1,4 +1,9 @@
-﻿# 06 - OWASP Methodology: WSTG, ASVS, API Security Top 10 -> AgentBug
+﻿# 06 - OWASP Methodology: WSTG, ASVS, API Security Top 10 -> BugFound
+
+> **About these notes.** These are point-in-time analyses of third-party reference
+> projects, kept for design input. They describe the reference projects at the
+> snapshots examined and are not claims about the current BugFound code; verify
+> current behavior in `crates/`.
 
 Read-only research deliverable. No implementation code was modified. Source clones are
 local, shallow, and git-ignored (research/README.md); record their commits when citing
@@ -12,8 +17,8 @@ this document.
 | OWASP ASVS | research/owasp-asvs/5.0/ | 82fb2f41cdb623e0b11e4d9a6b97c4306c1d119c | "Appendix C: fix RFC 5248, RFC 7539, FIPS 186-4 label and FIPS 203/204/205 draft links (#3446)". ASVS 5.0.0; older 1.0-4.0 trees present. |
 | OWASP API Security Top 10 | research/owasp-api-security/editions/2023/en/ | 33cea37b2ffde3e2e62f6b5d79a029a22a846633 | "Merge pull request #178 from phoenix766/docs/pt-pt-guid-authorization-note". editions/2019/ is the previous edition; VERSION says 2.7.0 (site tooling, not the edition). |
 
-Current implementation inspected (no changes made): crates/agentbug-engagement/src/lib.rs,
-crates/agentbug-tools/src/lib.rs, crates/agentbug-store/src/lib.rs, docs/report-format.md,
+Current implementation inspected (no changes made): crates/bugfound-engagement/src/lib.rs,
+crates/bugfound-tools/src/lib.rs, crates/bugfound-store/src/lib.rs, docs/report-format.md,
 docs/engagement.md, docs/REMAINING_GAPS.md, eval/score.py.
 
 ## 1. WSTG - what the guide actually says
@@ -51,7 +56,7 @@ latest/4-Web_Application_Security_Testing/00-Introduction_and_Objectives/README.
   Handling, Weak Cryptography, Business Logic, Client-side, API Testing. latest/ adds a
   13th chapter, WebAssembly Testing.
 - Implication: "access points discovered during passive testing become targets" is exactly
-  a coverage-ledger edge; current AgentBug has no task that consumes the asset inventory
+  a coverage-ledger edge; current BugFound has no task that consumes the asset inventory
   to generate follow-up hypotheses.
 
 ### 1.3 Test-case anatomy and controlled tests
@@ -77,7 +82,7 @@ latest/4-Web_Application_Security_Testing/05-Authorization/04-Insecure_Direct_Ob
 - 12-API_Testing/ also contains 02-API_Broken_Object_Level_Authorization.md,
   03-Excessive_Data_Exposure.md, 04-API_Broken_Function_Level_Authorization.md,
   09-Inbound_Webhooks.md, 10-gRPC.md, 99-GraphQL.md - a much richer API taxonomy than
-  AgentBug's single wstg-api task.
+  BugFound's single wstg-api task.
 
 ### 1.4 Bug-bounty guidance
 latest/3-The_OWASP_Testing_Framework/1-Bug_Bounty_Programs.md
@@ -99,7 +104,7 @@ latest/3-The_OWASP_Testing_Framework/1-Bug_Bounty_Programs.md
   PoC; INCREASINGLY POLICIES ON AI-GENERATED OR AI-ASSISTED REPORTS), disclosure timeline,
   reward tiers; publish security.txt (RFC 9116).
 - Implication: scope re-validation and reachability are first-class report fields.
-  AgentBug enforces fail-closed scope per network action (docs/engagement.md Sec 2) but
+  BugFound enforces fail-closed scope per network action (docs/engagement.md Sec 2) but
   does not capture "reachability" or report-eligibility as report concepts (its brief
   parser deliberately discards reward-eligibility lines as NON_ACTIONABLE).
 
@@ -121,7 +126,7 @@ latest/3-The_OWASP_Testing_Framework/2-Human-AI_Collaborative_Testing.md
   triage (a business-logic bug may score below a cosmetic XSS); PROMPT INJECTION via
   application responses ingested into tool reasoning; tool opacity; program policies on
   AI-assisted submissions (disclose, reject, or ban).
-- Implication: AgentBug already echoes this (tool-captured bytes, canary replay,
+- Implication: BugFound already echoes this (tool-captured bytes, canary replay,
   "operator review required", no auto-submit), but has no artifact recording
   AI-suggested vs human-confirmed, no prompt-injection note tied to tool output, and no
   AI-assistance disclosure field in the report.
@@ -156,7 +161,7 @@ latest/5-Reporting/01-Reporting_Structure.md
   Post-Testing), OSSTMM, PTES/PCI, MITRE ATT&CK adversary emulation; Sec Summary says
   Section 3 describes WHEN/WHICH techniques, Appendix G describes HOW.
 - 6-Appendix/D-Fuzzing.md and E-Encoded_Injection.md are companion technique references
-  (AgentBug has no curated corpus - docs/REMAINING_GAPS.md Sec 1).
+  (BugFound has no curated corpus - docs/REMAINING_GAPS.md Sec 1).
 
 ## 2. ASVS 5.0 - level, requirement, and coverage patterns
 
@@ -238,13 +243,13 @@ Crosswalk to WSTG latest/4-Web_Application_Security_Testing/12-API_Testing/ and 
 ASVS V8; API6 -> WSTG 10-BUSL / ASVS V2; API7 -> WSTG 07-Injection 19 / ASVS V4;
 API8 -> WSTG 02 / ASVS V13; API9 -> WSTG 01 / ASVS V13; API10 -> WSTG 12-API 09 / ASVS V4.
 
-## 4. Mapping to AgentBug (five workstreams)
+## 4. Mapping to BugFound (five workstreams)
 
 ### 4.1 Playbook taxonomy
-Current: wstg_playbooks() in crates/agentbug-engagement/src/lib.rs Sec Planner returns NINE
+Current: wstg_playbooks() in crates/bugfound-engagement/src/lib.rs Sec Planner returns NINE
 (id, one-sentence task statement) pairs: wstg-info, wstg-config, wstg-authz, wstg-auth,
 wstg-session, wstg-injection, wstg-business, wstg-api, wstg-client. IDs are custom (wstg-*),
-not real WSTG test IDs. crates/agentbug-tools/src/lib.rs KNOWLEDGE_BASE has TWELVE WSTG
+not real WSTG test IDs. crates/bugfound-tools/src/lib.rs KNOWLEDGE_BASE has TWELVE WSTG
 category rows (WSTG-INFO-01, CONF, IDNT, ATHN, ATHZ, SESS, INPV, ERRH, CRYP, BUSL, CLNT,
 APIT) with keyword lists and CWE hints - the tool's taxonomy is already richer than the
 planner's. knowledge_lookup scores by count of query words contained in
@@ -270,11 +275,11 @@ Recommended taxonomy (data-model guidance, no code copy):
 
 ### 4.2 Hypothesis templates
 Current: the planner calls store.add_hypothesis(id, statement) with the SAME SENTENCE as
-the task statement (agentbug-engagement Sec Planner); Hypothesis has only
-(id, session_id, statement, status='open', created_at) (agentbug-store schema and
+the task statement (bugfound-engagement Sec Planner); Hypothesis has only
+(id, session_id, statement, status='open', created_at) (bugfound-store schema and
 add_hypothesis); no production code calls set_hypothesis_status (only store tests do), so
 all nine hypotheses remain "open" forever. docs/report-format.md Appendix C expects a
-hypothesis list, but the production renderer render_canonical_report (agentbug-tools Sec
+hypothesis list, but the production renderer render_canonical_report (bugfound-tools Sec
 Canonical renderer) emits no hypotheses section.
 
 Recommended structured hypothesis (fields, not implementation):
@@ -328,7 +333,7 @@ Recommended ledger (patterns from ASVS Sec 2 above):
   FORKABLE ledger; a local fork must preserve traceability of IDs.
 
 ### 4.4 Verification criteria
-Current: verify_findings (agentbug-engagement Sec Verifier) is a deterministic replay
+Current: verify_findings (bugfound-engagement Sec Verifier) is a deterministic replay
 oracle: requires tool capture, SHA-256 digest check, response containing the tool's own
 canary, and a 2xx status; rejects self-graded <html echoes and findings whose
 title/description claim forbidden techniques under ROE; LLM-supplied response is advisory
@@ -352,21 +357,21 @@ Recommended per-hypothesis verification criteria (declare the oracle in the hypo
 - NEGATIVE-CONTROL / N/A ORACLE: record why a test could not be executed (ROE, no
   credentials, no third-party API) rather than silently skipping.
 - Keep HUMAN ACCOUNTABILITY explicit (WSTG Sec 3.2): verifier result = machine verdict,
-  report status = candidate -> verified -> operator-confirmed; never auto-promote.
+  report status = candidate -> verified -> operator-confirmed; do not auto-promote.
 - Reflect ASVS: L1 technical checks may be automatable, but L2/L3 and business logic /
   access control need documentation/source-led hybrid verification; "testable using
   automation != running an off the shelf tool". Generic http_fuzz output alone must not
   satisfy a requirement.
 
 ### 4.5 Report quality
-Current canonical renderer (agentbug-tools Sec render_canonical_report) emits:
+Current canonical renderer (bugfound-tools Sec render_canonical_report) emits:
 "<engagement> - Security Assessment Report"; Executive Summary (program + counts + one
 paragraph); Scope & ROE; Methodology (one fixed paragraph); Findings (### F-001, fields
 ID/Severity/CVSS/Vector/CWE/Asset/Verified/Evidence SHA-256, description, Steps,
 "Proof of Concept" = "Evidence bytes pinned by SHA-256", Impact, Remediation); Coverage
 (list); Timeline; Appendices A Evidence Integrity, B References.
 
-docs/report-format.md (authoritative template, checked by eval/score.py Sec
+docs/report-format.md (reference template, checked by eval/score.py Sec
 REQUIRED_SECTIONS) requires more: severity count table, per-finding OWASP field and CWE
 name, Status (candidate/verified/operator-confirmed), PoC as a redacted view of
 tool-captured bytes with canary, an Evidence block (SHA-256, artifact path, capture
@@ -400,7 +405,7 @@ Concrete gaps and fixes:
 8. AI ASSISTANCE DISCLOSURE - WSTG Sec 3.2 and bug-bounty Sec Designing a Program require
    checking program policy; add a report field stating AI-assisted testing was used and
    that a human reviewer must confirm before submission. Keep "local report only, no
-   auto-submit" guarantee.
+   auto-submit" design constraint.
 
 ## 5. Gap inventory of the current 9-playbook implementation
 

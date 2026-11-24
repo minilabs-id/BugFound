@@ -1,15 +1,16 @@
-# AgentBug Standard Report Format
+# BugFound Standard Report Format
 
-Every engagement report conforms to this canonical template. The local report is a
-draft for human review — AgentBug never submits it (see `docs/engagement.md`).
+Each engagement report uses this template. It is a local draft for human review; there
+is no submission path in `crates/`. Verify current behavior with the commands in
+`docs/PRODUCTION_PLAN.md` §2.
 
 ## Template
 
-Copy this template verbatim; keep the section order and headings. Replace bracketed
-placeholders. The heading names matter: `eval/score.py` checks for them.
+Keep the section order and headings; `eval/score.py` checks for them. Replace bracketed
+placeholders.
 
 ~~~markdown
-# AgentBug Engagement Report
+# BugFound Engagement Report
 
 - Engagement ID: <id>
 - Program URL: <program-url>
@@ -39,7 +40,7 @@ deterministic verifier and operator review confirm them.>
 - Excluded targets: <out-of-scope assets>
 - ROE source: <program URL / imported brief>, snapshot <brief_snapshot_id>
 - ROE constraints honored: <rate limits, prohibited techniques, timing windows>
-- Fail-closed decisions: <targets refused because scope/ROE was absent or ambiguous>
+- ROE-stop decisions: <targets refused because scope/ROE was absent or ambiguous>
 
 ## Methodology
 
@@ -60,8 +61,8 @@ gated or not used. Reference the playbooks/hypotheses where relevant.>
 - CVSS note: <present only when the vector is unscorable; model severity is then a candidate, not a score>
 
 The canonical renderer also emits `### C. Platform Field Checklist`, a local review aid
-whose platform hint is derived from the program URL. It contains no submission mechanism
-and never replaces verification against the current program brief.
+whose platform hint is derived from the program URL. It has no submission mechanism and
+does not replace verification against the current program brief.
 - OWASP: <A0X — Category>
 - Affected asset: <host / endpoint / parameter>
 - Status: <candidate | verified | operator-confirmed>
@@ -74,14 +75,13 @@ and never replaces verification against the current program brief.
 
 **Proof of concept**
 
-`<redacted view of the tool-captured request/payload; the authoritative bytes are
-the stored ToolCapture.request_bytes / response_bytes artifact referenced below>`
+`<redacted view of the tool-captured request/payload; the stored bytes are
+ToolCapture.request_bytes / response_bytes in the artifact referenced below>`
 
-The PoC is derived from the bytes captured by the tool that performed the
-request, not from a string supplied by the model. Include the canary marker used
-by the deterministic verifier in the evidence section, redacted if it is a
-secret. `validate_poc` is a helper tool, not an authoritative acceptance gate:
-acceptance requires the verifier replaying stored bytes and operator review.
+The PoC is derived from bytes captured by the tool that performed the request, not from
+a string supplied by the model. Include the canary marker used by the deterministic
+verifier in the evidence section, redacted if it is a secret. `validate_finding` is a
+local contract pre-flight with no store lookup; it does not set a verdict.
 
 **Impact**
 
@@ -133,12 +133,12 @@ acceptance requires the verifier replaying stored bytes and operator review.
 
 ### Appendix E — Reproduction command
 
-`agentbug engage --url <program-url> --cwd <engagement-dir>`
+`bugfound engage --url <program-url> --cwd <engagement-dir>`
 ~~~
 
 ## Finding field contract
 
-Each `### F-...` block **must** contain all of the following. `score.py` flags missing
+Each `### F-...` block must contain all of the following. `score.py` flags missing
 fields:
 
 | Field | Rule |
@@ -150,7 +150,7 @@ fields:
 | PoC | Minimal reproducible payload/request shown in the report, derived from tool-captured bytes (not an LLM-supplied string). |
 | Impact | Concrete security consequence, not a generic claim. |
 | Remediation | Actionable fix plus a re-test step. |
-| Evidence hash | SHA-256 over the raw captured request/response bytes (`attach_capture` / `get_capture`), stored as a separate artifact; report the redacted view. Redaction must never alter the meaning of the proof. |
+| Evidence hash | SHA-256 over the raw captured request/response bytes (`attach_capture` / `get_capture`), stored as a separate artifact; report the redacted view. Redaction preserves the meaning of the proof. |
 
 ## CVSS v3.1 severity bands (FIRST)
 
@@ -163,13 +163,13 @@ fields:
 | Critical | 9.0 – 10.0 |
 
 Source: FIRST — Common Vulnerability Scoring System v3.1 specification. The severity
-label in a finding must agree with the base score computed from its vector.
+label in a finding should agree with the base score computed from its vector.
 
 ## CWE / OWASP mapping guidance
 
-Use CWE for the technical weakness and OWASP Top 10 (2021) for the risk category.
-Pick the **most specific** CWE that fits the root cause; if several apply, list the
-primary CWE in the `CWE:` field and secondary ones in impact/remediation.
+Use CWE for the technical weakness and OWASP Top 10 (2021) for the risk category. Pick
+the most specific CWE that fits the root cause; if several apply, list the primary CWE
+in the `CWE:` field and secondary ones in impact/remediation.
 
 | Common class | Primary CWE | OWASP Top 10 2021 |
 | --- | --- | --- |

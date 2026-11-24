@@ -1,8 +1,10 @@
-# Remaining Gaps Fix Plan (B1–B14 + eval maturity)
+# Rencana Perbaikan Gap Tersisa (B1–B14)
 
-Status: **selesai — 6 workstream paralel, 212 tes hijau**
+Dokumen ini mencatat kontrak lintas crate dan kriteria untuk pass B1–B14.
+Untuk kondisi kode saat ini, jalankan perintah di `docs/PRODUCTION_PLAN.md` §2
+dan baca hasilnya dari output tersebut.
 
-## Contract lintas crate
+## Kontrak lintas crate
 
 STORE:
 - `attach_capture(finding_id, request:&[u8], response:&[u8], canary:&str) -> Result<()>`
@@ -44,4 +46,7 @@ DOCS/EVAL:
 - golden + satu hasil nyata, e2e cek isi, mismatch dibersihkan.
 
 ## Kriteria
-fmt/clippy/test/build hijau; tes untuk tiap B; canary tidak bisa dipalsukan; pause/resume tidak re-abort; evaluator bisa menghitung metrik dari replay.
+
+Setiap item B memiliki tes yang menyertai; canary tidak dapat dipalsukan;
+pause/resume tidak menyebabkan re-abort; evaluator dapat menghitung metrik
+dari replay. Verifikasi dengan perintah di `docs/PRODUCTION_PLAN.md` §2.

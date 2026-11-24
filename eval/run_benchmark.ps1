@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-    AgentBug benchmark driver for Windows (no WSL). DRY RUN BY DEFAULT.
+    BugFound benchmark driver for Windows (no WSL). DRY RUN BY DEFAULT.
 
 .DESCRIPTION
     Loops over the targets in targets.yml (or targets.example.yml), runs
-    `agentbug.exe engage ...` for each local target, and saves the report, log,
+    `bugfound.exe engage ...` for each local target, and saves the report, log,
     ground-truth manifest, trace export, joined replay JSONL and the scorer's
     recorded score under eval/results/<id>/. The engagement replay
     (workspace/replay-<id>.jsonl) is fed to `score.py --replay` after being
@@ -17,7 +17,7 @@
 .EXAMPLE
     pwsh eval/run_benchmark.ps1
     pwsh eval/run_benchmark.ps1 -Execute
-    pwsh eval/run_benchmark.ps1 -Execute -AllowRemote -Agentbug C:\path\agentbug.exe
+    pwsh eval/run_benchmark.ps1 -Execute -AllowRemote -Bugfound C:\path\bugfound.exe
 #>
 [CmdletBinding()]
 param(
@@ -25,7 +25,7 @@ param(
     [switch]$AllowRemote,
     [string]$Targets,
     [string]$Results,
-    [string]$Agentbug = 'agentbug.exe',
+    [string]$Bugfound = 'bugfound.exe',
     [switch]$Help
 )
 
@@ -37,7 +37,7 @@ Options:
   -Execute            Actually run engagements (default: dry run only).
   -Targets FILE       Target inventory (default: eval/targets.yml, then example).
   -Results DIR        Output directory (default: eval/results).
-  -Agentbug BIN       AgentBug executable (default: agentbug.exe on PATH).
+  -Bugfound BIN       BugFound executable (default: bugfound.exe on PATH).
   -AllowRemote        Permit non-loopback/non-private URLs (isolated lab only).
   -Help               Show this help.
 
@@ -151,7 +151,7 @@ foreach ($target in $inventory) {
     }
 
     $arguments = @('engage', '--url', $url, '--cwd', $workDir, '--db', $dbPath)
-    Write-Host "[$id] $Agentbug $($arguments -join ' ')"
+    Write-Host "[$id] $Bugfound $($arguments -join ' ')"
     Write-Host "        report -> $report | replay -> $replay | log -> $log"
     if (-not $Execute) {
         Write-Host "        export -> python $exporter <engagement.db> <trace.jsonl>"
@@ -166,7 +166,7 @@ foreach ($target in $inventory) {
     $manifest = [ordered]@{ project = $id; expected_vulns = $vulns }
     $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
 
-    & $Agentbug @arguments 2>&1 | Tee-Object -FilePath $log
+    & $Bugfound @arguments 2>&1 | Tee-Object -FilePath $log
     $nativeExit = $LASTEXITCODE
     $status = 'ok'
     if ($nativeExit -ne 0) {

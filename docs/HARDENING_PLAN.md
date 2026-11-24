@@ -1,19 +1,20 @@
-# AgentBug — Hardening & Truthfulness Plan
+# BugFound — Rencana Hardening & Truthfulness
 
 Tanggal: 2026-11-19
 Sumber: audit independen `HARNESS AUDIT` (temuan A1–A9, B1–B5)
-Status: **A1–A9 / B1–B5 ditutup oleh 4 workstream paralel; B1–B14
-(remaining-gap pass) menyusul. Suite saat ini 180+ tes — angka pasti dan hijau/
-tidaknya harus dibaca dari `cargo test --workspace` (lihat
-`PRODUCTION_PLAN.md` §4), bukan dari status dokumen ini.**
+
+Dokumen ini adalah rencana kerja yang ditulis dari audit 2026-11-19. B1–B14
+adalah pass lanjutan yang dicatat terpisah di `docs/B1_B14_FIX_PLAN.md`.
+Untuk kondisi kode saat ini, jalankan perintah di `docs/PRODUCTION_PLAN.md` §2
+dan baca angka serta hasilnya dari output tersebut — bukan dari dokumen ini.
 
 ---
 
 ## 0. Tujuan
 
-Membuat klaim AgentBug sesuai dengan kode yang benar-benar jalan, dan mengubah
-harness dari "scripted 9-step LLM loop" menjadi agent yang **aman, terverifikasi,
-dan bisa diukur**.
+Membuat klaim BugFound sesuai dengan kode yang benar-benar jalan, dan mengubah
+harness dari "scripted 9-step LLM loop" menjadi agent yang aman, terverifikasi,
+dan bisa diukur.
 
 > **ID note:** B1–B5 in this 2026-11-19 audit are the original follow-ups to
 > H-10…H-14. The newer `docs/B1_B14_FIX_PLAN.md` reuses the "B" prefix for a
@@ -35,9 +36,9 @@ Urutan prioritas (dari audit): **A2 → A3 → A7 → A1 → A4/A5 → A8 → A6
 ## 1. Phase 0 — Safety & config truth (3–5 hari)
 
 ### H-01 — A2: Jalur otonom hormati operator & batasi tool berisiko
-**File:** `crates/agentbug-engagement/src/lib.rs`, `crates/agentbug-cli/src/main.rs`,
-`crates/agentbug-desktop/src/main.rs`, `crates/agentbug-policy/src/lib.rs`,
-`crates/agentbug-tools/src/lib.rs`.
+**File:** `crates/bugfound-engagement/src/lib.rs`, `crates/bugfound-cli/src/main.rs`,
+`crates/bugfound-desktop/src/main.rs`, `crates/bugfound-policy/src/lib.rs`,
+`crates/bugfound-tools/src/lib.rs`.
 
 Aksi:
 - Perkenalkan `EngagementOptions { mode, budgets, max_rps, max_requests, max_estimated_tokens, allow_network_write, allow_intrusive }`, dikirim dari CLI/desktop ke `engage()`.
@@ -53,7 +54,7 @@ Kriteria penerimaan:
 - Tes: `engagement_options_are_honoured`, `fuzz_wordlist_cap_enforced`.
 
 ### H-02 — A7: ROE sebagai typed policy, fail-closed
-**File:** `crates/agentbug-engagement/src/lib.rs`, `crates/agentbug-tools/src/lib.rs`.
+**File:** `crates/bugfound-engagement/src/lib.rs`, `crates/bugfound-tools/src/lib.rs`.
 
 Aksi:
 - `RoePolicy { ua_marker, max_rps, max_requests, allow_fuzzing, allow_state_change, allow_disclosure }`.
@@ -68,7 +69,7 @@ Kriteria penerimaan:
 - Tes regresi: `roe_overrides` dipanggil lewat jalur produksi, bukan hanya langsung di test.
 
 ### H-03 — A1: Wire atau hapus modul core parity
-**File:** `crates/agentbug-core/src/*.rs`, `crates/agentbug-engagement/src/lib.rs`, docs.
+**File:** `crates/bugfound-core/src/*.rs`, `crates/bugfound-engagement/src/lib.rs`, docs.
 
 Aksi (pilih satu, rekomendasi: **wire minimal**):
 - `EventBus` dipakai engagement untuk event; `Inbox` untuk item kontrol; `ExecutionCoordinator.interrupt()` dipanggil `pause/abort` dan dicek tiap step; `CompactionV2` menggantikan inline compaction; `AgentError` mengklasifikasikan outcome.
@@ -86,13 +87,13 @@ Kriteria penerimaan:
 ## 2. Phase 1 — Verifier & evidence (4–6 hari)
 
 ### H-04 — A3: Verifier dengan oracle independen
-**File:** `crates/agentbug-engagement/src/lib.rs`, `crates/agentbug-tools/src/lib.rs`, `crates/agentbug-core/src/lib.rs`, `crates/agentbug-store/src/lib.rs`.
+**File:** `crates/bugfound-engagement/src/lib.rs`, `crates/bugfound-tools/src/lib.rs`, `crates/bugfound-core/src/lib.rs`, `crates/bugfound-store/src/lib.rs`.
 
 Aksi:
 - Saat finding dibuat, simpan request/response **mentah** + nonce/canary ke `evidence`.
 - `validate_poc` wajib punya `finding_id`; verifier replay bytes tersimpan, bukan argumen LLM.
-- Oracle: canary unguessable disuntikkan sebagai header `X-AgentBug-Canary` ke request nyata oleh `HttpRequestTool`, lalu verifier mensyaratkan token itu direfleksikan oleh target di `response_bytes` tool (status 2xx). Bukan `expected_status`/`marker` dari model. Token dibersihkan dari output yang terlihat model. Lihat `docs/adr/ADR-008-verification-oracle.md`.
-- Status finding: `candidate` → `verified`; hanya `verified` masuk laporan.
+- Oracle: canary unguessable disuntikkan sebagai header `X-BugFound-Canary` ke request nyata oleh `HttpRequestTool`, lalu verifier mensyaratkan token itu direfleksikan oleh target di `response_bytes` tool (status 2xx). Bukan `expected_status`/`marker` dari model. Token dibersihkan dari output yang terlihat model. Lihat `docs/adr/ADR-008-verification-oracle.md`.
+- Status finding: `candidate` → `validated`; hanya finding yang dikonfirmasi `verify_candidate` yang masuk laporan.
 
 Kriteria penerimaan:
 - Finding buatan dengan marker `<html` tidak lolos verifikasi.
@@ -101,7 +102,7 @@ Kriteria penerimaan:
   `non_reflecting_capture_is_rejected` (2xx tanpa refleksi tetap `candidate`).
 
 ### H-05 — A5: SHA-256 evidence nyata
-**File:** `crates/agentbug-store/src/lib.rs`, `crates/agentbug-engagement/src/lib.rs`.
+**File:** `crates/bugfound-store/src/lib.rs`, `crates/bugfound-engagement/src/lib.rs`.
 
 Aksi:
 - Ganti `DefaultHasher` dengan `Sha256::digest(request || response || artifact)`.
@@ -117,7 +118,7 @@ Kriteria penerimaan:
 ## 3. Phase 2 — Report & evaluation (4–6 hari)
 
 ### H-06 — A4: Satu renderer kanonik
-**File:** `crates/agentbug-engagement/src/lib.rs`, `crates/agentbug-tools/src/lib.rs`, `eval/score.py`.
+**File:** `crates/bugfound-engagement/src/lib.rs`, `crates/bugfound-tools/src/lib.rs`, `eval/score.py`.
 
 Aksi:
 - Hapus duplicate renderer di engagement; panggil renderer kanonik dari tools.
@@ -125,10 +126,10 @@ Aksi:
 - Tes: jalankan logika `score.py` terhadap laporan hasil generate.
 
 Kriteria penerimaan:
-- `score.py --strict` lolos untuk laporan produksi.
+- `score.py --strict` dijalankan terhadap laporan produksi.
 
 ### H-07 — A6: Evaluasi yang bisa menggagalkan klaim
-**File:** `eval/**`, `crates/agentbug-engagement/src/lib.rs`.
+**File:** `eval/**`, `crates/bugfound-engagement/src/lib.rs`.
 
 Aksi:
 - Scorer join laporan ke ground-truth manifest: recall, precision, FPR, reproducibility, branch coverage, token/finding.
@@ -145,7 +146,7 @@ Kriteria penerimaan:
 ## 4. Phase 3 — Planner, guard, correctnes (4–6 hari)
 
 ### H-08 — A8: Planner adaptif & guard durable
-**File:** `crates/agentbug-engagement/src/lib.rs`, `crates/agentbug-core/src/lib.rs`, `crates/agentbug-store/src/lib.rs`, `crates/agentbug-tools/src/lib.rs`.
+**File:** `crates/bugfound-engagement/src/lib.rs`, `crates/bugfound-core/src/lib.rs`, `crates/bugfound-store/src/lib.rs`, `crates/bugfound-tools/src/lib.rs`.
 
 Aksi:
 - Hipotesis first-class: status, score, update dari clue/finding.
@@ -161,17 +162,17 @@ Kriteria penerimaan:
 - Tes: `adaptive_reorder`, `durable_duplicate_guard`.
 
 ### H-09 — A9: Token/cost dari API usage
-**File:** `crates/agentbug-llm/src/lib.rs`, `crates/agentbug-core/src/lib.rs`, `crates/agentbug-store/src/lib.rs`.
+**File:** `crates/bugfound-llm/src/lib.rs`, `crates/bugfound-core/src/lib.rs`, `crates/bugfound-store/src/lib.rs`.
 
 Aksi:
 - `ChatResponse` simpan `usage.prompt_tokens` / `completion_tokens`.
 - Budget & cost pakai angka API, bukan `len/4`.
 
 Kriteria penerimaan:
-- `agentbug tokens` sama dengan_usage respons mock.
+- `bugfound tokens` sama dengan_usage respons mock.
 
 ### H-10 — B1: Satu DB path untuk kontrol
-**File:** `crates/agentbug-engagement/src/lib.rs`, `crates/agentbug-cli/src/main.rs`, `crates/agentbug-desktop/src/main.rs`.
+**File:** `crates/bugfound-engagement/src/lib.rs`, `crates/bugfound-cli/src/main.rs`, `crates/bugfound-desktop/src/main.rs`.
 
 Aksi:
 - Thread `db_path` eksplisit ke semua `status/pause/resume/abort`.
@@ -181,7 +182,7 @@ Kriteria penerimaan:
 - `engage --db live.db` lalu `engagement --pause --db live.db` benar-benar pause (bukan DB default).
 
 ### H-11 — B2: Fail-closed brief
-**File:** `crates/agentbug-engagement/src/lib.rs`.
+**File:** `crates/bugfound-engagement/src/lib.rs`.
 
 Aksi:
 - Tolak non-2xx dan halaman login; minta konfirmasi operator untuk scope hasil ekstraksi sebelum eksekusi.
@@ -201,7 +202,7 @@ Kriteria penerimaan:
 
 ### H-13 — B4: Dokumen satu kebenaran
 - `PRODUCTION_PLAN.md`, `threat-model.md`, `architecture.md`, `README.md` diselaraskan.
-- Ganti tabel "done" dengan evidence matrix: fitur → call site → tes.
+- Ganti tabel status dengan evidence matrix: fitur → call site → tes.
 
 ### H-14 — B5: Release hygiene
 - Tambah `LICENSE` (MIT), pin toolchain sesuai CI, `.gitignore` `eval/work/`, E2E test: server brief lokal → `engage()` → report → `score.py`.
@@ -212,26 +213,22 @@ Kriteria penerimaan:
 
 | WS | Ownership | Task |
 | --- | --- | --- |
-| WS1 | `agentbug-core/**` | H-03, H-08 (guard), H-09 |
-| WS2 | `agentbug-engagement/**` | H-01, H-02, H-04, H-06, H-10, H-11 |
-| WS3 | `agentbug-tools/**`, `agentbug-store/**` | H-04/H-05 evidence, H-12, H-06 renderer |
+| WS1 | `bugfound-core/**` | H-03, H-08 (guard), H-09 |
+| WS2 | `bugfound-engagement/**` | H-01, H-02, H-04, H-06, H-10, H-11 |
+| WS3 | `bugfound-tools/**`, `bugfound-store/**` | H-04/H-05 evidence, H-12, H-06 renderer |
 | WS4 | `eval/**`, `docs/**`, `README.md`, `.gitignore`, `LICENSE`, `.github/**` | H-07, H-13, H-14 |
 
-Aturan: WS tidak boleh mengubah file di luar ownership. Integrasi dilakukan setelah keempatnya selesai.
+Aturan: WS tidak boleh mengubah file di luar ownership. Integrasi dilakukan setelah keempat workstream menyampaikan hasilnya.
 
 ---
 
-## 7. Exit criteria
+## 7. Kriteria keluar
 
-- Semua task H-01…H-14 selesai dengan tes yang menyertai.
-- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-  `cargo test --workspace`, `cargo build --release --workspace` hijau (jangan
-  meng-copy jumlah tes dari dokumen mana pun; baca output aktual).
-- Tidak ada temuan A1–A9, B1–B5 (audit lama) yang masih open.
-- B1–B14 dari `docs/B1_B14_FIX_PLAN.md` terverifikasi (lihat
-  `docs/REMAINING_GAPS.md` §2).
-- Laporan produksi lolos `eval/score.py --strict`; `eval/e2e_test.ps1` memeriksa
-  bagian laporan dan menjalankan scorer dengan `--strict`.
+- Task H-01…H-14 memiliki tes yang menyertai.
+- Jalankan perintah di `docs/PRODUCTION_PLAN.md` §2 dan catat output dari run tersebut.
+- Periksa kembali temuan A1–A9, B1–B5 (audit lama) terhadap kode saat ini.
+- B1–B14 dirujuk di `docs/B1_B14_FIX_PLAN.md` dan `docs/REMAINING_GAPS.md` §2; verifikasi dengan perintah di `docs/PRODUCTION_PLAN.md` §2.
+- Laporan produksi dinilai dengan `eval/score.py --strict`; `eval/e2e_test.ps1` memeriksa bagian laporan dan menjalankan scorer dengan `--strict`.
 - Pause/Abort teruji menghentikan step dalam ≤1 langkah.
 - Dokumen tidak punya klaim tanpa call site.
 

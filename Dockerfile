@@ -17,7 +17,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN cargo build --release --locked -p agentbug-cli
+RUN cargo build --release --locked -p bugfound-cli
 
 # ---------- runtime ----------
 FROM debian:bookworm-slim AS runtime
@@ -26,17 +26,17 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system agentbug \
-    && useradd --system --gid agentbug --home-dir /home/agentbug --create-home agentbug \
+    && groupadd --system bugfound \
+    && useradd --system --gid bugfound --home-dir /home/bugfound --create-home bugfound \
     && mkdir -p /work \
-    && chown agentbug:agentbug /work
+    && chown bugfound:bugfound /work
 
-COPY --from=builder /build/target/release/agentbug /usr/local/bin/agentbug
+COPY --from=builder /build/target/release/bugfound /usr/local/bin/bugfound
 
 # No credentials are baked into the image: the API key is read from the
-# environment at runtime (llm.api_key = "env:OPENAI_API_KEY" in agentbug.toml).
+# environment at runtime (llm.api_key = "env:OPENAI_API_KEY" in bugfound.toml).
 ENV RUST_LOG=info
 WORKDIR /work
-USER agentbug
+USER bugfound
 
-ENTRYPOINT ["agentbug"]
+ENTRYPOINT ["bugfound"]

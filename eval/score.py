@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AgentBug evaluation scorer — standard library only.
+"""BugFound evaluation scorer — standard library only.
 
 Scores canonical Markdown engagement reports and, when ground truth and replay
 data are supplied, computes detection and reproducibility metrics. This is

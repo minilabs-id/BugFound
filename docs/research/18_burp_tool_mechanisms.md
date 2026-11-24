@@ -1,8 +1,13 @@
-# 18 — Burp Suite tool mechanisms, reconstructed from authoritative sources
+# 18 — Burp Suite tool mechanisms, reconstructed from local reference sources
+
+> **About these notes.** These are point-in-time analyses of third-party reference
+> projects, kept for design input. They describe the reference projects at the
+> snapshots examined and are not claims about the current BugFound code; verify
+> current behavior in `crates/`.
 
 Status: research artifact for the next tool-layer build phase. No benchmark claim.
 Sources are local research clones under `/research/` (git-ignored; never part of
-AgentBug source):
+BugFound source):
 
 - `research/burp-extender-api` — PortSwigger's published Extender API (42 Java
   interfaces). Licence: Burp Suite Professional Licence Agreement. We study the
@@ -144,7 +149,7 @@ Prefix reads (`getSiteMap`, `getScanIssues`) use literal case-sensitive text
 match (`IBurpExtenderCallbacks.java:854-858,:868-872`). Scope changes notify
 `IScopeChangeListener.scopeChanged()` (`IScopeChangeListener.java:24`).
 Out-of-scope active scans ask the user (`IBurpExtenderCallbacks.java:641-643`)
-— in AgentBug this becomes the deterministic fail-closed policy gate, never an
+— in BugFound this becomes the deterministic fail-closed policy gate, not an
 LLM/auto-approval decision.
 
 ## 7. Collaborator (OOB)
@@ -171,7 +176,7 @@ none, URL-encoded, multipart, XML, JSON, AMF, unknown. Parameter types
 JSON, with byte offsets (`:76-103`). Cookies (`ICookie.java:30-60`): domain/path
 may be null, expiry null for session cookies.
 
-## 9. Privilege map for the AgentBug port
+## 9. Privilege map for the BugFound port
 
 | Local (no egress) | Outbound | External OOB |
 |---|---|---|
@@ -180,7 +185,7 @@ may be null, expiry null for session cookies.
 GUI-bound and intentionally dropped: interception UI, rehook user prompts,
 context menus, message-editor tabs, suite tabs, `sendTo*` handoffs, `issueAlert`.
 
-## 10. Planned AgentBug tool slice (first implementation phase)
+## 10. Planned BugFound tool slice (first implementation phase)
 
 1. `http_request` — Repeater-equivalent: method, url, headers, body, cookies,
    redirect policy; emits full raw request/response bytes into the existing
@@ -195,17 +200,17 @@ context menus, message-editor tabs, suite tabs, `sendTo*` handoffs, `issueAlert`
 5. Deferred: Collaborator/OOB, Sequencer, live intercepting proxy, spider.
 
 Outcome on any ack-gated path stays `incomplete`; no auto-submit, no new
-`chat_full` call site in core, no domain vocabulary in `agentbug-core/src`.
+`chat_full` call site in core, no domain vocabulary in `bugfound-core/src`.
 
 ## 11 — Cross-check with OWASP ZAP (Apache 2.0 source)
 
-Authoritative in-tree evidence from `research/zaproxy` (sparse clone:
+In-tree evidence from `research/zaproxy` (sparse clone:
 `extension/ascan/**`, `parosproxy/paros/network/**`, `extension/httppanel/**`).
 The ZAP core engine classes (`Scanner`, `HostProcess`, `Plugin`, `Variant*`,
 `Alert`) are **not** in the sparse clone; claims about them are marked
 out-of-tree.
 
-### 11.1 Active-scan gate (the analogue of AgentBug's ROE gate)
+### 11.1 Active-scan gate (the analogue of BugFound's ROE gate)
 
 `ExtensionActiveScan.java:302-327`: `Control.getSingleton().getMode()` —
 `safe` → `InvalidParameterException("Scans are not allowed in Safe mode")`;
@@ -215,10 +220,10 @@ out-of-tree.
 (`ExtensionActiveScan.java:619-628`), as does `destroy()` (`:631-637`).
 Attack mode in a UI prompts with `showYesNoRememberDialog` and remembers the
 answer (`AttackModeScanner.java:150-193`) — the closest ZAP equivalent to
-AgentBug's hash-scoped operator acknowledgement (`ENG:756-822`).
+BugFound's hash-scoped operator acknowledgement (`ENG:756-822`).
 
 Lesson: the "may I attack?" decision is a **mode/scope gate outside the tool**,
-never a property of the tool itself. AgentBug already matches this with
+never a property of the tool itself. BugFound already matches this with
 `engagement build_tools` withholding (`ENG:3415-3438`) and `ToolOptions`.
 
 ### 11.2 Insertion points (`VariantFactory`)
@@ -247,7 +252,7 @@ form-urlencoded (`:898-906`); `getCookieParams()` merges request `Cookie` and
 response `Set-Cookie`/`Set-Cookie2` (`:935-946`). Writers rebuild the raw message:
 `HttpRequestHeader.setGetParams` (`:684-733`), `setCookieParams` (`:765-793`).
 
-Lesson: insertions are **byte-offset aware and location-typed**. AgentBug's
+Lesson: insertions are **byte-offset aware and location-typed**. BugFound's
 `HttpFuzzTool` only rewrites URL query/markers (`TOOLS:3933-3964`); an
 `enumerate_insertion_points` tool is the missing bridge from recon to fuzz.
 
@@ -258,12 +263,12 @@ Lesson: insertions are **byte-offset aware and location-typed**. AgentBug's
 (`:38-120`) uses INCLUDE/EXCLUDE collections with a matcher; empty data means
 `NOT_FILTERED` (`:82-84`). `FilterCriteria` documents **INCLUDE evaluated before
 EXCLUDE; include wins on conflict** (`FilterCriteria.java:22-36`) — the same
-specificity principle AgentBug now applies in `scope_target_allowed`.
+specificity principle BugFound now applies in `scope_target_allowed`.
 `FilterResult` carries a human-readable `reason` (`FilterResult.java:30-59`),
 and `ActiveScan.filteredMessage` records URI + reason (`ActiveScan.java:258-260`)
 as the audit trail.
 
-Lesson: every skip must produce a **reason string**, not a silent drop. AgentBug
+Lesson: every skip must produce a **reason string**, not a silent drop. BugFound
 already does this with `denial_result` (`TOOLS:948-964`) and audit Action events
 (`ENG:1038-1063`).
 
@@ -285,16 +290,16 @@ mode stops all scans. Concurrency is bounded — `ActiveScanController` uses a
 `ReentrantLock` + map for parallel scans (`:58-96`), attack mode caps
 `scannerCount = 4` (`AttackModeScanner.java:259-260,290-324`).
 
-Lesson: AgentBug's `request_stop` + `wait_while_paused` already match this; no
+Lesson: BugFound's `request_stop` + `wait_while_paused` already match this; no
 new cancellation primitive is needed.
 
-### 11.5 What AgentBug already has (do not rebuild)
+### 11.5 What BugFound already has (do not rebuild)
 
 - `HttpRequestTool` (`TOOLS:1053-1275`): scheme allowlist, method gate, proxy
   validation, scope/host validation, DNS pin, transmitted canary scrubbed from
   model-visible output, rate limit, timeout/body caps, `none` redirect policy,
-  authoritative `capture` in `structured`. This is stronger than ZAP's
-  `evidence` string + `HistoryReference`: AgentBug binds SHA-256 of raw bytes.
+  `capture` in `structured`. This differs from ZAP's
+  `evidence` string + `HistoryReference`: BugFound binds SHA-256 of raw bytes.
 - `HttpFuzzTool` (`TOOLS:3929-4088`): marker/param substitution with hard caps
   `MAX_FUZZ_WORDLIST = 200`, `MAX_FUZZ_REQUESTS = 200` (`TOOLS:24-28`),
   GET/HEAD/POST only (`:4003-4005`).

@@ -1,11 +1,16 @@
 # 02 — PentAGI Source Analysis (patterns only; no code copy)
 
-**Reference:** `D:\Github\Agent Bug Bounty\research\pentagi`
+> **About these notes.** These are point-in-time analyses of third-party reference
+> projects, kept for design input. They describe the reference projects at the
+> snapshots examined and are not claims about the current BugFound code; verify
+> current behavior in `crates/`.
+
+**Reference:** `D:\Github\BugFound\research\pentagi`
 **Commit:** `cffed9485aa1cca70762cd08a57ac62a80406258` (branch `main`, clean tree)
 **Language/stack:** Go backend (`backend/pkg/...`), TypeScript/React frontend, PostgreSQL + pgvector, Docker, Graphiti, Langfuse/OpenTelemetry.
-**Evidence convention:** `ROOT` = `D:\Github\Agent Bug Bounty\research\pentagi`. All paths below are absolute with `ROOT` as the base; `:N` is a 1‑based source line verified against the commit above. Documentation (`backend/docs/flow_execution.md`) was used only as a map; every claim below is backed by the cited source (or explicitly marked as doc‑only).
+**Evidence convention:** `ROOT` = `D:\Github\BugFound\research\pentagi`. All paths below are absolute with `ROOT` as the base; `:N` is a 1‑based source line verified against the commit above. Documentation (`backend/docs/flow_execution.md`) was used only as a map; every claim below is backed by the cited source (or explicitly marked as doc‑only).
 
-**Target:** `D:\Github\Agent Bug Bounty\crates\agentbug-*` (Rust: `core`, `engagement`, `llm`, `tools`, `store`, `policy`, `cli`, `desktop`).
+**Target:** `D:\Github\BugFound\crates\bugfound-*` (Rust: `core`, `engagement`, `llm`, `tools`, `store`, `policy`, `cli`, `desktop`).
 
 ---
 
@@ -13,7 +18,7 @@
 
 PentAGI is a *durable-plan-plus-agent-loop* system. A long-lived **Flow** owns ordered **Tasks**; each Task owns LLM-generated, dynamically **refined ordered Subtasks**; each Subtask is executed by a **Primary Agent** whose only legal output is **tool calls**, with specialists reached as *tools* (not as independent concurrent agents). Self-correction is layered and bounded: JSON repair, retry-with-delay, reflector-on-unstructured-output, repeated-call detection, execution-monitor mentor, and hard iteration caps. Memory is split between **pgvector knowledge documents** (reusable) and **Graphiti episodic graphs** (what happened), with provenance on every write. Tool execution is container-isolated with an explicit capability allow-list. Persistence is a rich relational log of chains, tool calls, and per-category logs, mirrored to Langfuse spans and GraphQL subscriptions.
 
-The single most transferable idea for AgentBug is **"plan as durable ordered rows + one bounded tool-call loop per step + explicit barrier tool for completion + layered bounded recovery"**, integrated with AgentBug's existing policy/budget/scope enforcement rather than replacing it. The most dangerous thing to copy is the code and the VXControl dependency/license tangle (see §7).
+The single most transferable idea for BugFound is **"plan as durable ordered rows + one bounded tool-call loop per step + explicit barrier tool for completion + layered bounded recovery"**, integrated with BugFound's existing policy/budget/scope enforcement rather than replacing it. The most dangerous thing to copy is the code and the VXControl dependency/license tangle (see §7).
 
 ---
 
@@ -40,7 +45,7 @@ The single most transferable idea for AgentBug is **"plan as durable ordered row
 
 **Weaknesses:** Status is duplicated across three levels with manual back-propagation (easy to desync — guards exist for stale/deleted rows at `task.go:248-262`, `subtask.go:193-207`); `Chain` is an opaque JSON blob — no schema evolution; replanning is not transactional (explicit TODOs at `subtasks.go:90` and `:146`).
 
-**Adaptation:** Map Flow→engagement, Task→work item/hypothesis, Subtask→session step, Action→AgentBug event/tool record. Keep AgentBug's guarded state transitions (`transition_state_owned`) as the *only* write path; add a `plan_revision` column and atomic "delete-planned + insert-new" in one SQLite transaction. Persist the tool-call record with the `received/running/finished/failed` lifecycle and link it to the existing tamper-evident event hash chain.
+**Adaptation:** Map Flow→engagement, Task→work item/hypothesis, Subtask→session step, Action→BugFound event/tool record. Keep BugFound's guarded state transitions (`transition_state_owned`) as the *only* write path; add a `plan_revision` column and atomic "delete-planned + insert-new" in one SQLite transaction. Persist the tool-call record with the `received/running/finished/failed` lifecycle and link it to the existing tamper-evident event hash chain.
 
 ### 1.2 Lifecycle and scheduling
 
@@ -65,7 +70,7 @@ Scheduler loop `ROOT/backend/pkg/controller/flow.go:1288-1351`: on startup it re
 
 **Strengths:** Ordered durable plan; clean resume semantics; advisory degradation on refiner LLM failure; bounded replanning (`≤15`); explicit human-in-the-loop state; restart recovery.
 **Weaknesses:** Delete-and-recreate invalidates all planned IDs and worker caches (costly, loses identity/provenance); plan order is purely numeric with no explicit dependency edges; no transactional replan; the whole orchestration depends on LLM calls for titles/image/plan/refine/report — latency and cost.
-**Adaptation:** Keep the ordered-plan + refine loop but make it *deterministic-first*: AgentBug already has coverage ledger + hypothesis planner (`README.md:48-53`), so use LLM only to propose deltas and validate them against scope/budget; store plan rows with `seq`, `revision`, `status`, and **reuse IDs** via a SQLite `UPSERT` rather than delete/recreate. Preserve `running→created` reset semantics for crash recovery; preserve "empty plan ⇒ run original request once".
+**Adaptation:** Keep the ordered-plan + refine loop but make it *deterministic-first*: BugFound already has coverage ledger + hypothesis planner (`README.md:48-53`), so use LLM only to propose deltas and validate them against scope/budget; store plan rows with `seq`, `revision`, `status`, and **reuse IDs** via a SQLite `UPSERT` rather than delete/recreate. Preserve `running→created` reset semantics for crash recovery; preserve "empty plan ⇒ run original request once".
 
 ---
 
@@ -106,7 +111,7 @@ Executor factories: `ROOT/backend/pkg/tools/tools.go:811` (assistant), `:997` (p
 
 **Strengths:** Capability-scoped tool sets per role (least privilege by construction); synchronous, structured handoff with typed result objects; lineage tracking; no free-form agent-to-agent chat to get lost.
 **Weaknesses:** Deep synchronous nesting multiplies LLM calls and latency; delegation is prompt-governed (a model can ignore a specialist); adviser doubles as mentor/planner (single point of failure); role boundaries rely on prompt discipline.
-**Adaptation:** Use AgentBug's tool registry to create *role-scoped registries* (a Pentester role sees only recon/exploit-scoped tools, gated again by `agentbug-policy` scope + approval — defense in depth, never prompt-only). Implement handoff as a tool that starts a **child session/step** with a copied-but-redacted context, returns a typed result event, and stamps parent/child IDs in the event chain. Keep it synchronous and bounded.
+**Adaptation:** Use BugFound's tool registry to create *role-scoped registries* (a Pentester role sees only recon/exploit-scoped tools, gated again by `bugfound-policy` scope + approval — defense in depth, not prompt-only). Implement handoff as a tool that starts a **child session/step** with a copied-but-redacted context, returns a typed result event, and stamps parent/child IDs in the event chain. Keep it synchronous and bounded.
 
 ---
 
@@ -132,7 +137,7 @@ Executor factories: `ROOT/backend/pkg/tools/tools.go:811` (assistant), `:997` (p
 **Strengths:** Orthogonal layers (args → call → output → loop → budget); every recovery path is *bounded*; repeated-call response preserves diagnostic information (a thoughtful fix to a real failure mode, documented in `helpers.go:119-125`); state guards avoid pointless retries.
 **Weaknesses:** Complex control flow with two different reflector entry points plus recursion flags — subtle to reason about; "mentor" and "reflector" are LLM calls, so recovery itself can fail or be prompted; consecutive-only repeat detection misses A→B→A cycles; many knobs (limits are split between constants, config, and doc).
 
-**Adaptation:** In `agentbug-core`, implement a small **recovery pipeline** after every tool call: (1) normalize args and detect repeats over a *sliding window* (not just consecutive) and return the prior result verbatim; (2) on `ErrToolArgs`, repair once against the tool's JSON schema with a bounded sub-call; (3) on model output with no tool call, emit a corrective user message with the registered terminal tools, max 2–3 times; (4) at step-budget thresholds, ask the planner/adviser for a progress review or force a terminal decision; (5) always finish with an explicit terminal tool mapped to AgentBug's session state. Reuse existing budgets (`README.md:26-29`) as the hard cap — do not duplicate limits.
+**Adaptation:** In `bugfound-core`, implement a small **recovery pipeline** after every tool call: (1) normalize args and detect repeats over a *sliding window* (not just consecutive) and return the prior result verbatim; (2) on `ErrToolArgs`, repair once against the tool's JSON schema with a bounded sub-call; (3) on model output with no tool call, emit a corrective user message with the registered terminal tools, max 2–3 times; (4) at step-budget thresholds, ask the planner/adviser for a progress review or force a terminal decision; (5) finish with an explicit terminal tool mapped to BugFound's session state. Reuse existing budgets (`README.md:26-29`) as the hard cap — do not duplicate limits.
 
 ---
 
@@ -160,7 +165,7 @@ Serialized message chain per agent type in `msgchains.chain` (`database/models.g
 **Strengths:** Clear separation of reusable knowledge (guide/answer/code) vs episodic history (memory/Graphiti) — the prompt guidance at `flow_execution.md:731-735` reflects a deliberate design decision; strong provenance; anonymization at the storage boundary; parameterized search.
 **Weaknesses:** Embedding provider can be `none` and knowledge store then silently degrades (`knowledge.go:69-72`); Graphiti health failure is sticky for the process (`client.go:48-53`); no explicit memory-invalidation/TTL policy; heavy external service dependency (Graphiti server, embedding API).
 
-**Adaptation:** In `agentbug-store`, add three tiers over SQLite: (1) *working* = existing session messages/events; (2) *episodic* = existing `trace_events`/timeline plus a `tool_result` event carrying `{session_id, task_id, tool_name, status, args_hash, result_excerpt}` — this is the Graphiti pattern without the service; (3) *semantic* = optional embeddings with `doc_type, engagement_id, task_id, source_event_id, part_size, total_size` provenance, filtered by scope before retrieval. Retrieve memory **before** external tools and gate every recalled item through `agentbug-policy` scope checks (prompt-injection resistance). Never import `vxcontrol/graphiti-go-client`.
+**Adaptation:** In `bugfound-store`, add three tiers over SQLite: (1) *working* = existing session messages/events; (2) *episodic* = existing `trace_events`/timeline plus a `tool_result` event carrying `{session_id, task_id, tool_name, status, args_hash, result_excerpt}` — this is the Graphiti pattern without the service; (3) *semantic* = optional embeddings with `doc_type, engagement_id, task_id, source_event_id, part_size, total_size` provenance, filtered by scope before retrieval. Retrieve memory **before** external tools and gate every recalled item through `bugfound-policy` scope checks (prompt-injection resistance). Do not import `vxcontrol/graphiti-go-client`.
 
 ---
 
@@ -179,7 +184,7 @@ Serialized message chain per agent type in `msgchains.chain` (`database/models.g
 
 **Strengths:** Default-deny capabilities; resource bounds (pids, log size, exec timeouts); deterministic per-flow workdir/ports; outbound result caps and summarization; startup verification of the sandbox; cleanup paths.
 **Weaknesses:** `NET_RAW`/`SYS_PTRACE` and optional `NET_ADMIN`/host-network mode are intentionally permissive for pentest fidelity — a hostile model has a large surface; restart-on-failure can resurrect a stopped workload; no `no-new-privileges`; proxy/secret handling depends on the anonymizer; container isolation is heavyweight for a local desktop tool.
-**Adaptation:** Keep the *pattern*, not Docker. AgentBug already has stronger default posture for local use (`README.md:30-35`: workspace confinement, 512KB read cap, 8KB truncation, shell allowlist/no chaining, DNS pinning, private-IP blocking). Add: (a) explicit per-tool timeout with partial-output capture and a model-readable "command timed out, use `timeout`" hint; (b) a `toolcalls`-style lifecycle row with status and duration; (c) a startup self-check that verifies `agentbug-policy` is actually enforcing before `full_auto` runs (analogous to the sandbox probe); (d) bounded output summarization over the existing 8KB truncation. Do not grant container capabilities to AgentBug; the policy layer is the boundary.
+**Adaptation:** Keep the *pattern*, not Docker. BugFound already has stronger default posture for local use (`README.md:30-35`: workspace confinement, 512KB read cap, 8KB truncation, shell allowlist/no chaining, DNS pinning, private-IP blocking). Add: (a) explicit per-tool timeout with partial-output capture and a model-readable "command timed out, use `timeout`" hint; (b) a `toolcalls`-style lifecycle row with status and duration; (c) a startup self-check that verifies `bugfound-policy` is actually enforcing before `full_auto` runs (analogous to the sandbox probe); (d) bounded output summarization over the existing 8KB truncation. Do not grant container capabilities to BugFound; the policy layer is the boundary.
 
 ---
 
@@ -196,7 +201,7 @@ Serialized message chain per agent type in `msgchains.chain` (`database/models.g
 **Strengths:** Every user-visible action is a durable row with flow/task/subtask FK and soft-delete cascade; per-category logs avoid a single giant table; token/cost/duration recorded per chain; OpenTelemetry + Langfuse give both system and LLM-level tracing; real-time subscription fan-out.
 **Weaknesses:** Many tables and parallel log workers increase write amplification; `Chain` JSON is opaque; trace/correlation relies on convention; observability sinks can fail independently (mitigated by `Drain`).
 
-**Adaptation:** AgentBug already has an event hash chain and trace-event export (`README.md:50-52,70-71`). Add: a `tool_calls` table with `{id, session_id, task_id, call_id, name, status, args, result, duration_ms, created_at}`; `agent_chains` snapshots keyed by `(session_id, step_id, agent_role)` for resume; token/cost accounting on each LLM step; a stable `trace_id` propagated into every event and tool call; and route events to the desktop UI via the existing channel/event bus instead of GraphQL.
+**Adaptation:** BugFound already has an event hash chain and trace-event export (`README.md:50-52,70-71`). Add: a `tool_calls` table with `{id, session_id, task_id, call_id, name, status, args, result, duration_ms, created_at}`; `agent_chains` snapshots keyed by `(session_id, step_id, agent_role)` for resume; token/cost accounting on each LLM step; a stable `trace_id` propagated into every event and tool call; and route events to the desktop UI via the existing channel/event bus instead of GraphQL.
 
 ---
 
@@ -208,26 +213,26 @@ Serialized message chain per agent type in `msgchains.chain` (`database/models.g
 - `ROOT/README.md:4231-4245`: says PentAGI is MIT; third-party deps "MIT-compatible"; then says "While the VXControl Cloud SDK code is MIT licensed, accessing VXControl Cloud Services ... requires a separate License Key and compliance with Terms of Service" — **this contradicts the NOTICE on the SDK's license**.
 - `ROOT/EULA.md:5-21`: source is MIT; EULA governs use of the product as a whole (source, Docker images, web UI); MIT prevails for source in conflict; use is a revocable, non-transferable license; no sublicensing beyond MIT. `:23-31` acceptable-use/authorized-testing restrictions; `:33-49` user bears GDPR/third-party/LLM-provider responsibility; `:59-67` liability caps; `:69-71` indemnification; `:73-91` termination, UK governing law/arbitration.
 - `ROOT/backend/go.mod:58-60`: `github.com/vxcontrol/cloud v1.0.1`, `github.com/vxcontrol/graphiti-go-client v0.9.0`, `github.com/vxcontrol/langchaingo v0.1.14-update.8` — **VXControl forks of core libraries** (`anonymizer` is imported at `ROOT/backend/pkg/tools/executor.go:22`). `ROOT/licenses/README.md:28-43` claims all deps are MIT-compatible.
-- `ROOT/research/README.md` note (AgentBug's own policy): clones are reference-only; "Jangan salin kode langsung ke AgentBug tanpa memeriksa lisensi dan atribusi."
+- `ROOT/research/README.md` note (BugFound's own policy): clones are reference-only; "Jangan salin kode langsung ke BugFound tanpa memeriksa lisensi dan atribusi."
 
 **Safe:** Study architecture, state machines, prompt-tool contracts, limits, schemas, and failure modes; reimplement ideas independently in Rust. MIT permits copying source with attribution, but the AGPL/NOTICE contradiction and EULA make that a poor choice.
-**Dangerous:** (1) Copying Go source verbatim or near-verbatim into `agentbug-*`; (2) importing `github.com/vxcontrol/*` modules — the Cloud SDK is AGPL-3.0 and its "special exception" is granted to the **official PentAGI project**, not to AgentBug; (3) assuming the README's "SDK code is MIT" overrides the NOTICE; (4) treating the EULA's acceptable-use, revocation, indemnification, or UK-law terms as if they did not exist; (5) copying prompt templates verbatim (they are part of the MIT source, but copying invites attribution/EULA disputes and offers no technical advantage); (6) assuming `licenses/README.md`'s "MIT-compatible" blanket statement is legally sufficient due diligence.
-**Concrete rule for AgentBug:** patterns only; original code; no VXControl imports; keep an attribution note in research docs (not in production code) that ideas were informed by PentAGI, and have the license audit (`docs/research/10_license_audit.md`) record the README/NOTICE/EULA contradiction explicitly.
+**Dangerous:** (1) Copying Go source verbatim or near-verbatim into `bugfound-*`; (2) importing `github.com/vxcontrol/*` modules — the Cloud SDK is AGPL-3.0 and its "special exception" is granted to the **official PentAGI project**, not to BugFound; (3) assuming the README's "SDK code is MIT" overrides the NOTICE; (4) treating the EULA's acceptable-use, revocation, indemnification, or UK-law terms as if they did not exist; (5) copying prompt templates verbatim (they are part of the MIT source, but copying invites attribution/EULA disputes and offers no technical advantage); (6) assuming `licenses/README.md`'s "MIT-compatible" blanket statement is legally sufficient due diligence.
+**Concrete rule for BugFound:** patterns only; original code; no VXControl imports; keep an attribution note in research docs (not in production code) that ideas were informed by PentAGI, and have the license audit (`docs/research/10_license_audit.md`) record the README/NOTICE/EULA contradiction explicitly.
 
 ---
 
-## 8. Cross-cutting adaptation map for AgentBug
+## 8. Cross-cutting adaptation map for BugFound
 
-| PentAGI pattern | AgentBug target crate | Concrete adaptation |
+| PentAGI pattern | BugFound target crate | Concrete adaptation |
 |---|---|---|
-| Ordered durable Subtask plan + delta Refiner | `agentbug-engagement`, `agentbug-store` | `plan` rows with `seq`/`revision`; atomic revision swap; deterministic coverage-ledger planner first, LLM proposes deltas; keep `≤N` bound and "empty plan ⇒ one step". |
-| Three-level status with back-propagation + guarded transitions | `agentbug-core` | Reuse `transition_state_owned`; add explicit `waiting_approval`/`waiting_input` mapping; one function owns cross-entity status propagation. |
-| One bounded tool loop per step + barrier tool | `agentbug-core` | Terminal tool → session state; step = `llm.stream` continuation from reloaded history; budgets are the hard cap; no unbounded in-memory loops. |
-| Capability-scoped specialist executors | `agentbug-core`, `agentbug-tools`, `agentbug-policy` | Role-scoped registries + policy gates; child-session handoff with typed result event; parent/child lineage in the event hash chain. |
-| Layered bounded recovery (arg fixer, reflector, repeat detector, mentor) | `agentbug-core`, `agentbug-llm` | Sliding-window repeat detection echoing previous result; schema-based single repair; corrective user message ≤3; planner review at budget thresholds; forced terminal decision. |
-| Provenance-rich memory (pgvector + Graphiti) | `agentbug-store` | Working/episodic/semantic tiers; every memory row carries `session/task/engagement/tool/source_event_id`; scope-filter on retrieval; no Graphiti dependency. |
-| Tool-call lifecycle + timeouts + partial output | `agentbug-tools`, `agentbug-store` | `tool_calls` table; per-tool timeout with partial output; existing 8KB truncation + summarization; startup self-check that policy is enforcing before `full_auto`. |
-| Chain snapshots, token/cost, spans, subscriptions | `agentbug-store`, `agentbug-desktop`, `agentbug-cli` | `(session, step, role)` chain snapshots; usage on each LLM step; stable `trace_id` on all events; stream events to existing desktop tabs. |
+| Ordered durable Subtask plan + delta Refiner | `bugfound-engagement`, `bugfound-store` | `plan` rows with `seq`/`revision`; atomic revision swap; deterministic coverage-ledger planner first, LLM proposes deltas; keep `≤N` bound and "empty plan ⇒ one step". |
+| Three-level status with back-propagation + guarded transitions | `bugfound-core` | Reuse `transition_state_owned`; add explicit `waiting_approval`/`waiting_input` mapping; one function owns cross-entity status propagation. |
+| One bounded tool loop per step + barrier tool | `bugfound-core` | Terminal tool → session state; step = `llm.stream` continuation from reloaded history; budgets are the hard cap; no unbounded in-memory loops. |
+| Capability-scoped specialist executors | `bugfound-core`, `bugfound-tools`, `bugfound-policy` | Role-scoped registries + policy gates; child-session handoff with typed result event; parent/child lineage in the event hash chain. |
+| Layered bounded recovery (arg fixer, reflector, repeat detector, mentor) | `bugfound-core`, `bugfound-llm` | Sliding-window repeat detection echoing previous result; schema-based single repair; corrective user message ≤3; planner review at budget thresholds; forced terminal decision. |
+| Provenance-rich memory (pgvector + Graphiti) | `bugfound-store` | Working/episodic/semantic tiers; every memory row carries `session/task/engagement/tool/source_event_id`; scope-filter on retrieval; no Graphiti dependency. |
+| Tool-call lifecycle + timeouts + partial output | `bugfound-tools`, `bugfound-store` | `tool_calls` table; per-tool timeout with partial output; existing 8KB truncation + summarization; startup self-check that policy is enforcing before `full_auto`. |
+| Chain snapshots, token/cost, spans, subscriptions | `bugfound-store`, `bugfound-desktop`, `bugfound-cli` | `(session, step, role)` chain snapshots; usage on each LLM step; stable `trace_id` on all events; stream events to existing desktop tabs. |
 | License hygiene | docs/audit | Patterns only; no VXControl imports; document README/NOTICE/EULA contradiction. |
 
 ---

@@ -1,8 +1,13 @@
 # 13 — Component Extraction & Decision Matrix
 
-Classification: **Adopt pattern** (reimplement in Rust), **Adapt** (keep idea, change shape), **Rebuild** (new AgentBug implementation), **Reject** (do not include). No source code is copied.
+> **About these notes.** These are point-in-time analyses of third-party reference
+> projects, kept for design input. They describe the reference projects at the
+> snapshots examined and are not claims about the current BugFound code; verify
+> current behavior in `crates/`.
 
-| Capability | Primary reference | Decision | Rationale / AgentBug target |
+Classification: **Adopt pattern** (reimplement in Rust), **Adapt** (keep idea, change shape), **Rebuild** (new BugFound implementation), **Reject** (do not include). No source code is copied.
+
+| Capability | Primary reference | Decision | Rationale / BugFound target |
 | --- | --- | --- | --- |
 | Agent step loop | OpenCode, Rig | Adopt pattern | already present; add typed LlmErrorKind + explicit terminal tool |
 | Session/inbox/admission | OpenCode | Adapt | add explicit steer/queue/control delivery and coalescing doorbell |
@@ -16,7 +21,7 @@ Classification: **Adopt pattern** (reimplement in Rust), **Adapt** (keep idea, c
 | Memory tiers | PentAGI | Rebuild over SQLite | working/episodic/semantic/procedural; provenance + scope-filter on retrieval |
 | Provider abstraction | MCP + LlmClient | Rebuild | capability negotiation, routing, fallback, real usage tokens |
 | Program intelligence | H1/Bugcrowd docs | Rebuild | typed assets, scope versions, VRT, safe harbor, status/freshness |
-| Scope enforcement | AgentBug + MCP | Keep/harden | deterministic, deny-by-default, source-linked rules |
+| Scope enforcement | BugFound + MCP | Keep as-is | deterministic, deny-by-default, source-linked rules |
 | Verification | Strix, CAI, PortSwigger | Rebuild | ternary closure + counterevidence + multi-oracle + paired controls |
 | CVSS/CWE | FIRST/CWE | Adapt | strict vector validation, root-cause CWE with rationale, confidence |
 | Reporting | OWASP/H1/Bugcrowd | Adapt | platform-specific templates, evidence contract, no auto-submit |

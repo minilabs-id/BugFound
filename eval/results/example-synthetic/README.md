@@ -1,10 +1,10 @@
 # Synthetic example result (NOT a benchmark result)
 
-This directory is a **documentation fixture generated entirely offline**. No
-agent engagement, no network request, and no LLM call produced it. It exists to
-show the artifact layout and the JSON shape of `eval/score.py`; the numbers in
-`score.json` are an arithmetic check on invented data and must never be quoted
-as a benchmark result.
+This directory is a fixture generated offline. No agent engagement, network
+request, or LLM call produced it. It shows the artifact layout and the JSON
+shape of `eval/score.py`. No measured effectiveness data is stored in
+`eval/results/`; the example directory contains invented data used to check
+arithmetic.
 
 To produce a real result, run `eval/run_benchmark.ps1 -Execute` against a local
 licensed testbed (or record an operator-run engagement yourself) and keep the
@@ -20,4 +20,4 @@ Files:
   --replay replay.jsonl --json --strict` over the synthetic fixture.
 
 `eval/score.py --dir eval/results` deliberately skips directories named
-`example-*` so this fixture cannot contaminate operator-recorded scores.
+`example-*` so this fixture is not included in operator-recorded scores.

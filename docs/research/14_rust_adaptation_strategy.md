@@ -1,8 +1,13 @@
 # 14 — Rust Adaptation Strategy
 
+> **About these notes.** These are point-in-time analyses of third-party reference
+> projects, kept for design input. They describe the reference projects at the
+> snapshots examined and are not claims about the current BugFound code; verify
+> current behavior in `crates/`.
+
 ## Principles
 
-1. Extract ideas, never copy source. Respect license audit (`10_license_audit.md`).
+1. Extract ideas, do not copy source. Respect license audit (`10_license_audit.md`).
 2. Keep existing working primitives (Runner, store, policy, budgets, approvals).
 3. Prefer small trait seams over new crates; avoid excessive fragmentation.
 4. Every new mechanism must have a test and a call site.
@@ -10,7 +15,7 @@
 ## Adaptation map
 
 ### Kernel purity
-Move bounty-specific functions out of `agentbug-core`:
+Move bounty-specific functions out of `bugfound-core`:
 - `persist_bounty_tool_result` → bounty domain crate.
 - WSTG `prioritize_targets` → bounty crate.
 - bounty-specific goal/scope digest → domain-owned policy object, kernel uses generic `GoalLock` trait.
@@ -40,7 +45,7 @@ Keep core depending only on llm/tools/policy/store abstractions.
 
 ### Memory
 - Three SQLite tiers: working (messages/events), episodic (trace/tool_result rows), semantic (optional embeddings + provenance).
-- Retrieval is scope-gated; unverified items never promoted to confirmed knowledge.
+- Retrieval is scope-gated; unverified items not promoted to confirmed knowledge.
 
 ### Verification
 - P0: make canary satisfiable by real tool captures.

@@ -1,9 +1,11 @@
-# AgentBug evaluation harness
+# BugFound evaluation harness
 
-Internal benchmarking **scaffolding** for the autonomous engagement flow. See
-`../docs/evaluation.md` for the full plan, metrics, baseline and replay
-requirements. **No benchmark result is asserted here** — an operator must run real
-engagements, keep the artifacts, and record the outcome.
+This directory holds a report scorer (`score.py`) and a trace exporter
+(`export_trace.py`) for operator-run engagements, plus an invented synthetic
+fixture used to check arithmetic. See `../docs/evaluation.md` for the plan,
+metrics, baseline and replay requirements. No measured effectiveness data is
+stored in `eval/results/`; the example directory contains invented data used to
+check arithmetic.
 
 ## Offline wiring record (not a benchmark)
 
@@ -14,9 +16,9 @@ replay per run under the gitignored `eval/work/lab/`. Use `--record` to copy the
 wiring record into `eval/results/local-reflect-lab/`; a baseline lane is
 recorded as `not-run.json` unless an operator supplies `--baseline-cmd`.
 
-These artifacts prove the harness can capture and hash repeat observations.
-They contain **no agent effectiveness measurement**: no recall, precision, FPR,
-latency claim, or baseline comparison may be quoted from them. `export_trace.py`
+These artifacts show the harness can capture and hash repeat observations. They
+are wiring records, not effectiveness measurements; no recall, precision, FPR,
+latency or baseline figure should be quoted from them. `export_trace.py`
 also maps the verifier's `candidate` key to `finding_id` and preserves additive
 provenance keys for future metrics.
 
@@ -34,7 +36,7 @@ eval/
 ├── export_trace.py        # stdlib SQLite trace_events -> replay JSONL exporter
 ├── work/                  # scratch dirs (gitignored)
 └── results/               # operator-recorded reports + replays (tracked, not gitignored)
-    └── example-synthetic/ # offline documentation fixture (not scored, not a result)
+    └── example-synthetic/ # invented data used to check arithmetic (not scored)
 ```
 
 ## Quick start (Windows)
@@ -87,8 +89,7 @@ For each target, `-Execute` writes under `eval/results/<id>/`:
   the file fed to `score.py --replay`. Trace events win for kinds both sources
   carry, so findings and tokens are not double-counted. A run without a replay
   log is not a valid result.
-- `score.json` — the recorded `score.py` output for operator review; it is **not**
-  a benchmark claim.
+- `score.json` — the recorded `score.py` output for operator review.
 
 Scratch working directories live in `eval/work/` and are gitignored. `eval/results/`
 is **tracked** so an operator can commit recorded results; see
@@ -122,10 +123,10 @@ Checks and metrics:
 | `tokens_per_finding` | replay `usage` events | API prompt + completion tokens / valid findings (no `len/4` estimates) |
 
 `--json` emits a single object with `reports`, `summary`, `metrics`, `notes`, and a
-`claim` field that is always `scaffolding only — no benchmark results asserted`.
+`claim` field.
 `--strict` fails on missing sections/fields and on optional `--min-recall`,
 `--min-precision`, `--max-fpr` thresholds when those are supplied. Metrics whose
-input is absent are reported as `null` / `n/a` and never guessed.
+input is absent are reported as `null` / `n/a` and are not guessed.
 
 Replay JSONL event kinds: `run_start`, `action`, `finding`, `tested`, `verifier`,
 `usage`, `report`. Unknown kinds are ignored with a warning.

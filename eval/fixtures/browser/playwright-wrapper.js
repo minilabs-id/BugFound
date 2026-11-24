@@ -1,11 +1,11 @@
-// AgentBug Playwright adapter.
+// BugFound Playwright adapter.
 //
 // Usage: node playwright-wrapper.js <action> <url> [selector] [output]
 // Actions: navigate | click | screenshot
 //
 // This binary is registered by the operator through
 // [external_tools.commands] playwright = "node <wrapper> {action} {url} {selector}".
-// It is still subject to AgentBug's scope, method and ROE gates; installing it
+// It is still subject to BugFound's scope, method and ROE gates; installing it
 // is not an authorization bypass. Output is bounded JSON on stdout.
 
 const { chromium } = require('playwright');

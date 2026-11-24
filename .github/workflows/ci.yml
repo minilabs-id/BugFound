@@ -38,12 +38,12 @@ jobs:
       - name: Enforce ADR-001 kernel boundary
         shell: bash
         run: |
-          if git grep -n -I -i -E 'finding|bounty|wstg|cvss|cwe|scope_summary|persist_bounty_tool_result|prioritize_targets|agentbug_engagement|agentbug_domain' -- crates/agentbug-core/src; then
-            echo "ADR-001: agentbug-core contains domain vocabulary"
+          if git grep -n -I -i -E 'finding|bounty|wstg|cvss|cwe|scope_summary|persist_bounty_tool_result|prioritize_targets|bugfound_engagement|bugfound_domain' -- crates/bugfound-core/src; then
+            echo "ADR-001: bugfound-core contains domain vocabulary"
             exit 1
           fi
-          if cargo tree -p agentbug-core -e normal --prefix none --depth 1 | grep -E 'agentbug-(engagement|domain)'; then
-            echo "ADR-001: agentbug-core depends on a domain crate"
+          if cargo tree -p bugfound-core -e normal --prefix none --depth 1 | grep -E 'bugfound-(engagement|domain)'; then
+            echo "ADR-001: bugfound-core depends on a domain crate"
             exit 1
           fi
 

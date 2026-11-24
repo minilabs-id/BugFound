@@ -61,7 +61,7 @@ def run_once(base_url: str, lane: str, index: int, destination: Path) -> dict:
     started = datetime.now(timezone.utc).isoformat()
     clock = time.perf_counter()
 
-    marker = "agentbug-lab-" + uuid.uuid4().hex[:16]
+    marker = "bugfound-lab-" + uuid.uuid4().hex[:16]
     reflected = probe(base_url, "/reflect", marker)
     negative = probe(base_url, "/safe", marker)
 

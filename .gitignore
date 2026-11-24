@@ -1,6 +1,6 @@
 /target
-/.agentbug
-/agentbug.toml
+/.bugfound
+/bugfound.toml
 **/*.rs.bk
 
 # Evaluation scratch space only. eval/results/ is intentionally tracked so an
@@ -9,7 +9,7 @@
 __pycache__/
 *.pyc
 
-# Local research clones (third-party repos); not part of AgentBug source.
+# Local research clones (third-party repos); not part of BugFound source.
 /research/
 
 # Evidence artifacts are generated under the engagement workspace, never in source.

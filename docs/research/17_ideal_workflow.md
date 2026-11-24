@@ -1,5 +1,10 @@
 # 17 — Ideal Bug-Bounty Agent Workflow (research synthesis, 2026-11-20)
 
+> **About these notes.** These are point-in-time analyses of third-party reference
+> projects, kept for design input. They describe the reference projects at the
+> snapshots examined and are not claims about the current BugFound code; verify
+> current behavior in `crates/`.
+
 Status: research only. This document is the reference for future construction. No code was changed for it.
 
 Sources: `01` OpenCode, `02` PentAGI, `03` harness patterns, `04` Strix/CAI, `06` OWASP WSTG, `08` platform docs, `09` PortSwigger, `10` license audit, `docs/report-format.md`, `docs/engagement.md`, ADR-001/007/008, and live run artifacts under `eval/work/cake-loop1`.
@@ -13,7 +18,7 @@ An engagement is **done** only if all of these hold:
 1. Authorization receipt accepted; no unresolved scope conflict or ambiguous constraint.
 2. Coverage ledger reconciles: every in-scope asset has ≥1 coverage row; every uncovered requirement has a `blocked` / `not-applicable` rationale. Attempted-and-denied counts as coverage.
 3. Every hypothesis is terminal (`validated | ruled_out | blocked | not-applicable`) or explicitly carried as `open_proof_gap` and accepted by the operator.
-4. Each verified finding has authoritative tool bytes, the correct class-specific oracle, a paired control where applicable, a redacted repro, and calibrated severity.
+4. Each verified finding has tool-captured bytes, the correct class-specific oracle, a paired control where applicable, a redacted repro, and calibrated severity.
 5. Evidence digests re-verify; zero orphan hypotheses / findings / bundles.
 6. Report matches the template, is derived from trace events, passes `score.py --strict`, and is stamped `draft — operator review required`.
 7. Operator review recorded. No auto-submit.
@@ -64,7 +69,7 @@ Stop decision: continue while new coverage tuples or hypothesis transitions occu
 | Blind SSRF / resource | Timing baseline or controlled listener |
 | Anything | Paired benign-success + payload-blocked ⇒ `ruled_out` |
 
-Authority ladder: deterministic verifier over tool bytes > independent falsification opinion (advisory) > operator acceptance. Never the model's own `validate_poc` verdict, never self-grading, never auto-submit.
+Authority ladder: deterministic verifier over tool bytes > independent falsification opinion (advisory) > operator acceptance. Not the model's own `validate_poc` verdict, not self-grading, not auto-submit.
 
 `open_proof_gap` must name the missing proof and block finalization until accepted by the operator.
 
@@ -86,9 +91,9 @@ Platform drafts stay self-authored field checklists (HackerOne: asset, weakness,
 
 | ID | Gap | Evidence |
 |---|---|---|
-| D1 | Scope self-contradiction (`app.clockify.me` in-scope vs `*.clockify.me` out-of-scope) never resolved; deny wins | `eval/work/cake-loop1/report-*.md:13-41,280-462` |
+| D1 | Scope self-contradiction (`app.clockify.me` in-scope vs `*.clockify.me` out-of-scope) not resolved; deny wins | `eval/work/cake-loop1/report-*.md:13-41,280-462` |
 | D2 | A single ambiguous ROE prose line aborted the whole engagement (now classified, but still abort-only) | `engagement/src/lib.rs:730-744`, `cake-full-run.log` |
-| D3 | Hypotheses are the same sentence as tasks and never transition; `set_hypothesis_status` only called in a test | `engagement/src/lib.rs:896-909`, `store/src/lib.rs:1985-1990,2022` |
+| D3 | Hypotheses are the same sentence as tasks and do not transition; `set_hypothesis_status` only called in a test | `engagement/src/lib.rs:896-909`, `store/src/lib.rs:1985-1990,2022` |
 | D4 | Fresh Runner per task; no passive→active feedback; roles defined but production uses `General` | `engagement/src/lib.rs:932-1113,1023-1030`, `roles.rs` |
 | D5 | Task `done` = runner returned `Ok`, not evidence produced; stall guard calls `finish(completed)` after denied calls | `engagement/src/lib.rs:1060-1067`, `core/src/lib.rs:1861-1883` |
 | D6 | Coverage recorded only on successful network calls; attempted-and-denied invisible; no requirement key | `core/src/lib.rs:2104-2106`, `store/src/lib.rs:1930-1966` |
@@ -105,7 +110,7 @@ A correct verdict for that run would have been: `incomplete — scope conflict u
 ## 7. Anti-patterns to avoid
 
 1. Trusting model severity/risk labels — calibrate after verification; model value is advisory only.
-2. Self-grading or LLM-as-verification-gate — deterministic byte oracle is authoritative.
+2. Self-grading or LLM-as-verification-gate — the deterministic byte oracle is the deciding signal.
 3. Unbounded fan-out — hard budgets, depth limit, graceful termination, repeat detection.
 4. Auto-submit — forbidden; requires a new ADR.
 5. LLM as permission judge or runtime-disabled guardrails — compiled policy gates.
@@ -127,6 +132,6 @@ A correct verdict for that run would have been: `incomplete — scope conflict u
 5. Authorization snapshot typed/versioned with operator acknowledgement path, while keeping fail-closed defaults (D2).
 6. Report evidence binding: redacted request/response, canary, artifact path, scope fingerprint (§5).
 7. Bounded budgets/fan-out and graceful termination (anti-pattern 3).
-8. Re-run the live loop after each step; treat results as construction evidence, never as benchmark claims.
+8. Re-run the live loop after each step; treat results as construction evidence, not as benchmark claims.
 
 The non-negotiable substrate to keep: tool-captured bytes + canary as only proof, deterministic ROE fail-closed, local-report-only, durable budgets/leases, and ADR-001 kernel/domain separation.

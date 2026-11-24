@@ -1,4 +1,9 @@
-﻿# 07 - CWE Root-Cause Classification and CVSS Evidence-Derived Scoring -> AgentBug
+﻿# 07 - CWE Root-Cause Classification and CVSS Evidence-Derived Scoring -> BugFound
+
+> **About these notes.** These are point-in-time analyses of third-party reference
+> projects, kept for design input. They describe the reference projects at the
+> snapshots examined and are not claims about the current BugFound code; verify
+> current behavior in `crates/`.
 
 Read-only research deliverable. No product code was modified. Only this file was written.
 The CWE and CVSS clones are local reference corpora; their pinned commits are recorded in
@@ -12,11 +17,11 @@ verify each claim against the local clone.
 | CWE Content Development Repository (CDR) | `research/cwe/` | `ea5a2ea88febdf26d293e604ecd4b4dae183a93d` (`ea5a2ea`) | CWE *content development* process: submission guidelines, scope exclusions, submission problems, and hundreds of individual submission `.txt` files. It is NOT the CWE weakness catalog itself (no `cwe.xml`, no full View-1000 tree). Hierarchy/view/root-cause rules must be extracted from guidelines and submission reviews. |
 | CVSS SIG resources | `research/cvss/` | `d766d0c8ab4368b67bf27dd0e411eb481f05fdbb` (`d766d0c`) | Official CVSS v4.0 Specification Document v1.2, SIG spec-change notes, NVD-RFI analysis, and the FIRST calculator validation corpus (vector files, enumerators, explainer). |
 
-Implementation inspected (no changes): `crates/agentbug-engagement/src/lib.rs`,
-`crates/agentbug-store/src/lib.rs`, `crates/agentbug-tools/src/lib.rs`,
-`crates/agentbug-core/src/lib.rs`, `docs/report-format.md`, `docs/engagement.md`,
+Implementation inspected (no changes): `crates/bugfound-engagement/src/lib.rs`,
+`crates/bugfound-store/src/lib.rs`, `crates/bugfound-tools/src/lib.rs`,
+`crates/bugfound-core/src/lib.rs`, `docs/report-format.md`, `docs/engagement.md`,
 `eval/score.py`, `eval/golden.example.json`,
-`crates/agentbug-engagement/tests/engagement_integration.rs`.
+`crates/bugfound-engagement/tests/engagement_integration.rs`.
 
 ---
 
@@ -26,7 +31,7 @@ Implementation inspected (no changes): `crates/agentbug-engagement/src/lib.rs`,
 
 `research/cwe/README.md:10-13` defines the CDR and its submitter/participant/observer roles;
 `README.md:26-41` defines the 4 stages and 18 phases a submission passes through. The
-important design point for AgentBug is that a CWE ID is the outcome of a *review process*,
+important design point for BugFound is that a CWE ID is the outcome of a *review process*,
 not a label chosen by keyword.
 
 `research/cwe/documentation/submission-guidelines.md:55-58` ("Submission is not
@@ -87,7 +92,7 @@ sibling, CWE-289 "Authentication Bypass by Alternate Name" as `CanFollow`, and C
 "Validate Before Canonicalize" as a near-miss in `ES2503-a0f69c3b...:147-162`. This is a
 root-cause graph (mistake -> more general mistake), not a flat keyword table.
 
-### 1.3 Root cause vs symptom vs impact (the classification AgentBug lacks)
+### 1.3 Root cause vs symptom vs impact (the classification BugFound lacks)
 
 `research/cwe/submissions/ES2503-a0f69c3b-new-inconsistent-email-normalization-leading-to-authentication-bypass.txt:51-59`
 separates **Root Cause Analysis** ("the email verification system normalizes email addresses
@@ -98,7 +103,7 @@ mitigations (`:77-88`). The reviewer then rejects the *impact* as the identity i
 technical impact which is 'authentication bypass' and also explains a proof of concept
 attack ... it should focus on the weakness that is occurring, which is that the incoming
 email address is not being properly normalized. There are other technical impacts that could
-arise from improper normalization." This is the exact distinction AgentBug must make:
+arise from improper normalization." This is the exact distinction BugFound must make:
 `authentication bypass` is an impact, `improper normalization` is the weakness; mapping the
 finding title "Authentication Bypass" to `CWE-287` is an impact-to-CWE shortcut.
 
@@ -144,15 +149,15 @@ string.
   Generation ('Cross-site Scripting')"**, consistent with the CWE-79-as-general-weakness
   guidance above.
 
-AgentBug's own crosswalk already exists in `docs/report-format.md:162-189`, with a
+BugFound's own crosswalk already exists in `docs/report-format.md:162-189`, with a
 "most specific CWE that fits the root cause" rule and rows for CWE-89, CWE-79, CWE-78,
 CWE-639, CWE-862/863, CWE-22, CWE-601, CWE-352, CWE-918, CWE-287, CWE-200/312, CWE-16,
 CWE-1104, CWE-770, CWE-840, CWE-502. `eval/golden.example.json:4-22` uses CWE-89, CWE-79,
 CWE-639 as the three ground-truth classes.
 
-### 1.6 Current AgentBug CWE implementation (exact evidence)
+### 1.6 Current BugFound CWE implementation (exact evidence)
 
-`crates/agentbug-engagement/src/lib.rs:2077-2117` `map_cwe(title, vuln_type)`:
+`crates/bugfound-engagement/src/lib.rs:2077-2117` `map_cwe(title, vuln_type)`:
 - builds one haystack from **title + vuln_type only** (`:2078`);
 - iterates an ordered `const TABLE` of 30 `(needle, cwe)` substring pairs (`:2079-2110`);
 - returns the **first substring hit** (`:2111-2114`);
@@ -174,8 +179,8 @@ Consequences of that design, read directly against the CWE guidance above:
   the product rule (`docs/report-format.md:165-166`).
 - `map_cwe` is only used in `build_canonical_report` (`:2316-2321`) as a fallback when the
   LLM-supplied `finding.cwe` is absent. The primary CWE is whatever the model wrote into
-  `save_finding.cwe` (`crates/agentbug-core/src/lib.rs:428-429`,
-  `crates/agentbug-tools/src/lib.rs:1521-1522`). So today the model supplies the taxonomy
+  `save_finding.cwe` (`crates/bugfound-core/src/lib.rs:428-429`,
+  `crates/bugfound-tools/src/lib.rs:1521-1522`). So today the model supplies the taxonomy
   and the deterministic code only patches omissions - the reverse of the verifier design.
 
 ---
@@ -197,10 +202,10 @@ Supplemental provides context and **"will not have any impact on the final CVSS 
 wherever a numerical CVSS value is displayed or communicated". `specification-document.md:34-37`
 requires publishing both score and vector so others can understand the derivation.
 
-### 2.2 v3.1 base scoring (the version AgentBug implements)
+### 2.2 v3.1 base scoring (the version BugFound implements)
 
 `research/cvss/README.md:7-13` and `vectorFiles/` are v4.0-only; the v3.1 closed-form
-equation is only present in the current product code. `crates/agentbug-engagement/src/lib.rs:1945-2039`
+equation is only present in the current product code. `crates/bugfound-engagement/src/lib.rs:1945-2039`
 is a correct transcription of the FIRST CVSS v3.1 Base equation:
 
 ```
@@ -212,8 +217,8 @@ Base     = Roundup( min(10, S:U ? Impact+Exploit : 1.08*(Impact+Exploit)) )
 with weights AV N/A/L/P = 0.85/0.62/0.55/0.2 (`:1980-1986`), AC L/H = 0.77/0.44
 (`:1987-1991`), PR depending on scope (U: 0.85/0.62/0.27, C: 0.85/0.68/0.5;
 `:1992-2005`), UI N/R = 0.85/0.62 (`:2006-2010`), C/I/A H/L/N = 0.56/0.22/0.0
-(`:2045-2052`), and FIRST roundup at `:2054-2063`. Tests pin three reference scores at
-`crates/agentbug-engagement/tests/engagement_integration.rs:56-61` (9.8, 7.5, 1.8, and 0.0
+(`:2045-2052`), and FIRST roundup at `:2054-2063`. Tests pin reference scores at
+`crates/bugfound-engagement/tests/engagement_integration.rs:56-61` (9.8, 7.5, 1.8, and 0.0
 for empty/incomplete vectors).
 
 The v3.1 qualitative bands are recorded in `docs/report-format.md:149-160`: None 0.0, Low
@@ -303,9 +308,9 @@ comments, report dated 2026-10-07):
   complete control (no net gain). `:96-109` extends impact guidance to LLM systems: consider
   protected stored data, not general-access outputs.
 
-### 2.6 Current AgentBug CVSS implementation (exact evidence)
+### 2.6 Current BugFound CVSS implementation (exact evidence)
 
-`crates/agentbug-engagement/src/lib.rs:1948-1954` parses the vector into a `HashMap` by
+`crates/bugfound-engagement/src/lib.rs:1948-1954` parses the vector into a `HashMap` by
 splitting on `/` and `:`; it does **not** check the version prefix, metric order, duplicate
 metrics, or unknown keys. `:1955-1978` only checks presence of AV/AC/PR/UI/S/C/I/A; any other
 `CVSS:x.y/...` string with those eight keys is scored as if it were v3.1. There is no v4.0
@@ -314,28 +319,28 @@ uses `>=9.0 / >=7.0 / >=4.0 / else Low`, so 0.0 maps to "Low" rather than the sp
 "None", although `build_canonical_report:2301-2305` only calls it when `score > 0.0`.
 
 The score is derived from the model, not evidence: `save_finding` declares `cvss` and `cwe`
-as free-form strings (`crates/agentbug-tools/src/lib.rs:1521-1522`), core copies
+as free-form strings (`crates/bugfound-tools/src/lib.rs:1521-1522`), core copies
 `args["cvss"]`/`args["cwe"]` verbatim into the finding
-(`crates/agentbug-core/src/lib.rs:428-429,443-444`), and `build_canonical_report` reads
+(`crates/bugfound-core/src/lib.rs:428-429,443-444`), and `build_canonical_report` reads
 `finding.cvss` as the vector and recomputes (`lib.rs:2299-2300`). If the model supplies a
 numeric score string (e.g. `"9.8"`) rather than a vector, `cvss_base` returns 0.0 and the
 report silently keeps the model's `severity` string (`:2301-2305`). `parse_report_finding`
-in `crates/agentbug-tools/src/lib.rs:3216-3217,3254-3257` similarly treats `cvss`,
+in `crates/bugfound-tools/src/lib.rs:3216-3217,3254-3257` similarly treats `cvss`,
 `cvss_vector`, `vector` as interchangeable. `eval/score.py:85-87` only recognizes
 `CVSS:3.1/...` vectors.
 
 ---
 
-## 3. Map to AgentBug: concrete, evidence-backed improvements
+## 3. Map to BugFound: concrete, evidence-backed improvements
 
 ### 3.1 CWE mapping: keyword substring -> root-cause reasoning
 
 Replace the "first substring hit" decision at `lib.rs:2077-2117` with a two-stage, evidence-
 grounded classifier. Use the CWE review process as the specification:
 
-1. **Extract facts from the authoritative capture, not the title.** Inputs available today:
+1. **Extract facts from the tool capture, not the title.** Inputs available today:
    `ToolCapture.request_bytes`/`response_bytes` and canary
-   (`crates/agentbug-store/src/lib.rs:197-206,1144-1182`), `Finding.description`,
+   (`crates/bugfound-store/src/lib.rs:197-206,1144-1182`), `Finding.description`,
    `reproduction`, `impact`, `vuln_type` (`:66-98`). The current `map_cwe` ignores all of
    these.
 2. **Classify the mistake (CWE) separately from the attack (CAPEC) and the impact
@@ -366,7 +371,7 @@ grounded classifier. Use the CWE review process as the specification:
 ### 3.2 CVSS: LLM-supplied vector -> evidence-derived scoring
 
 Replace the flow `save_finding.cvss (LLM string) -> Finding.cvss -> cvss_base`
-(`crates/agentbug-core/src/lib.rs:428-429`; `agentbug-engagement/src/lib.rs:2299-2300`) with
+(`crates/bugfound-core/src/lib.rs:428-429`; `bugfound-engagement/src/lib.rs:2299-2300`) with
 an explicit derivation stage that computes the vector from stored artifacts, then scores it:
 
 1. **Validate before scoring.** Add an anchored, ordered, no-duplicate, version-aware parser
@@ -390,12 +395,12 @@ an explicit derivation stage that computes the vector from stored artifacts, the
      (`submission-guidelines.md:265-270`), scoring the *final* delta, not the initial state
      (`specification-document.md:357-371`); keep Subsequent System impact N unless a
      concrete downstream asset was observed (`:373-402`).
-3. **Preserve the version split.** Keep the verified v3.1 equation and its three regression
+3. **Preserve the version split.** Keep the v3.1 equation and its regression
    vectors (`engagement_integration.rs:56-61`) for v3.1 output. For v4.0, use the
    MacroVector lookup + interpolation from `specification-document.md:1034-1231` and the
    270-row `macro-scores` table; do not approximate v4 with the v3.1 formula. Label the
    result CVSS-B / -BT / -BE / -BTE per `:170-206`.
-4. **Keep Temporal/Threat separate from Base.** AgentBug can justify Threat E:P because a
+4. **Keep Temporal/Threat separate from Base.** BugFound can justify Threat E:P because a
    working PoC exists in `ToolCapture` (`specification-document.md:494-530`), but this is a
    consumer-side enrichment, not a change to Base (`:141-152`, modifications.md:125-135).
    Environmental CR/IR/AR remain operator-provided and default X=High (`:549-564`).
@@ -406,7 +411,7 @@ an explicit derivation stage that computes the vector from stored artifacts, the
 
 ### 3.3 Report severity sections
 
-`render_canonical_report` (`crates/agentbug-tools/src/lib.rs:3043-3175`) currently emits a
+`render_canonical_report` (`crates/bugfound-tools/src/lib.rs:3043-3175`) currently emits a
 single `- **Severity:**`, `- **CVSS:**`, `- **Vector:**`, `- **CWE:**` block (`:3100-3115`)
 and a generic references appendix (`:3172-3174`). `docs/report-format.md:11-131` already
 specifies richer sections that the renderer does not produce (severity-count table at
@@ -438,14 +443,14 @@ regex should be extended for v4.0 if v4 output is emitted.
 
 ### 3.4 Verifier confidence
 
-`verify_findings` (`crates/agentbug-engagement/src/lib.rs:2163-2249`) already implements a
+`verify_findings` (`crates/bugfound-engagement/src/lib.rs:2163-2249`) already implements a
 strong deterministic gate: require a `ToolCapture` (`:2181-2183`), canary in response
 (`:2186`), 2xx status line (`:2251-2258`), reject self-graded `<html>` echoes without the
 canary (`:2189-2191,2260-2263`), reject claims of ROE-forbidden techniques (`:2192-2203`),
 verify stored SHA-256 digests (`:2169-2173,2130-2138`), and records `advisory_match` only
 as a detail string (`:2204-2211,2242-2244`). The verdict is only boolean `verified` /
 `rejected` in the trace (`:2217-2235`) and the store has only `validated_at` +
-`validation_detail` as strings (`crates/agentbug-store/src/lib.rs:94-97,1224-1237`).
+`validation_detail` as strings (`crates/bugfound-store/src/lib.rs:94-97,1224-1237`).
 
 Concrete confidence pattern (no new evidence source required - reuse existing signals):
 - Replace the single boolean with a **numeric confidence plus named signal vector**, e.g.
@@ -456,7 +461,7 @@ Concrete confidence pattern (no new evidence source required - reuse existing si
 - Add **per-field provenance** to each scored finding: source identity (`tool-capture` vs
   `llm`), timestamp, model/ruleset version, review state, evidence references - exactly the
   nvd-rfi `:126-145` recommendation. `capture_digest` (`:2132-2138`) and `evidence_hash`
-  (`crates/agentbug-store/src/lib.rs:1090-1101,232-241`) are the existing digests.
+  (`crates/bugfound-store/src/lib.rs:1090-1101,232-241`) are the existing digests.
 - Keep **generation and validation separated** (nvd-rfi `:158-169`): the model proposes the
   CWE/vector/severity, but the deterministic verifier must never accept the LLM's own
   `finding.response` as proof - today that value is explicitly "advisory only"
@@ -492,7 +497,7 @@ Concrete confidence pattern (no new evidence source required - reuse existing si
 | `research/cvss/spec-rev/nvd-rfi-cvss-improvements.md:16-29,76-99,126-169,173-187` | Divergence data, inferred-vs-observed, provenance, candidate transparency, AI validation separation. |
 | `research/cvss/spec-rev/modifications.md:43-94,96-135` | AV/AC/AT/PR clarifications, LLM impact guidance, threat enrichment. |
 | `research/cvss/vectorFiles/*`, `vectorEnum/base_enum.py`, `helperScripts/cvss_explainer.js:84-89` | Validation corpus and anchored-regex + per-metric narrative pattern. |
-| `crates/agentbug-engagement/src/lib.rs:1945-2117,2163-2374` | Current `cvss_base`, `map_cwe`, verifier, report builder (gaps). |
-| `crates/agentbug-core/src/lib.rs:407-469`; `agentbug-tools/src/lib.rs:1500-1546,3216-3257` | LLM-supplied cvss/cwe ingress points. |
-| `crates/agentbug-store/src/lib.rs:66-98,197-206,232-241,1144-1182,1224-1237` | Finding/ToolCapture/digest/validation storage available for evidence-derived scoring. |
+| `crates/bugfound-engagement/src/lib.rs:1945-2117,2163-2374` | Current `cvss_base`, `map_cwe`, verifier, report builder (gaps). |
+| `crates/bugfound-core/src/lib.rs:407-469`; `bugfound-tools/src/lib.rs:1500-1546,3216-3257` | LLM-supplied cvss/cwe ingress points. |
+| `crates/bugfound-store/src/lib.rs:66-98,197-206,232-241,1144-1182,1224-1237` | Finding/ToolCapture/digest/validation storage available for evidence-derived scoring. |
 | `docs/report-format.md:11-189`; `eval/score.py:46-54,85-109` | Required report sections, bands, CWE/OWASP contract, checker constraints. |

@@ -1,4 +1,4 @@
-# cargo-deny configuration for the AgentBug workspace.
+# cargo-deny configuration for the BugFound workspace.
 # Run from the workspace root with: cargo deny check
 # See https://embarkstudios.github.io/cargo-deny/
 

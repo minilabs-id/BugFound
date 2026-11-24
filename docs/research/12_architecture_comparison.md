@@ -1,10 +1,15 @@
 # 12 — Architecture Comparison (synthesis of 01–11)
 
+> **About these notes.** These are point-in-time analyses of third-party reference
+> projects, kept for design input. They describe the reference projects at the
+> snapshots examined and are not claims about the current BugFound code; verify
+> current behavior in `crates/`.
+
 Status: research synthesis. No code changes.
 
 ## 1. The five architectures in one table
 
-| System | Core unit | Durable state | Orchestration | Recovery | What AgentBug should learn |
+| System | Core unit | Durable state | Orchestration | Recovery | What BugFound should learn |
 | --- | --- | --- | --- | --- | --- |
 | OpenCode | Session + durable Step | Event store + inbox + claim | Runner/coordinator, cooldown doorbell | stale settlement, bounded resume | one LLM call per step; steer/queue/control; wild-card permission gates |
 | PentAGI | Flow → Task → Subtask → ToolCall | Msgchain snapshots + rich SQL | LLM planner/refiner, ordered subtasks | running→created reset | ordered plan + barrier completion + bounded layered recovery |
@@ -15,17 +20,17 @@ Status: research synthesis. No code changes.
 | Strix | Orchestrator → child jobs | artifact-bound evidence | mandatory discover→validate→report | closure states | ternary finding closure + counterevidence |
 | CAI | Reasoner/Retester/Reporter | typed memory | cyclic triage swarm | guardrails (default off!) | FP elimination role, non-executive reasoner |
 
-## 2. Where AgentBug already aligns
+## 2. Where BugFound already aligns
 
 - Durable SQLite sessions + event hash chain + trace events → Temporal/OpenCode shape.
 - One Runner step = one LLM call, reloaded history → OpenCode invariant.
 - Scope/ROE fail-closed, rate limit, shell allowlist, DNS pin → stronger than MCP/Strix defaults.
 - SHA-256 tool captures, atomic approvals, stop flags, guarded transitions → solid primitives.
-- Canonical report + redaction + replay scorer → better than most references.
+- Canonical report + redaction + replay scorer → present in the current design.
 
-## 3. Where AgentBug diverges in important ways
+## 3. Where BugFound diverges in important ways
 
-| Dimension | References | AgentBug today | Verdict |
+| Dimension | References | BugFound today | Verdict |
 | --- | --- | --- | --- |
 | Kernel/domain separation | universal core + domain adapters | core/tools contain bounty logic | **must refactor** |
 | Multi-agent | specialist roles + delegation | no real multi-agent | **gap** |
@@ -38,7 +43,7 @@ Status: research synthesis. No code changes.
 
 ## 4. Critical contradiction to resolve first
 
-Research 11 found that `HttpRequestTool` mints a canary from request bytes + nanoseconds but **never injects it into the outgoing request or the captured response**; the verifier requires `response.contains(canary)`. Unit tests pass only because they hand-splice the canary into synthetic bytes. Therefore in real runs no finding can ever be promoted — which matches our live retest results (always 0 verified findings).
+Research 11 found that `HttpRequestTool` mints a canary from request bytes + nanoseconds but did not inject it into the outgoing request or the captured response in that snapshot; the verifier requires `response.contains(canary)`. The tests described there hand-splice the canary into synthetic bytes. Research 11 also records a later fix; verify current behavior in `crates/`.
 
 This is P0: the verifier must be made satisfiable by real tool captures before any architecture work matters.
 

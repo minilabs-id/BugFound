@@ -1,13 +1,18 @@
 # 16 — Final Recommendations (research verdict)
 
+> **About these notes.** These are point-in-time analyses of third-party reference
+> projects, kept for design input. They describe the reference projects at the
+> snapshots examined and are not claims about the current BugFound code; verify
+> current behavior in `crates/`.
+
 ## Verdict
 
-AgentBug is already a strong hardened runtime for scoped, single-runner bug bounty work. It is **not yet** the "strong across all lines" autonomous agent framework in the master prompt. The next milestone should not add more tools; it should fix three structural problems and then build the missing layers on top.
+The current code is a scoped, single-runner bug-bounty harness. It is **not yet** the "strong across all lines" autonomous agent framework in the master prompt. The next milestone should not add more tools; it should fix three structural problems and then build the missing layers on top.
 
 ## P0 — before anything else
 
-1. **Make the verifier satisfiable.** Today `HttpRequestTool` mints a canary but never injects it into the request or the captured response; the verifier requires `response.contains(canary)`. Real findings can never be promoted. Fix at the tool-capture boundary: include the canary marker in the captured response bytes at capture time (tool-generated, not LLM-supplied), keep evidence hash verification, and add a test that promotes a finding from a real local HTTP response. (Ref: 11_current_gap_analysis.md)
-2. **Kernel/domain separation.** Move `persist_bounty_tool_result`, WSTG planner, bounty system prompt, and target/scope digest out of `agentbug-core`. Kernel must not know what a finding is. (Ref: 12, 14)
+1. **Make the verifier satisfiable.** In the snapshot analyzed by 11_current_gap_analysis.md, `HttpRequestTool` minted a canary but did not inject it into the request or the captured response, while the verifier required `response.contains(canary)`; real findings could not be promoted. Fix at the tool-capture boundary: include the canary marker in the captured response bytes at capture time (tool-generated, not LLM-supplied), keep evidence hash verification, and add a test that promotes a finding from a real local HTTP response. (Ref: 11_current_gap_analysis.md)
+2. **Kernel/domain separation.** Move `persist_bounty_tool_result`, WSTG planner, bounty system prompt, and target/scope digest out of `bugfound-core`. Kernel must not know what a finding is. (Ref: 12, 14)
 3. **Honest status.** Until P0-1 is fixed, every "0 verified findings" result is a harness artifact, not evidence about the target. Document this in README/eval docs.
 
 ## P1 — core maturity

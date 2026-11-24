@@ -1,8 +1,8 @@
 {
-  "name": "agentbug-playwright-adapter",
+  "name": "bugfound-playwright-adapter",
   "private": true,
   "version": "1.0.0",
-  "description": "Operator-installed Playwright CLI adapter for AgentBug's gated browser tool.",
+  "description": "Operator-installed Playwright CLI adapter for BugFound's gated browser tool.",
   "dependencies": {
     "playwright": "^1.65.1"
   }

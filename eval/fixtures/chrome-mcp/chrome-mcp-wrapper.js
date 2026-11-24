@@ -1,4 +1,4 @@
-// AgentBug browser adapter backed by Google's chrome-devtools-mcp CLI.
+// BugFound browser adapter backed by Google's chrome-devtools-mcp CLI.
 // No browser extension; the CLI drives Chrome over DevTools Protocol.
 //
 // Usage: node chrome-mcp-wrapper.js <action> <url> [selector] [output]

@@ -1,6 +1,11 @@
 # 15 — Dependency Analysis
 
-## Current AgentBug runtime dependencies
+> **About these notes.** These are point-in-time analyses of third-party reference
+> projects, kept for design input. They describe the reference projects at the
+> snapshots examined and are not claims about the current BugFound code; verify
+> current behavior in `crates/`.
+
+## Current BugFound runtime dependencies
 
 `anyhow`, `serde`, `serde_json`, `tokio`, `tracing`, `tracing-subscriber`, `reqwest`, `rusqlite`, `clap`, `toml`, `uuid`, `async-trait`, `futures`, `url`, `chrono`, `sha2`, `eframe`, `egui`, `base64`, `regex`.
 
@@ -28,4 +33,4 @@
 
 ## License gate
 
-CI already runs `cargo deny check`. Add a policy note that `research/` clones are never vendored into distributions; restricted references (PentAGI VXControl, CAI proprietary, HackerOne/PortSwigger mirrors) are learning-only. See `10_license_audit.md`.
+CI already runs `cargo deny check`. Add a policy note that `research/` clones are not vendored into distributions; restricted references (PentAGI VXControl, CAI proprietary, HackerOne/PortSwigger mirrors) are learning-only. See `10_license_audit.md`.

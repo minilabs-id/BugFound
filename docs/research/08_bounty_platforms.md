@@ -1,4 +1,9 @@
-﻿# 08 - Bounty Platforms: HackerOne vs Bugcrowd Program Intelligence -> AgentBug
+﻿# 08 - Bounty Platforms: HackerOne vs Bugcrowd Program Intelligence -> BugFound
+
+> **About these notes.** These are point-in-time analyses of third-party reference
+> projects, kept for design input. They describe the reference projects at the
+> snapshots examined and are not claims about the current BugFound code; verify
+> current behavior in `crates/`.
 
 Read-only research deliverable. No implementation code was modified; only this file was
 written. Local source clones are shallow and git-ignored (research/README.md:3-5); record
@@ -11,7 +16,7 @@ their commits when citing this document.
 | HackerOne docs (community mirror) | `research/hackerone-docs/docs/programs/*.md`, `research/hackerone-docs/docs/hackers/*.md` | HEAD `ba9ef9b2b3ddd4465312f0c6b94bf6863dd9f5bb`, "Fix Setting Response Targets article" (2018-05-16). Paths in frontmatter are `/programs/<page>.html`, `/hackers/<page>.html`. | ~79 program pages + ~30 researcher pages. Substantive but **stale (~2018)**; treat as historical semantics, verify against the live platform before design decisions. |
 | Bugcrowd docs (local "official mintlify" mirror) | `research/bugcrowd-docs/` | HEAD `558fda7d191d241514613afc92e8714db457e41a`, "Initial commit" (2026-11-13). | **No platform content at all.** It is the unmodified Mintlify starter kit: `README.md:1` "Mintlify Starter Kit"; `docs.json:2` name "Mintlify Starter Kit"; `index.mdx:6` "Write a short description of your product here"; only `index.mdx`, `quickstart.mdx`, `AGENTS.md`, `docs.json`. The local mirror cannot substantiate any Bugcrowd rule. |
 | Bugcrowd docs (official public site, **external evidence**) | `https://docs.bugcrowd.com/` -> Customers / Researchers / Customer API sections | Fetched 2026-11-20; site footer "Copyright © 2026 Bugcrowd"; no local snapshot was created (write-only constraint). Cited below as `EXT BC / <section>` with URL and section heading. Re-fetch before treating as pinned. | Current product docs: Engagement Brief, Scope & Rewards, VRT Scope Rules, Brief Changelog, Engagement Status, Disclose.io & Safe Harbor, Reporting a Bug, Submission Limit, Known Issues, plus full nav taxonomy. |
-| AgentBug implementation (current, no changes) | `crates/agentbug-engagement/src/lib.rs`, `crates/agentbug-policy/src/lib.rs`, `crates/agentbug-engagement/tests/engagement_integration.rs`, `crates/agentbug-cli/src/main.rs`, `docs/engagement.md`, `docs/report-format.md` | Workspace as inspected. | `BriefReader` (`fetch_brief`), `extract_profile_from_text`, `extract_profile_with_llm`, `parse_roe`, `unparsed_constraints`, `EngagementProfile`, `RoePolicy`, `parse_scope_brief`, `build_canonical_report`, `verify_findings`. |
+| BugFound implementation (current, no changes) | `crates/bugfound-engagement/src/lib.rs`, `crates/bugfound-policy/src/lib.rs`, `crates/bugfound-engagement/tests/engagement_integration.rs`, `crates/bugfound-cli/src/main.rs`, `docs/engagement.md`, `docs/report-format.md` | Workspace as inspected. | `BriefReader` (`fetch_brief`), `extract_profile_from_text`, `extract_profile_with_llm`, `parse_roe`, `unparsed_constraints`, `EngagementProfile`, `RoePolicy`, `parse_scope_brief`, `build_canonical_report`, `verify_findings`. |
 
 **Evidence-class rule for this document:** `[H1 path:lines]` = exact local-file evidence.
 `EXT BC / <page>` = official public web docs, not present in the local mirror. Where the two
@@ -98,10 +103,10 @@ Both platforms separate *what may be submitted and paid for* from *what the test
 | --- | --- | --- |
 | Report/asset eligibility | `defining-scope.md:35-36` (Submission/Bounty flags); `submit-report-form.md:20` weakness Show/Hide/Disable; `hackers/weakness.md:11-15` (CWE subset, enable/disable/hide per program) | EXT BC in-scope group flag, VRT Scope Rules, P5 Informational opt-in (`customers/submission-management/p5-opt-in/` in nav) |
 | Reporter eligibility | `signal-requirements.md:7-29`: Strict/Standard/Lenient/off Signal threshold; below-threshold hackers get capped reports, reset every 30 days | EXT BC `.../reporting-a-bug/submissions-limit/`: 6 submissions/week when 90-day accuracy <50%, new accounts 1 awaiting review + 6/week, 7-day minimum throttle, mandatory identity verification for Managed Bug Bounty; VDPs/Pen Tests excluded |
-| Operational constraints (tester behavior) | No dedicated platform page in the 2018 mirror; lives in per-program ROE text. Representative brief in `crates/agentbug-engagement/src/lib.rs:2550-2561`: max 10 rps, quoted UA marker, "No DoS testing. Do not modify data. No disclosure." | EXT BC `.../reporting-a-bug/`: -1 point for submitting against an out-of-scope target; repeated out-of-scope testing loses program/platform privileges. Detailed permitted techniques remain in the program brief. |
+| Operational constraints (tester behavior) | No dedicated platform page in the 2018 mirror; lives in per-program ROE text. Representative brief in `crates/bugfound-engagement/src/lib.rs:2550-2561`: max 10 rps, quoted UA marker, "No DoS testing. Do not modify data. No disclosure." | EXT BC `.../reporting-a-bug/`: -1 point for submitting against an out-of-scope target; repeated out-of-scope testing loses program/platform privileges. Detailed permitted techniques remain in the program brief. |
 | Availability gating | `pausing-report-submissions.md:7-19`: program can pause submissions; H1 can auto-pause on failing response SLAs; re-enable only when no failing SLA reports | EXT BC `.../engagement-brief/engagement-status/`: statuses Launching, Launch paused, In progress, In progress-paused, Finalizing, Completed, Canceling, Canceled; in paused/canceling states researchers can read the brief but **cannot submit or complete the methodology** |
 
-AgentBug already encodes this distinction in one place: `unparsed_constraints` deliberately
+BugFound already encodes this distinction in one place: `unparsed_constraints` deliberately
 excludes report-eligibility/qualifier lines from the fail-closed check via `NON_ACTIONABLE`
 (`lib.rs:1724-1745`, e.g. "duplicate", "informational", "already reported", "out of scope",
 "third party"), with the comment that these "describe what the program will/not reward, not
@@ -124,7 +129,7 @@ the information away** instead of retaining it as program intelligence.
   informational opt-in, and collaboration reward splits.
 
 **Pattern:** reward structure is per-asset/class and can be time-boxed; it is not a scalar.
-AgentBug's `RoePolicy` has no reward field and its `EngagementProfile` stores only free-text
+BugFound's `RoePolicy` has no reward field and its `EngagementProfile` stores only free-text
 `reporting_rules` lines matched by a keyword filter (`lib.rs:1400-1418`).
 
 ### 1.5 Disclosure policy and safe harbor
@@ -203,13 +208,13 @@ local finding-ID uniqueness is a weaker property.
   submission cannot be edited after reporting.
 
 **Pattern:** the report contract is platform- and program-specific, structured, and includes
-classification plus an attestation. AgentBug deliberately never submits
+classification plus an attestation. BugFound deliberately does not submit
 (`docs/engagement.md:7-10`), so the requirement is local: produce a submission-ready draft.
 
 ### 1.8 Rate limits and prohibited methods
 
 - Neither platform's generic docs define a platform-wide **network request rate limit**.
-  Those live in the program brief. AgentBug's `parse_roe` regexes
+  Those live in the program brief. BugFound's `parse_roe` regexes
   (`lib.rs:1577-1579`) only recognize `N requests? per second` and
   `N requests? (total|in total|per engagement|maximum)`; the fixture brief uses 10 rps and a
   quoted UA marker (`lib.rs:2550-2561`).
@@ -225,10 +230,10 @@ classification plus an attestation. AgentBug deliberately never submits
 
 ## 2. HackerOne vs Bugcrowd semantics and terminology
 
-| Concept | HackerOne (local mirror) | Bugcrowd (official external docs) | AgentBug today |
+| Concept | HackerOne (local mirror) | Bugcrowd (official external docs) | BugFound today |
 | --- | --- | --- | --- |
 | Top-level container | Program: Response (private VDP) or Bounty; managed/hosted; private by default, public is explicit (`program-start-up-guide.md:16-20`, `start-h1-bounty.md:7-9`, `public-vs-private.md:7-25`) | Security Program containing one or more Engagements with lifecycle states (`Launching` ... `Canceled`) (EXT BC nav + Engagement Status) | `EngagementProfile.program_url` string; no program type/visibility |
-| Scope unit | Typed **Asset** with identifier (CIDR/URL/store IDs/etc.) (`asset-types.md:8-20`) | **Target** inside a scope **group**; group carries in-scope and pays-rewards flags (EXT BC Scope & Rewards) | `ScopeConfig.in_scope/out_of_scope` string patterns (`agentbug-policy/src/lib.rs:171-223`) |
+| Scope unit | Typed **Asset** with identifier (CIDR/URL/store IDs/etc.) (`asset-types.md:8-20`) | **Target** inside a scope **group**; group carries in-scope and pays-rewards flags (EXT BC Scope & Rewards) | `ScopeConfig.in_scope/out_of_scope` string patterns (`bugfound-policy/src/lib.rs:171-223`) |
 | Exclusions | Out-of-scope assets + `Environmental Score` severity cap + weakness `Disable`/`Hide` | Out-of-scope groups + VRT Scope Rules (class x target) + "Now OOS" flags | Flat deny list; `NON_ACTIONABLE` prose filters |
 | Eligibility | Eligibility for Submission / for Bounty per asset; Signal threshold per researcher | In-scope flag; pays-rewards flag; full/partial Safe Harbor; P5 opt-in; Known Issues | Nothing structured; prose keyword filter |
 | Severity | CVSS v3 (optional hacker severity) + per-asset environmental cap | VRT P1-P5 baseline priority (suggested, not guaranteed); CVSS management docs exist | `cvss_base` CVSS v3.1 + `map_cwe` static table (`lib.rs:1948-2117`) |
@@ -240,10 +245,10 @@ classification plus an attestation. AgentBug deliberately never submits
 | Freshness | "Re-evaluate your policy on a recurring basis" (`good-policies.md:22`); no version API in mirror | Published Brief Changelog versions, target flags for four weeks, VRT review twice yearly, status with date+reason | One fetch at start; resume does not re-fetch (`docs/engagement.md:139-142`) |
 
 **Terminology trap:** "engagement" means different things. In Bugcrowd it is a first-class,
-stateful object with a published brief; in AgentBug `EngagementProfile.engagement` is just a
+stateful object with a published brief; in BugFound `EngagementProfile.engagement` is just a
 display name derived from a `Program:` line or URL host (`lib.rs:1383-1387`). "Scope" in
-HackerOne is an asset collection; in AgentBug it is a pair of host-pattern lists. "Rule" in
-AgentBug mixes allow/deny scope lines, ROE prose, and reporting prose in three loose buckets
+HackerOne is an asset collection; in BugFound it is a pair of host-pattern lists. "Rule" in
+BugFound mixes allow/deny scope lines, ROE prose, and reporting prose in three loose buckets
 (`lib.rs:1389-1429`), whereas the platforms separate them into distinct typed objects.
 
 ## 3. What a robust program-intelligence data model must capture
@@ -273,7 +278,7 @@ proposed implementation.
 5. **OperationalConstraint** - dimension (network rps, total requests, UA marker, fuzzing/
    scanner, state changes, intrusive tools, disclosure, DoS), verdict
    (allowed/denied/**unknown**), exact quoted text, source ref. *Why:* per-program ROE;
-   AgentBug's fixture (`lib.rs:2550-2561`) demonstrates all four dimensions in one brief.
+   BugFound's fixture (`lib.rs:2550-2561`) demonstrates all four dimensions in one brief.
 6. **DisclosurePolicy** - mode (coordinated/discretionary/non-disclosure/disabled/default/
    mutual), permission holder, embargo days, full-vs-limited, redaction list.
    *Why:* H1 `public-disclosure.md:9-49`; EXT BC safe harbor + Reporting a Bug.
@@ -294,7 +299,7 @@ proposed implementation.
 - **Separate eligibility from operations.** Eligibility rules change what a report is worth
   or whether it will be accepted; operational constraints change what the agent may do. Keep
   fail-closed enforcement on operations, but retain eligibility as data for triage/report
-  annotation. AgentBug's `NON_ACTIONABLE` list is the right enforcement boundary, not the
+  annotation. BugFound's `NON_ACTIONABLE` list is the right enforcement boundary, not the
   right storage boundary.
 - **Model absence as Unknown, not False.** For `RoePolicy`, fail-closed false is correct for
   actions; for program intelligence, "not stated" must remain distinguishable from "explicitly
@@ -308,7 +313,7 @@ proposed implementation.
   scope changes mid-program - exactly the dispute scenario the Bugcrowd changelog exists to
   prevent.
 - **Keep the human authorization boundary.** Both platforms' safe-harbor language is a
-  program's promise, not legal advice; AgentBug must keep operator confirmation explicit
+  program's promise, not legal advice; BugFound must keep operator confirmation explicit
   (`docs/engagement.md:188-189`).
 
 ### 3.3 Provenance tuple (minimum)
@@ -320,17 +325,17 @@ This is the concrete answer to "source references for extracted rules". It is al
 makes an LLM-extracted scope usable: the LLM may propose values, but the deterministic pass
 must be able to cite the sentence/element that justified them.
 
-## 4. Mapping to AgentBug's current BriefReader / RoePolicy - concrete gaps
+## 4. Mapping to BugFound's current BriefReader / RoePolicy - concrete gaps
 
 ### 4.1 Multi-platform parsers - GAP: no platform detection or structured extraction
 
 Current code:
 
-- `fetch_brief` (`crates/agentbug-engagement/src/lib.rs:1212-1248`) is a single generic
+- `fetch_brief` (`crates/bugfound-engagement/src/lib.rs:1212-1248`) is a single generic
   reqwest GET: no proxy, no redirects, private-host rejection, 45s timeout, 1 MB cap,
   browser UA. `html_to_text` (`:1325-1345`) regex-strips HTML and explicitly preserves `-`
   and `*.` line shapes for the scope heuristic.
-- `parse_scope_brief` (`crates/agentbug-policy/src/lib.rs:171-223`) is a line scanner:
+- `parse_scope_brief` (`crates/bugfound-policy/src/lib.rs:171-223`) is a line scanner:
   a heading containing "out of scope"/"in scope" flips a boolean; lines starting with `-` are
   accepted as patterns only if they are single tokens containing `.`/`/`/`:`/`*.`; all other
   lines become a `notes` blob.
@@ -400,7 +405,7 @@ it to annotate findings ("out-of-scope class", "no bounty", "likely duplicate") 
 a warning/confirmation step - not to loosen tool gates. Note H1's Signal threshold
 (`signal-requirements.md:7-29`) and Bugcrowd's submission throttling are reporter-level
 eligibility rules the agent cannot satisfy on a user's behalf; surface them as operator
-checks, never silently assume them.
+checks, not silently assume them.
 
 ### 4.4 Report requirements per platform - GAP: single canonical schema only
 
@@ -424,7 +429,7 @@ the program's full/limited/redaction settings. Auto-submission stays forbidden
 
 - Dedup is a `HashSet<String>` of already-seen local finding IDs (`lib.rs:886-890`,
   `:1000-1031`); `verify_findings` checks canary replay and evidence digests
-  (`:2163-2249`) but never asks whether the issue is novel for the platform.
+  (`:2163-2249`) but does not ask whether the issue is novel for the platform.
 - `duplicate` and `already reported` appear only in the `NON_ACTIONABLE` exclusion list
   (`lib.rs:1736-1738`) - deliberately not enforced, but also not captured.
 - Doc requirement: H1 Duplicate state with an original report link and reputation effect
@@ -433,7 +438,7 @@ the program's full/limited/redaction settings. Auto-submission stays forbidden
 
 **Gap summary:** model `DuplicatePolicy` and `PriorArt`; when a known-issues feed is available,
 attach matching target/class prior art to a finding as an advisory field; record that local
-uniqueness is not platform novelty in the report and in the event stream. Never claim a
+uniqueness is not platform novelty in the report and in the event stream. Do not claim a
 finding is "new" based only on local dedup.
 
 ### 4.6 Authorization freshness - GAP: no safe harbor, no active window, no attestation record
@@ -482,7 +487,7 @@ replay/trace and report so an auditor can answer "which sentence authorized this
   singular forms need coverage (`lib.rs:1577`). The request-ceiling regex is similarly narrow
   (`:1578-1579`). These are brief-language gaps, not platform semantics, and should be
   handled by the platform adapter with fail-closed fallback.
-- LLM user-agent marker construction hard-codes `agentbug/0.1 <marker>` (`lib.rs:1588`);
+- LLM user-agent marker construction hard-codes `bugfound/0.1 <marker>` (`lib.rs:1588`);
   preserve the exact quoted string from the brief (the integration test only asserts
   containment, `tests/engagement_integration.rs:36-43`).
 - `host_key` intersection strips scheme, port, `*.` and trailing dot (`lib.rs:1542-1566`).
@@ -504,7 +509,7 @@ replay/trace and report so an auditor can answer "which sentence authorized this
   asset-centric with two eligibility bits and an environmental severity cap; Bugcrowd is
   target-group-centric with a second (VRT class x target) exclusion matrix, published brief
   versions, four-week target flags, and a graded safe-harbor claim.
-- AgentBug's `BriefReader`/`RoePolicy` is a deliberately conservative single-brief,
+- BugFound's `BriefReader`/`RoePolicy` is a deliberately conservative single-brief,
   English-phrase, fail-closed reader. Its safety posture is sound; its **intelligence model is
   too flat**: no platform adapters, no typed eligibility, no version/freshness, no
   safe-harbor/status window, no per-platform report contract, no duplicate prior art, and no

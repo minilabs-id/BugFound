@@ -1,10 +1,15 @@
-﻿# 11 Current gap analysis: AgentBug vs. the master vision
+﻿# 11 Current gap analysis: BugFound vs. the master vision
 
-Date: 2026-11-20. Mode: READ-ONLY review of crates/agentbug-*, README.md,
+> **About these notes.** These are point-in-time analyses of third-party reference
+> projects, kept for design input. They describe the reference projects at the
+> snapshots examined and are not claims about the current BugFound code; verify
+> current behavior in `crates/`.
+
+Date: 2026-11-20. Mode: READ-ONLY review of crates/bugfound-*, README.md,
 docs/PRODUCTION_PLAN.md, docs/HARDENING_PLAN.md, docs/REMAINING_GAPS.md,
 docs/TOOLS_CONTROL_HARDENING.md, docs/architecture.md, docs/research and eval/.
-No code was modified; no tests were executed. Test counts are declared test
-functions counted from source (215 at research time, 217 after R1/R2), not a pass/fail claim.
+No code was modified; no tests were executed. Where test counts are mentioned,
+they are declared test functions counted from source, not a pass/fail claim.
 Severity legend: Critical means the advertised mechanism cannot work in
 production; High means a core pillar of the vision is absent or inverted;
 Medium means partial or incorrect implementation, or material doc drift;
@@ -17,38 +22,38 @@ Low is polish; Deferred is consciously out of scope per REMAINING_GAPS.md.
 
 ## 0. Executive verdict (brutal)
 
-AgentBug is **not** a Universal Agent Kernel with a Bug Bounty Domain Engine
+BugFound is **not** a Universal Agent Kernel with a Bug Bounty Domain Engine
 plugged in. It is one vertically integrated, single-process bug-bounty harness.
-The crates marketed as reusable infrastructure (agentbug-core, agentbug-tools,
-agentbug-policy, agentbug-store) are saturated with bounty-domain concepts:
+The crates marketed as reusable infrastructure (bugfound-core, bugfound-tools,
+bugfound-policy, bugfound-store) are saturated with bounty-domain concepts:
 findings, CVSS/CWE, scope/ROE, WSTG playbooks, canaries, coverage, hypotheses,
 clues, report rendering and target extraction. There is no seam at which the
 domain could be removed without rewriting the core.
 More seriously, the **verification pillar is functionally broken in the real
-product path**. The "independent canary oracle" requires the captured response
-to contain a canary that the HTTP tool mints internally but **never sends in the
-request** (Section 2). Every verifier test passes only because the tests manually
-splice the canary into synthetic response bytes. Against a live target the
-verifier cannot promote a single finding, so a production engagement's report
-will always contain zero verified findings. This is not a "deferred feature"; it
-is a shipped feature that fails closed so hard that it never opens.
+product path** as analyzed at that snapshot. The "independent canary oracle"
+requires the captured response to contain a canary that the HTTP tool mints
+internally but **does not send in the request** (Section 2). The verifier tests
+use captures with the canary manually spliced into synthetic response bytes.
+Against a live target the verifier cannot promote a finding, so a production
+engagement's report would contain zero verified findings. This is recorded as a
+finding from that snapshot; Section 2 notes a later fix, and current behavior
+should be verified in `crates/`.
 Multi-agent orchestration, reflection, and memory layers do not exist. Provider
 "abstraction" is one trait with one OpenAI-compatible HTTP implementation and a
 side-channel for token usage. The tool runtime is a static in-process registry
 with PATH-scanning adapters, not a dynamic, capability-negotiated tool layer.
-Permission/sandbox is a solid policy layer plus defense-in-depth string checks,
+Permission/sandbox is a policy layer plus defense-in-depth string checks,
 explicitly not an OS sandbox. Program intelligence is a fixed nine-item WSTG
 checklist, a static CWE/WSTG table, heuristic brief parsing and a CVSS v3.1
-scorer. Reporting is a good local Markdown renderer with no submission path (by
-design). Observability is durable events plus eval-trace scaffolding, not
-production telemetry. Evaluation is scaffolding with **no recorded results and
-no executed baseline**, and the only end-to-end smoke test runs the offline,
+scorer. Reporting is a local Markdown renderer with no submission path (by
+design). Observability is durable events plus eval-trace export, not
+production telemetry. Evaluation is a scorer/exporter with **no recorded results
+and no executed baseline**, and the only end-to-end smoke test runs the offline,
 zero-tool LLM.
 
-The prototype is genuinely hardened in the areas it advertises as hardened
-(leases, atomic approvals, durable budgets, egress controls, redaction, shell
-allowlist, tamper-evident event chain). The gap is architectural and functional,
-not a lack of small fixes.
+The prototype has working mechanisms in several areas (leases, atomic approvals,
+durable budgets, egress controls, redaction, shell allowlist, tamper-evident
+event chain). The gap is architectural and functional, not a lack of small fixes.
 
 ---
 
@@ -73,14 +78,14 @@ not a lack of small fixes.
   blocks, but no OS sandbox.
 - Program intelligence: Partial / Medium. Nine static WSTG tasks, static
   knowledge base, heuristic plus LLM scope parse.
-- Verification: Broken in production / Critical. Canary never transmitted; tests
-  use synthetic captures.
+- Verification: Broken in production / Critical. Canary not transmitted in the
+  analyzed snapshot; tests use synthetic captures.
 - Reporting and submission: Partial / Deferred. Canonical local report;
   submission intentionally absent.
 - Observability: Partial / Medium. Durable events, trace_events, hash chain,
   in-memory bus; no OTel or metrics.
-- Evaluation: Scaffolding only / High. Scorer, exporter and drivers exist; zero
-  results, no baseline, offline e2e.
+- Evaluation: Scorer/exporter only / High. Scorer, exporter and drivers exist;
+  zero results, no baseline, offline e2e.
 
 ---
 
@@ -89,8 +94,8 @@ not a lack of small fixes.
 ## 2. CRITICAL: the verification oracle is unsatisfiable in production
 
 > **Resolved in R1.1 (2026-11-20).** `HttpRequestTool` now mints the canary
-> before request construction, injects it as `X-AgentBug-Canary` into the real
-> outbound request and its authoritative representation, scrubs it from the
+> before request construction, injects it as `X-BugFound-Canary` into the real
+> outbound request and its captured request representation, scrubs it from the
 > model-visible output, and threads the single token through every capture.
 > New tests `real_http_capture_promotes_finding` and
 > `non_reflecting_capture_is_rejected` gate the fix against a real local HTTP
@@ -98,35 +103,35 @@ not a lack of small fixes.
 > retained as the historical finding that motivated R1.
 
 Severity: Critical. This is the single most important finding in this report.
-Evidence chain, all verified in code:
+Evidence chain, as recorded from code:
 
-1. crates/agentbug-tools/src/lib.rs:940-951 - canary_for(request) hashes request
-   bytes plus nanoseconds into a token "agentbug-canary-" plus 64 hex digits.
-2. crates/agentbug-tools/src/lib.rs:953-960 - build_capture stores that token as
+1. crates/bugfound-tools/src/lib.rs:940-951 - canary_for(request) hashes request
+   bytes plus nanoseconds into a token "bugfound-canary-" plus 64 hex digits.
+2. crates/bugfound-tools/src/lib.rs:953-960 - build_capture stores that token as
    HttpCapture.canary. It does not add it to the request or the response.
-3. crates/agentbug-tools/src/lib.rs:1056-1088 - the outgoing request is built from
+3. crates/bugfound-tools/src/lib.rs:1056-1088 - the outgoing request is built from
    caller-supplied method, URL, headers and body. No canary header, query
    parameter or body injection exists; request_repr is built from the same
    inputs at lines 1082-1088.
-4. crates/agentbug-tools/src/lib.rs:1125-1160 - the captured response is status
-   plus observed headers plus redacted body. The canary is never present unless
+4. crates/bugfound-tools/src/lib.rs:1125-1160 - the captured response is status
+   plus observed headers plus redacted body. The canary is not present unless
    the remote server independently emitted that exact random token.
-5. crates/agentbug-tools/src/lib.rs:1252-1261 - ValidatePoCTool replays caller
-   headers and body verbatim and forwards the capture; it also never injects a
+5. crates/bugfound-tools/src/lib.rs:1252-1261 - ValidatePoCTool replays caller
+   headers and body verbatim and forwards the capture; it also does not inject a
    canary.
-6. crates/agentbug-engagement/src/lib.rs:2184-2187 - the verifier accepts a
+6. crates/bugfound-engagement/src/lib.rs:2184-2187 - the verifier accepts a
    finding only when response.contains(canary) AND has_success_status(response).
-7. crates/agentbug-engagement/src/lib.rs:2935-2965 and 2978-2985 - verifier tests
+7. crates/bugfound-engagement/src/lib.rs:2935-2965 and 2978-2985 - verifier tests
    construct captures by hand with a response string that manually includes the
-   canary. That is why the suite is green while the product cannot validate a
-   real finding.
-Impact: verify_findings (lines 2163-2249) promotes nothing, so
+   canary. The tests therefore do not exercise the live validation path; the
+   product path cannot validate a real finding as analyzed at that snapshot.
+Impact as analyzed: verify_findings (lines 2163-2249) promotes nothing, so
 store.verified_findings (line 1039) is empty and build_canonical_report
-(lines 1046-1054 and 2265-2374) reports zero verified findings on every real
-engagement. The "self-grading prevention" property is achieved vacuously: the
-system is independent of the LLM because it rejects everything. Claims in
-HARDENING_PLAN.md H-04 (lines 88-100) and PRODUCTION_PLAN.md matrix row 10 about
-a working authoritative verifier are therefore false in production.
+(lines 1046-1054 and 2265-2374) reports zero verified findings on a real
+engagement. The "self-grading prevention" property would then hold only because
+everything is rejected. The claims about a working independent verifier in
+HARDENING_PLAN.md H-04 (lines 88-100) and PRODUCTION_PLAN.md matrix row 10 are
+not supported by that analysis.
 Recommended next action (P0): decide the oracle semantics explicitly, then make
 them real. For reflected-input classes, inject a canary header or parameter into
 the outgoing request inside HttpRequestTool and verify its reflection in the
@@ -146,41 +151,41 @@ There is no kernel crate and no domain crate. The dependency direction is
 inverted from the vision: the supposed kernel depends on every concrete domain
 adapter. Evidence:
 
-- crates/agentbug-core/Cargo.toml:19-22 - core depends on agentbug-llm,
-  agentbug-tools, agentbug-policy and agentbug-store (all concrete).
-- crates/agentbug-tools/Cargo.toml:18 - the tool runtime depends on
-  agentbug-policy, which is the bounty scope engine.
-- crates/agentbug-policy/src/lib.rs:38-54 defines ScopeConfig with engagement,
+- crates/bugfound-core/Cargo.toml:19-22 - core depends on bugfound-llm,
+  bugfound-tools, bugfound-policy and bugfound-store (all concrete).
+- crates/bugfound-tools/Cargo.toml:18 - the tool runtime depends on
+  bugfound-policy, which is the bounty scope engine.
+- crates/bugfound-policy/src/lib.rs:38-54 defines ScopeConfig with engagement,
   in_scope and out_of_scope; lines 168-223 define parse_scope_brief; lines
   341-363 require network actions to be in engagement scope. A generic
   permission engine cannot be extracted without deleting these.
-- crates/agentbug-core/src/lib.rs:67-76 - goal_digest binds runs to a scope
+- crates/bugfound-core/src/lib.rs:67-76 - goal_digest binds runs to a scope
   summary; lines 163-201 - prioritize_targets expands wildcard scope and ranks
   by Hypothesis.
-- crates/agentbug-core/src/lib.rs:377-549 - persist_bounty_tool_result dispatches
+- crates/bugfound-core/src/lib.rs:377-549 - persist_bounty_tool_result dispatches
   on finding/asset/artifact/task/clue names and reads severity, cvss, cwe,
   vuln_type, canary, engagement_id and playbook_id. Domain orchestration lives
   in the runner.
-- crates/agentbug-core/src/lib.rs:1020-1048 - the stall guard counts confirmed
+- crates/bugfound-core/src/lib.rs:1020-1048 - the stall guard counts confirmed
   findings plus assets plus artifacts; lines 1763-1771 emit "No new findings
   ... concluding playbook".
-- crates/agentbug-core/src/lib.rs:1298-1304 - the system prompt says "You are
-  AgentBug, a universal agent core" immediately followed by "Engagement scope:
+- crates/bugfound-core/src/lib.rs:1298-1304 - the system prompt says "You are
+  BugFound, a universal agent core" immediately followed by "Engagement scope:
   ... Never probe out-of-scope targets." The kernel prompt is domain-injected.
-- crates/agentbug-core/src/lib.rs:2123-2193 - extract_policy_target knows asset,
+- crates/bugfound-core/src/lib.rs:2123-2193 - extract_policy_target knows asset,
   fqdn, subdomain and endpoint, and parses shell commands for URLs.
-- crates/agentbug-tools/src/lib.rs:76-103 - ToolOptions carries scope, ROE
+- crates/bugfound-tools/src/lib.rs:76-103 - ToolOptions carries scope, ROE
   user-agent, max RPS and allowed HTTP methods (ROE policy in tool config).
-- crates/agentbug-tools/src/lib.rs:2044-2087 and 2115-2131 - the "universal"
+- crates/bugfound-tools/src/lib.rs:2044-2087 and 2115-2131 - the "universal"
   registry registers SaveFindingTool, RecordAssetTool, ValidatePoCTool,
   HttpFuzzTool, PayloadForgeTool, KnowledgeLookupTool, ReportWriterTool,
   TaskPutTool, CluePutTool, vuln_scan and a gated browser CLI adapter.
-- crates/agentbug-tools/src/lib.rs:2870-2988 - bundled WSTG and CWE knowledge
+- crates/bugfound-tools/src/lib.rs:2870-2988 - bundled WSTG and CWE knowledge
   base and knowledge_lookup.
-- crates/agentbug-tools/src/lib.rs:3010-3178 - ReportFinding, ReportInput and
+- crates/bugfound-tools/src/lib.rs:3010-3178 - ReportFinding, ReportInput and
   render_canonical_report (CVSS, CWE, PoC, evidence hash, scope and ROE) live
   in the tool crate.
-- crates/agentbug-store/src/lib.rs:270-380 - one monolithic SQLite schema mixing
+- crates/bugfound-store/src/lib.rs:270-380 - one monolithic SQLite schema mixing
   session primitives with findings, assets, coverage, hypotheses, engagements,
   tasks, clues, evidence, reports and trace_events.
 
@@ -191,14 +196,14 @@ architecture.
 Recommended next action (P1): establish a seam rather than a big-bang rewrite.
 -a Define kernel traits for Policy, Tool, Store and Model with generic
   ActionRequest and ToolSpec; move scope/ROE, finding/report and WSTG into
-  agentbug-engagement or a new agentbug-domain crate.
+  bugfound-engagement or a new bugfound-domain crate.
 -b Replace persist_bounty_tool_result, prioritize_targets, evidence_count and
   the scope-bearing system prompt in core with an injected domain Observer or
   Planner trait implemented by engagement.
 -c Split the domain tables into a separate store extension.
 -d Enforce with a CI dependency check: core must not import policy domain types
   or mention finding, scope, cvss or cwe.
-Verified NOT gaps (do not re-report): ToolOptions.allowed_methods is implemented
+Observed as present (do not re-report): ToolOptions.allowed_methods is implemented
 and enforced (tools/src/lib.rs:1007-1016); B1 capture bytes are stored via
 attach_capture (core/src/lib.rs:450-463); approvals are a single
 park_with_approval transaction (core/src/lib.rs:2048-2049); B12 goal lock uses
@@ -218,8 +223,8 @@ Bounded one-LLM-call-per-step loop with durable reloaded history
 (lines 688-707 and 1150-1233), atomic approval park/resume
 (lines 1586-1725 and 2000-2075), crash recovery (670-686), durable budgets and
 rate/cooldown/duplicate guards (773-803, 939-969, 1050-1105), injection
-detection and goal/scope lock (82-111, 833-852). There are 41 integration tests
-in core/tests/runner_integration.rs and 12 unit tests in core/src/lib.rs.
+detection and goal/scope lock (82-111, 833-852). Integration tests live in
+core/tests/runner_integration.rs and unit tests in core/src/lib.rs.
 No action beyond the kernel refactor and verifier fix.
 
 ### 4.2 Multi-agent orchestration: missing, High
@@ -243,7 +248,7 @@ cancellation and wake bookkeeping only.
 
 ### 4.3 Reflection: missing, High
 
-No reflect, critic, self-review or revision concept exists in crates (verified by
+No reflect, critic, self-review or revision concept exists in crates (checked by
 search; only "Reflected XSS" strings and is_self_graded_marker exist). The runner
 appends tool output as untrusted text and immediately continues
 (core/src/lib.rs:1516-1523 and 1948-1999). There is no second-pass review of a
@@ -304,7 +309,7 @@ register/get/specs (tools/src/lib.rs:105-151); compile-time built-ins plus PATH
 discovery (2149-2272). Two divergent ToolSpec types (tools 30-36 versus llm
 69-74) are converted lossily in the runner (core/src/lib.rs:1838-1847), dropping
 risk metadata.
-input_schema is sent to the model but arguments are never schema-validated at
+input_schema is sent to the model but arguments are not schema-validated at
 the boundary; the runner only JSON-parses them (llm/src/lib.rs:425-432). Tool
 results are flattened to one untrusted text string (core/src/lib.rs:1517-1523),
 so the model gets no typed success or error channel. Prior research at
@@ -367,8 +372,8 @@ See Section 2. Beyond the unsatisfiable canary: verification is a generic
 2xx plus substring check (engagement 2251-2263) with no vulnerability-class
 semantics, no re-request against a controlled oracle, no differential or timing
 analysis, no confirmation that the finding claim matches captured evidence.
-validate_poc is correctly advisory only (tools 1279-1282), which means the only
-authoritative gate is the broken verifier. is_self_graded_marker (2260-2263) is
+validate_poc is advisory only (tools 1279-1282), which means the gate analyzed
+here is the verifier described in Section 2. is_self_graded_marker (2260-2263) is
 a fragile heuristic that rejects any HTML response lacking the canary.
 
 Next action: P0 from Section 2, then per-class validators, an independent
@@ -381,10 +386,10 @@ hash, CVSS/CWE and PoC (tools/src/lib.rs:3010-3178); report built only from
 verified findings (engagement 2265-2374); report written locally with SHA-256
 recorded in the store (1055-1071); redaction at report egress (2311-2372).
 
-No submission path exists anywhere in crates (verified by search: only "never
-submit" strings at engagement/src/lib.rs:875, 953 and 1828). This matches
+No submission path exists in crates (checked by search: only "never submit"
+strings at engagement/src/lib.rs:875, 953 and 1828). This matches
 README.md:73-77 and REMAINING_GAPS.md:15 and is a deliberate design decision,
-not a bug. Report it as Deferred, but note that a "complete bug bounty platform"
+not a bug. Report it as Deferred, but note that a "full bug bounty platform"
 vision without any submission or review workflow has a missing end-to-end link:
 an operator must manually review and submit.
 Next action: if the vision eventually includes submission, add it as an explicit
@@ -411,31 +416,31 @@ event schemas and an OTLP exporter, emit tool and LLM latency plus budget
 metrics.
 
 
-### 4.12 Evaluation: scaffolding only, High
+### 4.12 Evaluation: scorer/exporter only, High
 
 Evidence: eval/score.py (report structure plus recall, precision, FPR,
 reproducibility and tokens-per-finding, stdlib only), eval/export_trace.py,
 Windows and POSIX drivers, a golden manifest example, and one offline synthetic
-fixture under eval/results/example-synthetic, all explicitly labelled "not a
-result". README.md:150-168, PRODUCTION_PLAN.md:15-16 and 148-150, and
-REMAINING_GAPS.md:16 and 18 agree: no results asserted, and the plain-agent
-baseline is a plan, not a recorded result.
+fixture under eval/results/example-synthetic that holds invented data used to
+check arithmetic. README.md:150-168, PRODUCTION_PLAN.md:15-16 and 148-150, and
+REMAINING_GAPS.md:16 and 18 describe the baseline as a plan rather than a
+recorded result.
 Critical weakness: eval/e2e_test.ps1:83-131 runs engage --brief-only and then an
 offline full engagement (no API key, so OfflineLlm at
 engagement/src/lib.rs:2384-2411 issues no tool calls and validates nothing),
 then checks report headings and score.py --strict format checks. No Rust
 integration test performs brief to plan to real tool execution to verification
-to report. The nine tests in engagement/tests/engagement_integration.rs are
+to report. The tests in engagement/tests/engagement_integration.rs are
 pure-function tests: scope parsing, ROE, CVSS, options, playbook count.
 
-Impact: the harness can never fail a claim about detection quality because no
-real detection has been run; combined with Section 2 its verifier would fail
-every real finding anyway.
+Impact: the harness cannot currently fail a claim about detection quality because
+no real detection has been run; combined with Section 2 its verifier would fail
+every real finding in that analysis.
 Next action: run the benchmark on local vulnerable testbeds, record results with
 replay and manifest, execute the baseline, and add a Rust end-to-end test with a
 local HTTP server that asserts a tool capture is promoted and appears in the
-report. Until then keep the honest "hardened prototype, no benchmark results"
-label.
+report. Until then, describe the code and the absence of recorded measurements
+without a maturity label.
 
 ---
 
@@ -458,9 +463,12 @@ when provider usage is absent.
 D3 (Critical, already reported): HARDENING_PLAN.md:88-100 H-04 claims a working
 independent verifier. Code works only for hand-built captures (Section 2).
 
-D4 (Low): PRODUCTION_PLAN.md:4-5 and REMAINING_GAPS.md:57-58 say 180+ tests;
-215 declared test functions were counted at research time; 217 after R1/R2. Harmless, but the number must come
-from the gate, as the docs themselves say.
+D4 (Low): PRODUCTION_PLAN.md:4-5 and REMAINING_GAPS.md:57-58 cite a test-count
+figure; declared test functions were counted from source at research time. The
+docs themselves say the number should come from the gate.
+**Resolved 2026-11-23:** hardcoded test counts were removed from README,
+PRODUCTION_PLAN, REMAINING_GAPS and the master plan; the verification gate
+prints the count.
 
 D5 (Medium): core/src/step.rs:1-2 is presented as a retained module but is
 explicitly "additive; Runner keeps its own inline implementation" and duplicates
@@ -477,7 +485,7 @@ matrix row names a symbol that exists.
 ## 6. What is genuinely implemented and tested (do not regress)
 
 - Durable sessions, leases, guarded transitions and stale-session recovery
-  (core/src/lib.rs:670-707 and 1150-1233), 41 runner integration tests.
+  (core/src/lib.rs:670-707 and 1150-1233), runner integration tests.
 - Atomic approval park and resume with durable expiry, deferred tool-call
   batches and a full guard-chain re-run after approval
   (core/src/lib.rs:890-969, 1586-1725, 2000-2075).
@@ -531,7 +539,7 @@ report them honestly when claiming maturity.
    4.8). P3: OTLP observability (Section 4.11) and docs/code drift cleanup
    (Section 5).
 
-Until P0 and P1 land, the honest label remains hardened prototype: a single
-node, local-only bug-bounty harness with an unsatisfiable verifier, not a
-universal agent kernel with a working domain engine.
+Until P0 and P1 land, this remains a single-node, local-only bug-bounty harness
+with an unsatisfiable verifier in the analyzed snapshot, not a universal agent
+kernel with a working domain engine.
 

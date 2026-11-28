@@ -25,6 +25,15 @@ jobs:
           toolchain: 1.90.0
           components: rustfmt, clippy
 
+      # bugfound-app is a Tauri shell; on Linux its webkit2gtk-sys build script
+      # probes system packages via pkg-config. Without these, every workspace
+      # check fails on ubuntu-latest even though the agent crates are fine.
+      - name: Install Tauri Linux prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -32,7 +41,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Audit dependencies
-        uses: taiki-e/install-action@cargo-deny
+        # Pin the tool so a newer release's schema/config changes cannot
+        # silently alter deny.toml behavior (audit F16).
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.18.5
       - run: cargo deny check
 
       - name: Enforce ADR-001 kernel boundary

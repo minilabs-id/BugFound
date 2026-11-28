@@ -107,9 +107,18 @@ python eval/score.py --dir eval/results/<id> --manifest eval/results/<id>/manife
 
 `score.py` accepts both the engagement replay's `event` key and the trace DB's
 `kind` key. Recognised kinds are `run_start`, `action`, `finding`, `tested`,
-`verifier`, `usage` and `report`. FPR prefers explicit `tested` hypotheses, then
-deterministic `verifier` verdicts, then failed `action` events that carry a
-hypothesis identifier; its basis is reported in `false_positive_basis`.
+`verifier`, `usage` and `report`. A true FPR is measured only from negative
+`tested` hypotheses (explicit positive verdicts such as `observed`/`confirmed`
+are excluded), then negative `verifier` verdicts, then failed `action` events
+carrying a hypothesis identifier; its basis is `false_positive_basis`. With no
+negatives it is `not_measured`. `false_discovery_rate_proxy = 1 - precision` is
+reported separately and never substitutes for FPR.
+
+Report headings carry no structured verdict. `--finding-map <file>` maps a
+report heading to a replay finding id (`{"heading": "F-001"}`); canonical
+headings with a stable `F-###` id are resolved by that id. With neither, every
+report-heading verdict stays `None` — identifier/type similarity is not
+evidence.
 
 Checks and metrics:
 
@@ -118,15 +127,17 @@ Checks and metrics:
 | required sections / finding fields | report Markdown | Executive Summary, Scope & ROE (`Scope` accepted), Methodology, Findings, Coverage, Timeline, Appendices; CVSS v3.1, CWE, steps, PoC, impact, remediation, evidence hash |
 | `recall` | manifest + reports/replay | `|G ∩ R| / |G|` over ground-truth keys |
 | `precision` | manifest + reports/replay | true positives / reported findings |
-| `false_positive_rate` | replay `tested` / `verifier` / failed `action` events, else reported findings | `FP / (FP + TN)`; `false_positive_basis` states which basis was used |
+| `false_positive_rate` | negative replay `tested` / `verifier` / failed `action` events only | `FP / (FP + TN)`; `not_measured` when there are no negatives; `false_positive_basis` states the basis |
+| `false_discovery_rate_proxy` | derived from `precision` | `1 - precision`; a proxy, never an FPR and never accepted by `--max-fpr` |
 | `reproducibility` | replay grouped by `run_id` (`run_start` marks a run) | fraction of findings present in every run + fraction of runs with the modal report hash (needs ≥2 runs) |
 | `tokens_per_finding` | replay `usage` events | API prompt + completion tokens / valid findings (no `len/4` estimates) |
 
 `--json` emits a single object with `reports`, `summary`, `metrics`, `notes`, and a
 `claim` field.
 `--strict` fails on missing sections/fields and on optional `--min-recall`,
-`--min-precision`, `--max-fpr` thresholds when those are supplied. Metrics whose
-input is absent are reported as `null` / `n/a` and are not guessed.
+`--min-precision`, `--max-fpr` thresholds when those are supplied. `--max-fpr`
+requires a measured FPR and refuses to accept `false_discovery_rate_proxy`.
+Metrics whose input is absent are reported as `null` / `n/a` and are not guessed.
 
 Replay JSONL event kinds: `run_start`, `action`, `finding`, `tested`, `verifier`,
 `usage`, `report`. Unknown kinds are ignored with a warning.

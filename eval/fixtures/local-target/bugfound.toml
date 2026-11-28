@@ -1,0 +1,25 @@
+[llm]
+base_url = "http://127.0.0.1:1/v1"
+api_key = ""
+default_model = "mock"
+timeout_ms = 60000
+
+[agent]
+mode = "ask"
+max_steps = 25
+auto_approve_all = false
+
+[policy]
+allowed_tools = []
+denied_tools = []
+
+[network]
+allow_network_write = false
+allow_intrusive = false
+trusted_local_targets = ["127.0.0.1"]
+
+[scope]
+in_scope = ["127.0.0.1"]
+
+[oob]
+endpoint = "http://127.0.0.1:8082"

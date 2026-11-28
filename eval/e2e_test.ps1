@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Local end-to-end smoke test: HTML brief server -> `agentbug.exe engage
+    Local end-to-end smoke test: HTML brief server -> `bugfound.exe engage
     --brief-only` -> report existence check.
 
 .DESCRIPTION
@@ -16,7 +16,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Agentbug = 'agentbug.exe',
+    [string]$BugFound = 'bugfound.exe',
     [switch]$KeepWork
 )
 
@@ -51,7 +51,7 @@ $server = Start-Process -FilePath 'python' -ArgumentList $serverArgs -PassThru -
     -RedirectStandardOutput (Join-Path $workDir 'server.out.log') `
     -RedirectStandardError (Join-Path $workDir 'server.err.log')
 
-$savedApiKey = $env:AGENTBUG_API_KEY
+$savedApiKey = $env:BUGFOUND_API_KEY
 $savedOpenAiKey = $env:OPENAI_API_KEY
 try {
     # Wait for the brief server to accept connections.
@@ -76,13 +76,13 @@ try {
     $url = "http://127.0.0.1:$port/brief.html"
 
     # Force offline mode so this smoke test never calls an LLM provider.
-    $env:AGENTBUG_API_KEY = ''
+    $env:BUGFOUND_API_KEY = ''
     $env:OPENAI_API_KEY = ''
 
     # 1. Required read-only path: ingest the brief, plan tasks, execute no tools.
     $briefArgs = @('engage', '--brief-only', '--url', $url, '--cwd', $workDir, `
         '--db', (Join-Path $workDir 'brief-only.db'))
-    & $Agentbug @briefArgs 2>&1 | Tee-Object -FilePath (Join-Path $workDir 'brief-only.log')
+    & $BugFound @briefArgs 2>&1 | Tee-Object -FilePath (Join-Path $workDir 'brief-only.log')
     $briefLog = Get-Content -LiteralPath (Join-Path $workDir 'brief-only.log') -Raw
     if ($briefLog -notmatch 'engagement started' -or $briefLog -notmatch 'engagement finished') {
         throw "engage --brief-only did not complete; see $workDir\brief-only.log"
@@ -92,7 +92,7 @@ try {
     # 2. Offline full engagement writes a report-<id>.md under --cwd.
     $engageArgs = @('engage', '--url', $url, '--cwd', $workDir, `
         '--db', (Join-Path $workDir 'engage.db'))
-    & $Agentbug @engageArgs 2>&1 | Tee-Object -FilePath (Join-Path $workDir 'engage.log')
+    & $BugFound @engageArgs 2>&1 | Tee-Object -FilePath (Join-Path $workDir 'engage.log')
 
     $report = Get-ChildItem -LiteralPath $workDir -Recurse -File -Filter 'report*.md' `
         -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -130,7 +130,7 @@ try {
     }
     Write-Host "[e2e] score.py --strict PASS (format only; no benchmark result)."
 } finally {
-    $env:AGENTBUG_API_KEY = $savedApiKey
+    $env:BUGFOUND_API_KEY = $savedApiKey
     $env:OPENAI_API_KEY = $savedOpenAiKey
     if ($null -ne $server -and -not $server.HasExited) {
         Stop-Process -Id $server.Id -Force

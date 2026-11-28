@@ -1,0 +1,11 @@
+BugFound Local Authorized Lab
+
+In scope
+- 127.0.0.1
+
+Out of scope
+- example.com
+
+Safe harbor applies to this local testbed. Please report findings privately.
+Rules of engagement:
+State changes are allowed on this local testbed.

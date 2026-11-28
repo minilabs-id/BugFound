@@ -1,0 +1,18 @@
+[package]
+name = "bugfound-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# `custom-protocol` makes a plain `cargo build` embed frontend/dist instead of
+# pointing the window at the Vite dev URL. The Tauri CLI also sets this for
+# production builds; keeping it here makes the documented build command honest.
+tauri = { version = "2", features = ["custom-protocol"] }
+serde.workspace = true
+serde_json.workspace = true
+bugfound-desktop-core = { path = "../bugfound-desktop-core" }

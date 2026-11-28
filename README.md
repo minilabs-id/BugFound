@@ -12,6 +12,11 @@ read the call sites listed in `docs/PRODUCTION_PLAN.md`. For what is absent,
 read `docs/REMAINING_GAPS.md`. For how to check the current state, run the
 commands in `docs/PRODUCTION_PLAN.md` §4; no test count is recorded here.
 
+The V3 agent-driven work (investigation state, planner seam, versioned technique
+catalog, verifier authority, Tauri shell, and local evaluation labs) is
+summarised honestly in [`docs/V3_STATUS.md`](docs/V3_STATUS.md). No effectiveness
+claim is made for public targets.
+
 ## Workspace
 
 | Crate | Role |
@@ -26,7 +31,9 @@ commands in `docs/PRODUCTION_PLAN.md` §4; no test count is recorded here.
 | `bugfound-proxy` | Bounded HTTP/CONNECT intercepting proxy with a scope gate. |
 | `bugfound-collaborator` | Self-hosted HTTP/DNS interaction listener for OOB checks. |
 | `bugfound-cli` | Command-line interface. |
-| `bugfound-desktop` | Windows desktop interface (egui/eframe). |
+| `bugfound-desktop` | Legacy Windows desktop interface (egui/eframe); removed when the new shell reaches parity. |
+| `bugfound-desktop-core` | Shared desktop state, config and redacted view models used by the shell. |
+| `bugfound-app` | New Tauri 2 desktop shell; renders the React frontend in `frontend/`. |
 
 `research/` holds third-party source clones kept for reference; they are
 git-ignored and are not part of the build.
@@ -81,12 +88,13 @@ bugfound plan|tokens|tools|doctor|verify-log --session <id>
 bugfound scope-import --file brief.txt --program "Acme"
 ```
 
-The desktop build uses the same crates. `start-desktop.bat` launches it on
-Windows. Its surface is a conversation: type a program URL or a follow-up
-message, read streamed assistant text and tool activity in the same timeline,
-and answer approval prompts inline. One long-lived worker owns the Tokio
-runtime, the conversation session and the engagement driver. Configuration is
-read from `bugfound.toml`; see `config/bugfound.example.toml`.
+The desktop interface is being replaced by a Tauri 2 + React shell (ADR-009;
+plan in `docs/roadmap/DESKTOP_UI_OVERHAUL.md`). The legacy egui build is still
+available through `start-desktop.bat` until the new shell reaches feature
+parity. The new shell is built with `cargo build -p bugfound-app` after
+`pnpm --dir frontend build`; it loads `bugfound.toml` through
+`bugfound-desktop-core`, and the webview only sees redacted view models.
+Configuration is documented in `config/bugfound.example.toml`.
 
 ## Verification
 

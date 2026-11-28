@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Baseline core IPC only. No shell, filesystem, HTTP or dialog plugin permissions are granted to the webview; every agent action goes through a Rust command.","local":true,"windows":["main"],"permissions":["core:default"]}}

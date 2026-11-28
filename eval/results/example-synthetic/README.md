@@ -16,8 +16,12 @@ Files:
 - `manifest.json` — invented ground truth for that finding.
 - `replay.jsonl` — invented `run_start`/`action`/`tested`/`finding`/`verifier`/
   `usage`/`report` events.
-- `score.json` — output of `python eval/score.py report.md --manifest manifest.json \
-  --replay replay.jsonl --json --strict` over the synthetic fixture.
+- `score.json` — UTF-8 (no BOM) output of `python eval/score.py report.md
+  --manifest manifest.json --replay replay.jsonl --json --strict` over the
+  synthetic fixture, regenerated from the current scorer. Its
+  `false_positive_rate` is measured from the negative `tested` event only;
+  `false_discovery_rate_proxy` (`1 - precision`) is reported separately and is
+  never used by `--max-fpr`.
 
 `eval/score.py --dir eval/results` deliberately skips directories named
 `example-*` so this fixture is not included in operator-recorded scores.

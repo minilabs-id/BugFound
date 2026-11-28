@@ -1,0 +1,11 @@
+[package]
+name = "bugfound-kernel-traits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+sha2.workspace = true
+bugfound-store = { path = "../bugfound-store" }
+bugfound-tools = { path = "../bugfound-tools" }

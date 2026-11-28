@@ -1,0 +1,10880 @@
+// Public type aliases/redaction helpers intentionally live below the test module.
+#![allow(clippy::items_after_test_module)]
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{self, AsyncReadExt};
+use tokio::process::Command;
+use tokio::time::{sleep, timeout, Duration};
+
+pub use bugfound_redact::{
+    redact, redact_canaries, redact_canary_text, redact_json, redact_json_value, redact_secrets,
+    redact_sensitive, redact_text, redacted_json, scrub_canaries, CANARY_PREFIX, REDACTED,
+    REDACTED_CANARY, SENSITIVE_KEYS,
+};
+
+const MAX_OUTPUT_BYTES: usize = 8 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 16 * 1024;
+/// One extra chunk of headroom prevents a single borderline chunk from being
+/// discarded just because it crosses the cap; we still stop immediately after.
+const MAX_HTTP_BODY_SLACK: usize = 8 * 1024;
+const MAX_READ_BYTES: u64 = 512 * 1024;
+/// Hard ROE caps for `http_fuzz`: at most 200 wordlist items and 200 requests
+/// per call. Methods are restricted to non-destructive GET/HEAD/POST.
+const MAX_FUZZ_WORDLIST: usize = 200;
+const MAX_FUZZ_REQUESTS: usize = 200;
+const FUZZ_METHODS: &[&str] = &["GET", "HEAD", "POST"];
+/// Hard caps for the active-scan wrapper. Defaults stay conservative.
+const MAX_SCAN_PAYLOADS: usize = 200;
+const MAX_SCAN_REQUESTS: usize = 200;
+/// Local Collaborator simulation never records more than this many hits.
+const MAX_OOB_INTERACTIONS: usize = 32;
+/// Unit separator used to combine `(domain, name)` into one jar key. Neither
+/// component may legally contain this character.
+const COOKIE_JAR_KEY_SEP: char = '\u{1f}';
+/// Hard caps so a hostile response cannot grow an unbounded jar or header.
+const MAX_COOKIE_JAR_ENTRIES: usize = 256;
+const MAX_COOKIE_HEADER_BYTES: usize = 4096;
+/// Per-pipe cap for child stdout/stderr. `output()`/`wait_with_output()` used to
+/// buffer unbounded, attacker-controlled bytes before truncation.
+const MAX_CHILD_STREAM_BYTES: usize = MAX_OUTPUT_BYTES;
+
+/// Read at most `cap` bytes from a child pipe, then drain the remainder so a
+/// surviving writer never blocks on a full pipe.
+async fn drain_capped_pipe<R: io::AsyncRead + Unpin>(reader: R, cap: usize) -> Vec<u8> {
+    let mut head = Vec::new();
+    let mut limited = reader.take(cap as u64);
+    let _ = limited.read_to_end(&mut head).await;
+    let mut rest = limited.into_inner();
+    let _ = io::copy(&mut rest, &mut io::sink()).await;
+    head
+}
+
+/// Spawn bounded drain tasks for both child pipes, poll the child with a
+/// deadline, and kill the whole process tree on timeout. Returns the capped
+/// stdout/stderr prefixes; the caller redacts them before formatting output.
+async fn collect_capped_output(
+    child: &mut tokio::process::Child,
+    limit: Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    let stdout = child.stdout.take().context("stdout pipe")?;
+    let stderr = child.stderr.take().context("stderr pipe")?;
+    let stdout_task = tokio::spawn(drain_capped_pipe(stdout, MAX_CHILD_STREAM_BYTES));
+    let stderr_task = tokio::spawn(drain_capped_pipe(stderr, MAX_CHILD_STREAM_BYTES));
+    let pid = child.id();
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait().context("poll child")? {
+            Some(status) => break status,
+            None => {
+                if Instant::now() >= deadline {
+                    kill_process_tree(child);
+                    let _ = child.kill().await;
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    anyhow::bail!("command timeout");
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    // A grandchild can keep the pipes open after the direct child exits; bound
+    // that drain too and kill the tree if it does not settle.
+    let drain = async {
+        let stdout = stdout_task.await.context("stdout drain task")?;
+        let stderr = stderr_task.await.context("stderr drain task")?;
+        Ok::<_, anyhow::Error>((stdout, stderr))
+    };
+    match timeout(limit, drain).await {
+        Ok(Ok((stdout, stderr))) => Ok((status, stdout, stderr)),
+        _ => {
+            if let Some(pid) = pid {
+                kill_process_tree_by_pid(pid);
+            }
+            anyhow::bail!("command output drain timeout");
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for arguments. `parameters` is accepted as a serde alias so
+    /// provider-shaped payloads deserialize into the same canonical descriptor.
+    #[serde(alias = "parameters")]
+    pub input_schema: Value,
+    /// Tool-supplied hint. Never used as a security decision; the host assigns
+    /// capabilities at registration.
+    pub risk: String, // read|write|destructive|network
+}
+
+impl ToolSpec {
+    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema: parameters,
+            risk: "safe".to_string(),
+        }
+    }
+
+    pub fn parameters(&self) -> &Value {
+        &self.input_schema
+    }
+
+    pub fn into_parameters(self) -> Value {
+        self.input_schema
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub ok: bool,
+    pub output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured: Option<Value>,
+}
+
+/// Authoritative evidence captured from a real outbound HTTP exchange. The
+/// bytes here are stored by core, not trusted from LLM-visible text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpCapture {
+    pub request: String,
+    pub response: String,
+    pub canary: String,
+}
+
+impl HttpCapture {
+    pub fn as_value(&self) -> Value {
+        json!({
+            "request": self.request,
+            "response": self.response,
+            "canary": self.canary,
+        })
+    }
+}
+
+/// Extract `(request, response, canary)` from a tool's `structured` value.
+/// Accepts either the whole `structured` object (`{"capture": {...}}`) or the
+/// capture object itself.
+pub fn capture_from_structured(v: &Value) -> Option<(String, String, String)> {
+    let capture = v.get("capture").unwrap_or(v);
+    let request = capture.get("request")?.as_str()?.to_string();
+    let response = capture.get("response")?.as_str()?.to_string();
+    let canary = capture.get("canary")?.as_str()?.to_string();
+    Some((request, response, canary))
+}
+
+/// Shared cookie jar: `(domain, name)` -> `(value, path, expires)`.
+pub type CookieJar = Arc<Mutex<BTreeMap<String, (String, String, String)>>>;
+
+/// Operator-supplied policy for tool construction. Defaults keep the runner
+/// locked down (no proxy, no trusted local targets, no external tools).
+#[derive(Clone)]
+pub struct ToolOptions {
+    pub allow_proxy: bool,
+    pub proxy_url: Option<String>,
+    pub trusted_local_targets: Vec<String>,
+    pub enable_external_tools: bool,
+    pub external_commands: BTreeMap<String, String>,
+    /// Inclusive scope entries. When non-empty, a target must match at least
+    /// one entry before any request is made.
+    pub scope_in: Vec<String>,
+    /// Exclusive scope entries. A matching target is always denied.
+    pub scope_out: Vec<String>,
+    /// Fail closed when a network tool is invoked with an empty scope. The core
+    /// runner owns the enforcement; this flag is the operator-controlled policy
+    /// surface it reads. Defaults to `true`.
+    pub require_explicit_scope: bool,
+    /// When true, external adapters are registered only if their binary is
+    /// discovered on PATH.
+    pub auto_detect_external: bool,
+    /// Full User-Agent override required by an engagement's rules of engagement.
+    pub user_agent: Option<String>,
+    /// Hard cap on outgoing HTTP requests per second (ROE enforcement).
+    pub max_rps: Option<u64>,
+    /// When set, only these HTTP methods may be issued (case-insensitive).
+    /// Enforced centrally in `HttpRequestTool::run`, so every HTTP-backed tool
+    /// (including `validate_poc` and `http_fuzz`) inherits the same gate.
+    pub allowed_methods: Option<Vec<String>>,
+    /// Shared rolling window used by the rate limiter (Clone/Default friendly).
+    pub rate_window: Arc<Mutex<VecDeque<Instant>>>,
+    /// Require falsification fields when saving a finding. Enabled by the
+    /// engagement layer; off in generic kernel/tool tests.
+    pub require_falsification: bool,
+    /// Shared cookie jar keyed by `(domain, name)` encoded as
+    /// `"domain<US>name"`, value `(cookie_value, path, expires)`. `Arc` keeps
+    /// the jar identical across every `HttpRequestTool` clone in a registry.
+    pub cookie_jar: CookieJar,
+    /// Local-only Collaborator simulation store: token -> recorded interactions.
+    /// Server metadata is stored under a reserved `__server__` prefixed key.
+    pub oob_interactions: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    /// Base URL of a self-hosted external OOB oracle's loopback admin listener
+    /// (e.g. `http://127.0.0.1:8082`). When set, the `collaborator` tool mints
+    /// tokens and reads interactions from that server instead of the loopback
+    /// simulation. When `None`, the loopback fallback is used unchanged.
+    pub oob_endpoint: Option<String>,
+    /// Optional operator-provisioned token. When an external endpoint is set,
+    /// this overrides the token returned by `POST /token` and is also used as
+    /// the default token for `fetch` when the call omits one.
+    pub oob_token: Option<String>,
+    /// Operator/engagement-minted admin bearer token for the external OOB
+    /// oracle's admin API (`POST /token` and `GET /interactions`). Never supplied
+    /// by the model: `run_external`'s `token` input is the OOB interaction token
+    /// used as a query parameter, not this admin credential. Empty disables the
+    /// header for lab deployments that run the oracle without admin auth.
+    pub oob_admin_token: String,
+    /// Per-adapter external command specs. When an adapter name is present here,
+    /// it overrides the built-in default for that adapter. `actions`, when
+    /// non-empty, turns the adapter into a fixed action dispatcher.
+    pub external_adapter_specs: BTreeMap<String, ExternalAdapterSpec>,
+    /// Mirror of the engagement `allow_network_write` opt-in. External adapters
+    /// refuse state-changing actions (`click`, `fill`, `eval`, ...) unless this
+    /// is true, so a ROE that forbids state change cannot be bypassed by
+    /// routing the action through a browser adapter.
+    pub allow_network_write: bool,
+}
+
+impl Default for ToolOptions {
+    fn default() -> Self {
+        Self {
+            allow_proxy: false,
+            proxy_url: None,
+            trusted_local_targets: Vec::new(),
+            enable_external_tools: false,
+            external_commands: BTreeMap::new(),
+            scope_in: Vec::new(),
+            scope_out: Vec::new(),
+            // B3/B11: network scope and finding falsification are opt-out, not
+            // opt-in. Lab builders can relax either field explicitly.
+            require_explicit_scope: true,
+            auto_detect_external: false,
+            user_agent: None,
+            max_rps: None,
+            allowed_methods: None,
+            rate_window: Arc::new(Mutex::new(VecDeque::new())),
+            require_falsification: true,
+            cookie_jar: Arc::new(Mutex::new(BTreeMap::new())),
+            oob_interactions: Arc::new(Mutex::new(HashMap::new())),
+            oob_endpoint: None,
+            oob_token: None,
+            oob_admin_token: String::new(),
+            external_adapter_specs: BTreeMap::new(),
+            allow_network_write: false,
+        }
+    }
+}
+
+/// Whether the core runner must reject a network tool call when no scope was
+/// configured. Kept as a helper so core and tools cannot drift on the default.
+pub fn tool_requires_explicit_scope(options: &ToolOptions) -> bool {
+    options.require_explicit_scope
+}
+
+/// Only these tools mint byte-authoritative captures. The store uses this to
+/// restrict which tool names may contribute capture rows, so a forged
+/// `structured.capture` from `save_finding` or a generic adapter is ignored.
+pub fn tool_produces_authoritative_capture(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    let normalized = normalized.trim_start_matches("bugfound_");
+    matches!(
+        normalized,
+        "http" | "http_request" | "request" | "poc" | "poc_validate" | "validate_poc"
+    )
+}
+
+/// Only the collaborator mints authoritative OOB interaction tokens. The store
+/// uses this to stage tokens for binding; a forged `structured.oob_proof` from
+/// `save_finding` or a generic adapter is ignored. Normalization matches
+/// `tool_produces_authoritative_capture` exactly.
+pub fn tool_produces_oob_token(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    let normalized = normalized.trim_start_matches("bugfound_");
+    matches!(normalized, "collaborator")
+}
+
+/// Operator-configurable external adapter. `actions` is an optional action map
+/// (action -> argv template); when present, the model must supply `action` and
+/// `arg_template` is ignored at run time. `command` is a single program path
+/// (spaces allowed, no splitting); `base_args` are global flags placed before
+/// the action argv on every call.
+#[derive(Clone, Debug, Default)]
+pub struct ExternalAdapterSpec {
+    pub command: Option<String>,
+    pub arg_template: Option<Vec<String>>,
+    pub actions: BTreeMap<String, Vec<String>>,
+    pub timeout_ms: Option<u64>,
+    pub base_args: Vec<String>,
+}
+
+/// Browser adapter configuration as a config file expresses it: one program
+/// plus separate read-only and state-changing action tables. Kept here so the
+/// CLI, the desktop worker and the engagement layer all build the same adapter
+/// instead of three near-copies.
+#[derive(Clone, Debug, Default)]
+pub struct BrowserAdapterConfig {
+    /// Absolute path to the browser CLI (e.g. `agent-browser`).
+    pub program: String,
+    /// Global flags placed before every action argv (`--user-data-dir`, ...).
+    pub base_args: Vec<String>,
+    pub read_actions: BTreeMap<String, Vec<String>>,
+    pub write_actions: BTreeMap<String, Vec<String>>,
+    pub timeout_ms: Option<u64>,
+}
+
+impl BrowserAdapterConfig {
+    /// Render this config as `("agent-browser", spec)`.
+    pub fn to_adapter_spec(&self) -> (String, ExternalAdapterSpec) {
+        let mut actions = self.read_actions.clone();
+        actions.extend(self.write_actions.clone());
+        if actions.is_empty() {
+            actions = default_browser_actions();
+        }
+        (
+            "agent-browser".to_string(),
+            ExternalAdapterSpec {
+                command: Some(self.program.clone()),
+                arg_template: None,
+                actions,
+                timeout_ms: self.timeout_ms,
+                base_args: self.base_args.clone(),
+            },
+        )
+    }
+}
+
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn spec(&self) -> ToolSpec;
+    async fn run(&self, input: Value) -> Result<ToolResult>;
+}
+
+#[derive(Default, Clone)]
+pub struct ToolRegistry {
+    tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// Host-owned classification frozen at registration. `ToolSpec.risk` is a
+    /// tool-supplied hint and must never decide a security action on its own.
+    host_risk: BTreeMap<String, String>,
+}
+
+impl ToolRegistry {
+    pub fn new() -> Self {
+        Self {
+            tools: BTreeMap::new(),
+            host_risk: BTreeMap::new(),
+        }
+    }
+    pub fn register(&mut self, tool: Arc<dyn Tool>) {
+        let spec = tool.spec();
+        self.host_risk.insert(spec.name.clone(), spec.risk.clone());
+        self.tools.insert(spec.name, tool);
+    }
+
+    /// Register with an explicit host classification (config/plugin paths).
+    /// The tool's self-reported `risk` is ignored.
+    pub fn register_with_host_risk(&mut self, tool: Arc<dyn Tool>, risk: impl Into<String>) {
+        let name = tool.spec().name;
+        self.host_risk.insert(name.clone(), risk.into());
+        self.tools.insert(name, tool);
+    }
+
+    /// Classification decided by the host, not by the tool descriptor.
+    pub fn host_risk(&self, name: &str) -> &str {
+        self.host_risk
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    }
+
+    pub fn register_alias(&mut self, name: impl Into<String>, tool: Arc<dyn Tool>) {
+        let name = name.into();
+        let risk = self
+            .host_risk
+            .get(&tool.spec().name)
+            .cloned()
+            .unwrap_or_else(|| tool.spec().risk);
+        struct AliasTool {
+            name: String,
+            inner: Arc<dyn Tool>,
+        }
+        #[async_trait]
+        impl Tool for AliasTool {
+            fn spec(&self) -> ToolSpec {
+                let mut s = self.inner.spec();
+                s.name = self.name.clone();
+                s
+            }
+            async fn run(&self, input: serde_json::Value) -> Result<ToolResult> {
+                self.inner.run(input).await
+            }
+        }
+        self.host_risk.insert(name.clone(), risk);
+        self.tools
+            .insert(name.clone(), Arc::new(AliasTool { name, inner: tool }));
+    }
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.get(name).cloned()
+    }
+    pub fn specs(&self) -> Vec<ToolSpec> {
+        self.tools.values().map(|t| t.spec()).collect()
+    }
+}
+
+fn truncate(s: &str) -> String {
+    if s.len() <= MAX_OUTPUT_BYTES {
+        return s.to_string();
+    }
+    // Cut on a UTF-8 boundary so multi-byte output cannot panic.
+    let mut end = MAX_OUTPUT_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n...[truncated]", &s[..end])
+}
+
+/// Only the two harmless local commands may be spawned by the agent. Anything
+/// that can read files, spawn tools or reach the network must go through the
+/// scoped `http_request`/`dns_lookup` tool instead, where policy is enforced.
+fn validate_shell_command(cmd: &str) -> Result<()> {
+    const ALLOWED: &[&str] = &["echo", "whoami"];
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    let exe = Path::new(first)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !ALLOWED.contains(&exe.as_str()) {
+        anyhow::bail!("command '{exe}' is not in the shell allowlist");
+    }
+    // Chaining, redirection and expansion characters must never survive into
+    // the shell string: a prompt-injected command could otherwise smuggle a
+    // second program past the allowlist or read files outside the workspace.
+    for ch in [
+        '|', ';', '&', '`', '>', '<', '\n', '\r', '!', '=', '/', '\\', ':', '$', '{', '}', '(',
+        ')', '[', ']',
+    ] {
+        if cmd.contains(ch) {
+            anyhow::bail!("shell metacharacter '{ch}' is not allowed");
+        }
+    }
+    for seq in ["..", "$("] {
+        if cmd.contains(seq) {
+            anyhow::bail!("shell sequence '{seq}' is not allowed");
+        }
+    }
+    for token in cmd.split_whitespace() {
+        if token.contains('=') || token.contains('!') || looks_like_path(token) {
+            anyhow::bail!("argument '{token}' is not allowed");
+        }
+    }
+    Ok(())
+}
+
+/// A token that refers to a filesystem path (absolute, relative, home-relative
+/// or a bare dot entry). Rejecting these keeps `shell_exec` from being used as
+/// a file reader even before other structural checks apply.
+fn looks_like_path(token: &str) -> bool {
+    token.contains(['/', '\\', ':', '~']) || token.starts_with('.')
+}
+
+/// Deny private, loopback, link-local, metadata, CGNAT and other reserved ranges.
+/// Bug bounty targets are user-controlled, so only globally routable addresses
+/// are allowed to leave the runner.
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            a == 0
+                || a == 10
+                || a == 127
+                || (a == 100 && (64..=127).contains(&b)) // CGNAT + metadata
+                || (a == 169 && b == 254) // link-local / cloud metadata
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 168)
+                || (a == 192
+                    && ((b == 0 && (c == 0 || c == 2))
+                        || (b == 31 && c == 196)
+                        || (b == 52 && c == 193)
+                        || (b == 88 && c == 99)
+                        || (b == 175 && c == 48)))
+                || (a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100)))
+                || (a == 203 && b == 0 && c == 113)
+                || a >= 224 // multicast + reserved
+        }
+        IpAddr::V6(v6) => {
+            // `to_ipv4_mapped` only covers ::ffff:a.b.c.d. Browsers and resolvers
+            // also accept IPv4-compatible/zero-prefixed forms such as
+            // ::127.0.0.1 and ::7f00:1, which must be decoded before the IPv4
+            // range checks below.
+            if let Some(v4) = v6.to_ipv4().or_else(|| v6.to_ipv4_mapped()) {
+                return is_blocked_ip(IpAddr::V4(v4));
+            }
+            let s = v6.segments();
+            v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
+                || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
+                || s[0] == 0x2002 // 2002::/16 6to4 (encodes private IPv4)
+                || (s[0] == 0x2001 && s[1] == 0) // 2001::/32 Teredo
+                || (s[0] == 0x0064 && s[1] == 0xff9b) // 64:ff9b::/96 NAT64
+        }
+    }
+}
+
+fn is_local_name(host: &str) -> bool {
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+}
+
+/// Parse one component of an IPv4 authority. Browsers accept decimal, `0x`
+/// hexadecimal and leading-zero octal numbers; all three must be decoded so a
+/// private address cannot be smuggled past the string checks.
+fn parse_ipv4_number(part: &str) -> Option<u64> {
+    if part.is_empty() {
+        return None;
+    }
+    if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    if part.len() > 1 && part.starts_with('0') {
+        return u64::from_str_radix(&part[1..], 8).ok();
+    }
+    part.parse::<u64>().ok()
+}
+
+/// Parse every numeric IPv4 spelling a URL authority may take: a single packed
+/// number (`2130706433`, `0x7f000001`, `017700000001`) or a dotted combination
+/// whose final component may carry more than one byte (`127.1`). Returns
+/// `None` for ordinary hostnames and IPv6 literals.
+fn parse_numeric_host_ipv4(host: &str) -> Option<IpAddr> {
+    let h = host.trim().trim_matches(['[', ']']).trim_end_matches('.');
+    let parts: Vec<&str> = h.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let values: Vec<u64> = parts
+        .iter()
+        .map(|p| parse_ipv4_number(p))
+        .collect::<Option<Vec<_>>>()?;
+    let last = values.len() - 1;
+    if values[..last].iter().any(|v| *v > u64::from(u8::MAX)) {
+        return None;
+    }
+    let trailing_bytes = 4 - last;
+    let max_last = u64::from(u32::MAX >> (8 * (4 - trailing_bytes)));
+    if values[last] > max_last {
+        return None;
+    }
+    let high = values[..last]
+        .iter()
+        .fold(0u32, |acc, v| (acc << 8) | *v as u32);
+    let ip = if trailing_bytes == 4 {
+        values[last] as u32
+    } else {
+        (high << (8 * trailing_bytes)) | values[last] as u32
+    };
+    Some(IpAddr::V4(Ipv4Addr::from(ip)))
+}
+
+/// Numeric-address checks that apply even to trusted names. A blocked address
+/// is only permitted when that exact IP (or its CIDR/prefix) is trusted.
+fn validate_numeric_host(host: &str, trusted: &[String]) -> Result<()> {
+    let h = normalize_host(host);
+    let Some(ip) = h
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| parse_numeric_host_ipv4(&h))
+    else {
+        return Ok(());
+    };
+    if is_blocked_ip(ip) && !ip_is_explicitly_trusted(ip, trusted) {
+        anyhow::bail!("private/reserved target address is not allowed: {ip}");
+    }
+    Ok(())
+}
+
+/// String-level checks that do not need DNS. Fail closed on anything ambiguous.
+fn validate_host_string(host: &str) -> Result<()> {
+    let h = normalize_host(host);
+    if h.is_empty() {
+        anyhow::bail!("url has no host");
+    }
+    if is_local_name(&h) {
+        anyhow::bail!("local/metadata targets are not allowed");
+    }
+    validate_numeric_host(&h, &[])
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn ipv4_in_cidr(ip: Ipv4Addr, cidr: &str) -> bool {
+    let Some((base, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(base) = base.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u32>() else {
+        return false;
+    };
+    if prefix > 32 {
+        return false;
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    u32::from(ip) & mask == u32::from(base) & mask
+}
+
+/// A trusted entry is an exact host, a `*.suffix` wildcard, an IPv4 address,
+/// an IPv4 CIDR block, or a simple dotted IPv4 prefix (e.g. `192.168.1.`).
+fn trusted_entry_matches(entry: &str, host: &str) -> bool {
+    let trimmed = entry.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let entry = trimmed.trim_end_matches('.');
+    if let Some(suffix) = entry.strip_prefix("*.") {
+        return !suffix.is_empty() && host != suffix && host.ends_with(&format!(".{suffix}"));
+    }
+    if entry.contains('/') {
+        return host
+            .parse::<Ipv4Addr>()
+            .map(|ip| ipv4_in_cidr(ip, entry))
+            .unwrap_or(false);
+    }
+    if let Ok(entry_ip) = entry.parse::<Ipv4Addr>() {
+        return host
+            .parse::<Ipv4Addr>()
+            .map(|ip| ip == entry_ip)
+            .unwrap_or(false);
+    }
+    // A trailing dot is meaningful for a dotted IPv4 prefix, so inspect the
+    // untrimmed form here.
+    if trimmed.ends_with('.') && trimmed.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return host.starts_with(&trimmed);
+    }
+    entry == host
+}
+
+fn host_is_trusted(host: &str, trusted: &[String]) -> bool {
+    let host = normalize_host(host);
+    trusted
+        .iter()
+        .any(|entry| trusted_entry_matches(entry, &host))
+}
+
+/// Whether an IP itself (not just a hostname resolving to it) was explicitly
+/// trusted by the operator. Trusted names do not authorise private IPs.
+fn ip_is_explicitly_trusted(ip: IpAddr, trusted: &[String]) -> bool {
+    let text = ip.to_string();
+    trusted
+        .iter()
+        .any(|entry| trusted_entry_matches(entry, &text))
+}
+
+/// Trust bypasses only the syntactic local-name block. Numeric addresses and
+/// every address returned by DNS are still verified independently.
+fn validate_host_with_options(host: &str, options: &ToolOptions) -> Result<()> {
+    let h = normalize_host(host);
+    if h.is_empty() {
+        anyhow::bail!("url has no host");
+    }
+    let trusted = &options.trusted_local_targets;
+    if !host_is_trusted(&h, trusted) {
+        return validate_host_string(host);
+    }
+    // A trusted entry bypasses only the local-name block. Numeric addresses
+    // are still checked; only an explicitly trusted IP is exempt.
+    validate_numeric_host(&h, trusted)
+}
+
+/// Reduce a scope target to a comparable host string. URLs are reduced to
+/// their host so scope entries can stay host-oriented.
+fn normalize_scope_target(target: &str) -> String {
+    let trimmed = target.trim();
+    if trimmed.contains("://") {
+        if let Ok(parsed) = url::Url::parse(trimmed) {
+            if let Some(host) = parsed.host_str() {
+                return normalize_host(host);
+            }
+        }
+    }
+    normalize_host(trimmed)
+}
+
+/// Split a target into normalized host and path. The path is kept so a
+/// path-scoped exclusion can be enforced on the exact path it names, while a
+/// host-only target keeps an empty path and is never over-blocked by it.
+fn scope_target_host_and_path(target: &str) -> (String, String) {
+    let trimmed = target.trim();
+    if trimmed.contains("://") {
+        if let Ok(parsed) = url::Url::parse(trimmed) {
+            let host = parsed.host_str().map(normalize_host).unwrap_or_default();
+            return (host, parsed.path().to_string());
+        }
+    }
+    match trimmed.find('/') {
+        Some(index) => (
+            normalize_host(&trimmed[..index]),
+            trimmed[index..].to_string(),
+        ),
+        None => (normalize_host(trimmed), String::new()),
+    }
+}
+
+/// A host-oriented rule that carries a path. CIDRs are excluded because their
+/// slash is a prefix length, not a path.
+fn has_host_oriented_path(entry: &str) -> bool {
+    let Some((host, tail)) = entry.split_once('/') else {
+        return false;
+    };
+    if host.parse::<IpAddr>().is_err() {
+        return true;
+    }
+    // `10.0.0.0/8` is a CIDR block. `127.0.0.1/secret/*` is a host-plus-path
+    // rule: its suffix is not a numeric prefix length and must not be treated
+    // as a CIDR (which silently disabled path exclusions on IP hosts).
+    !(tail.chars().all(|c| c.is_ascii_digit()) && tail.parse::<u32>().is_ok())
+}
+
+/// Match an IP address against an IPv4 or IPv6 CIDR block. Mirrors
+/// `bugfound_policy::ScopeConfig::cidr_matches` so the tool-side guard and the
+/// policy engine agree on both address families.
+fn ip_in_cidr(ip: IpAddr, cidr: &str) -> bool {
+    let Some((network, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(network) = network.parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u32>() else {
+        return false;
+    };
+    match (network, ip) {
+        (IpAddr::V4(net), IpAddr::V4(addr)) if prefix <= 32 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            u32::from(net) & mask == u32::from(addr) & mask
+        }
+        (IpAddr::V6(net), IpAddr::V6(addr)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(net) & mask == u128::from(addr) & mask
+        }
+        _ => false,
+    }
+}
+
+/// One scope entry against one normalized target. Supports exact hosts,
+/// plain suffixes (including a leading dot), `*.suffix` wildcards (which require
+/// at least one extra label and never cover the apex), bare `*`, and IPv4/IPv6
+/// CIDR blocks. Path-bearing host rules are handled by `scope_entry_matches_path`.
+fn scope_entry_matches(entry: &str, target: &str) -> bool {
+    let entry = entry.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    let entry = entry.trim_end_matches('.');
+    if entry.is_empty() {
+        return false;
+    }
+    // A bare wildcard is the explicit "any target" rule; the policy engine
+    // treats it the same way.
+    if entry == "*" {
+        return true;
+    }
+    if entry.contains('/') {
+        if !has_host_oriented_path(entry) {
+            return target
+                .parse::<IpAddr>()
+                .map(|ip| ip_in_cidr(ip, entry))
+                .unwrap_or(false);
+        }
+        // Host-oriented pattern with a path (e.g. "*.api.clockify.me/api/"):
+        // match on the host component only; the full pattern stays in reports.
+        let host = entry
+            .split('/')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('.');
+        if let Some(suffix) = host.strip_prefix("*.") {
+            return !suffix.is_empty() && target.ends_with(&format!(".{suffix}"));
+        }
+        return target == host;
+    }
+    if let Some(suffix) = entry.strip_prefix("*.") {
+        return !suffix.is_empty() && target.ends_with(&format!(".{suffix}"));
+    }
+    if let Some(suffix) = entry.strip_prefix('.') {
+        return !suffix.is_empty() && target.ends_with(&format!(".{suffix}"));
+    }
+    let ip_match = entry
+        .parse::<Ipv4Addr>()
+        .map(|entry_ip| {
+            target
+                .parse::<Ipv4Addr>()
+                .map(|ip| ip == entry_ip)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    // A bare entry is an exact host (or exact IP) only. Subdomains require an
+    // explicit `*.` or leading `.` wildcard; suffix-matching a bare entry would
+    // let one asset silently cover unrelated hosts and outrank broader
+    // exclusions. Wildcard semantics above are intentionally unchanged.
+    ip_match || target == entry
+}
+
+/// Normalize a URL path the same way the policy matcher does: lowercase,
+/// leading `/`, no query/fragment, resolved `.`/`..` and duplicate separators.
+fn normalize_scope_path(path: &str) -> String {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    format!("/{}", segments.join("/")).to_ascii_lowercase()
+}
+
+/// Match a path-scoped host rule (e.g. `clockify.me/help/*`) against a target.
+/// Host-only targets never match; path-bearing targets match on host plus path.
+fn scope_entry_matches_path(entry: &str, host: &str, path: &str) -> bool {
+    let Some((host_entry, path_entry)) = entry.split_once('/') else {
+        return false;
+    };
+    let path_entry = path_entry.trim();
+    if host_entry.trim().is_empty() || path_entry.is_empty() || path.is_empty() {
+        return false;
+    }
+    if !scope_entry_matches(host_entry, host) {
+        return false;
+    }
+    let pattern = normalize_scope_path(path_entry);
+    let path = normalize_scope_path(path);
+    match pattern.strip_suffix('*') {
+        Some(prefix) => path.starts_with(prefix),
+        None => path == pattern || path.starts_with(&format!("{pattern}/")),
+    }
+}
+
+/// Decide whether `target` is permitted by an inclusive/exclusive scope.
+/// Exclusive entries always win. An empty inclusive list allows any target
+/// that is not explicitly excluded. Path-bearing rules apply to BOTH lists:
+/// an in-scope `host/admin/*` does not authorize `host/login`, and an
+/// out-of-scope `host/secret/*` blocks only that path.
+pub fn scope_target_allowed(target: &str, in_scope: &[String], out_of_scope: &[String]) -> bool {
+    let (host, path) = scope_target_host_and_path(target);
+    if host.is_empty() {
+        return false;
+    }
+    let in_matches: Vec<&String> = in_scope
+        .iter()
+        .filter(|entry| {
+            if has_host_oriented_path(entry) {
+                scope_entry_matches_path(entry, &host, &path)
+            } else {
+                scope_entry_matches(entry, &host)
+            }
+        })
+        .collect();
+    let out_matches: Vec<&String> = out_of_scope
+        .iter()
+        .filter(|entry| {
+            if has_host_oriented_path(entry) {
+                scope_entry_matches_path(entry, &host, &path)
+            } else {
+                scope_entry_matches(entry, &host)
+            }
+        })
+        .collect();
+    // Exclusive entries always win. There is no specificity escape hatch:
+    // every matching out-of-scope rule (including an explicit wildcard) beats
+    // any in-scope rule, mirroring `bugfound-policy::ScopeConfig::check_target`.
+    if !out_matches.is_empty() {
+        return false;
+    }
+    in_scope.is_empty() || !in_matches.is_empty()
+}
+
+/// Resolve a trusted host. Trust only bypasses the syntactic `.local`/
+/// `localhost` block; every returned address is still verified, and only an
+/// explicitly trusted IP is allowed to be private/reserved.
+async fn resolve_trusted_host(host: &str, options: &ToolOptions) -> Result<std::net::SocketAddr> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 0))
+        .await
+        .with_context(|| format!("resolve trusted host {host}"))?
+        .collect();
+    if addrs.is_empty() {
+        anyhow::bail!("trusted host resolved to no addresses: {host}");
+    }
+    for addr in &addrs {
+        if is_blocked_ip(addr.ip())
+            && !ip_is_explicitly_trusted(addr.ip(), &options.trusted_local_targets)
+        {
+            anyhow::bail!(
+                "trusted host resolved to a non-trusted private/reserved address: {}",
+                addr.ip()
+            );
+        }
+    }
+    Ok(addrs[0])
+}
+
+/// Resolve every address before connecting and pin the request to a validated IP.
+/// This closes the DNS-rebinding/TOCTOU gap between validation and connection.
+async fn resolve_public_ip(host: &str) -> Result<std::net::SocketAddr> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 0))
+        .await
+        .with_context(|| format!("resolve target host {host}"))?
+        .collect();
+    if addrs.is_empty() {
+        anyhow::bail!("target host resolved to no addresses: {host}");
+    }
+    for addr in &addrs {
+        if is_blocked_ip(addr.ip()) {
+            anyhow::bail!(
+                "target resolves to a private/reserved address: {}",
+                addr.ip()
+            );
+        }
+    }
+    Ok(addrs[0])
+}
+
+fn resolve_cwd(cwd: impl AsRef<Path>) -> Result<PathBuf> {
+    let cwd = cwd.as_ref().to_path_buf();
+    let canon = cwd
+        .canonicalize()
+        .with_context(|| format!("invalid cwd: {}", cwd.display()))?;
+    if !canon.is_dir() {
+        anyhow::bail!("cwd is not a directory: {}", canon.display());
+    }
+    Ok(canon)
+}
+
+fn resolve_in_cwd(cwd: &Path, rel: &str, must_exist: bool, for_write: bool) -> Result<PathBuf> {
+    resolve_in_cwd_inner(cwd, rel, must_exist, for_write, false)
+}
+
+/// Internal variant used only by the authoritative evidence writer. The agent-
+/// facing helpers must never pass `allow_evidence = true`.
+fn resolve_in_cwd_inner(
+    cwd: &Path,
+    rel: &str,
+    must_exist: bool,
+    for_write: bool,
+    allow_evidence: bool,
+) -> Result<PathBuf> {
+    // Evidence artifacts are authoritative: the agent must not be able to read
+    // (or overwrite) them through fs_read/fs_write. Only the tool-owned writer
+    // may resolve an `evidence/...` path.
+    if !allow_evidence {
+        let first = Path::new(rel).components().next();
+        if let Some(std::path::Component::Normal(part)) = first {
+            if part.to_string_lossy().eq_ignore_ascii_case("evidence") {
+                anyhow::bail!("evidence artifacts are not accessible from the workspace");
+            }
+        }
+    }
+    // Reject traversal and absolute paths lexically, before touching the FS.
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("path escapes workspace root");
+    }
+    let p = cwd.join(rel_path);
+    let canon_cwd = cwd.canonicalize().unwrap_or(cwd.to_path_buf());
+    let canon = if p.exists() {
+        p.canonicalize().context("canonicalize path")?
+    } else {
+        if must_exist || !for_write {
+            anyhow::bail!("path not found: {rel}");
+        }
+        let parent = p.parent().ok_or_else(|| anyhow!("bad path"))?;
+        // Validate the deepest existing ancestor before creating anything. A
+        // symlinked parent must not let us create directories outside cwd.
+        let mut ancestor = parent;
+        while !ancestor.exists() {
+            ancestor = ancestor.parent().ok_or_else(|| anyhow!("bad path"))?;
+        }
+        if !ancestor
+            .canonicalize()
+            .context("canonicalize ancestor")?
+            .starts_with(&canon_cwd)
+        {
+            anyhow::bail!("path escapes workspace root");
+        }
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create dir {}", parent.display()))?;
+        parent
+            .canonicalize()
+            .context("canonicalize parent")?
+            .join(p.file_name().ok_or_else(|| anyhow!("bad file name"))?)
+    };
+    if !canon.starts_with(&canon_cwd) {
+        anyhow::bail!("path escapes workspace root");
+    }
+    Ok(canon)
+}
+
+pub struct FsReadTool {
+    cwd: PathBuf,
+}
+impl FsReadTool {
+    pub fn new(cwd: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            cwd: resolve_cwd(cwd)?,
+        })
+    }
+}
+#[async_trait]
+impl Tool for FsReadTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "fs_read".into(),
+            description: "Read a UTF-8 text file from the workspace (confined to cwd). Returns truncated content (512KB max).".into(),
+            input_schema: json!({"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative file path"}},"required":["path"]}),
+            risk: "read".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let path = input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("path required"))?;
+        let full = resolve_in_cwd(&self.cwd, path, true, false)?;
+        let meta = tokio::fs::metadata(&full).await.context("stat file")?;
+        if meta.len() > MAX_READ_BYTES {
+            anyhow::bail!(
+                "file too large ({} bytes, limit {}): {}",
+                meta.len(),
+                MAX_READ_BYTES,
+                path
+            );
+        }
+        let data = tokio::fs::read(&full).await.context("read file")?;
+        // Canaries are minted tool-side and must never reach the model, even if
+        // a workspace file happens to contain raw capture bytes.
+        let mut out = redact_canary_text(&redact(&String::from_utf8_lossy(&data)));
+        if out.is_empty() {
+            out = "(empty file)".into();
+        }
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&out),
+            structured: None,
+        })
+    }
+}
+
+/// Pass only what a child process needs to start; never inherit secrets such
+/// as DATABASE_URL or program API tokens.
+fn safe_process_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os()
+        .filter(|(k, _)| {
+            let key = k.to_string_lossy().to_ascii_uppercase();
+            [
+                "PATH",
+                "PATHEXT",
+                "SYSTEMROOT",
+                "COMSPEC",
+                "TEMP",
+                "TMP",
+                "LANG",
+                "LC_ALL",
+            ]
+            .iter()
+            .any(|allowed| *allowed == key)
+        })
+        .collect()
+}
+
+pub struct ShellExecTool {
+    cwd: PathBuf,
+}
+impl ShellExecTool {
+    pub fn new(cwd: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            cwd: resolve_cwd(cwd)?,
+        })
+    }
+}
+#[async_trait]
+impl Tool for ShellExecTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "shell_exec".into(),
+            description: "Execute an allowlisted trivial shell command (echo/whoami) in the workspace cwd (30s timeout, 8KB output cap). Not a general shell.".into(),
+            input_schema: json!({"type":"object","properties":{"cmd":{"type":"string","description":"Shell command to run in workspace cwd"}},"required":["cmd"]}),
+            risk: "exec".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let cmd = input
+            .get("cmd")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("cmd required"))?
+            .trim()
+            .to_string();
+        if cmd.is_empty() {
+            anyhow::bail!("cmd required");
+        }
+        // Allowlist, not denylist: only a few local, non-network commands are
+        // permitted. Chaining/substitution is rejected so a prompt-injected
+        // command cannot smuggle a second program past the allowlist.
+        validate_shell_command(&cmd)?;
+        let env = safe_process_env();
+        #[cfg(windows)]
+        let mut c = {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(&cmd);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut c = {
+            let mut c = Command::new("sh");
+            c.arg("-lc").arg(&cmd);
+            c
+        };
+        c.current_dir(&self.cwd)
+            .env_clear()
+            .envs(env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = c.spawn().context("spawn shell command")?;
+        let (status, out_stdout, out_stderr) =
+            collect_capped_output(&mut child, Duration::from_secs(30))
+                .await
+                .context("command timeout (30s)")?;
+        let stdout = redact(&String::from_utf8_lossy(&out_stdout));
+        let stderr = redact(&String::from_utf8_lossy(&out_stderr));
+        let code = status.code().unwrap_or(-1);
+        let text = format!(
+            "exit={code}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            stdout, stderr
+        );
+        Ok(ToolResult {
+            ok: status.success(),
+            output: truncate(&text),
+            structured: Some(json!({"exit_code": code, "success": status.success()})),
+        })
+    }
+}
+
+pub struct HttpRequestTool {
+    client: reqwest::Client,
+    options: ToolOptions,
+}
+impl Default for HttpRequestTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Proxy is opt-in. Without a usable configured proxy we disable all proxies
+/// so a system proxy cannot resolve the hostname and bypass our DNS pin.
+fn apply_proxy(builder: reqwest::ClientBuilder, options: &ToolOptions) -> reqwest::ClientBuilder {
+    if options.allow_proxy {
+        if let Some(url) = options.proxy_url.as_deref() {
+            if let Ok(proxy) = reqwest::Proxy::all(url) {
+                return builder.proxy(proxy);
+            }
+        }
+    }
+    builder.no_proxy()
+}
+
+fn build_http_client(options: &ToolOptions) -> reqwest::Client {
+    let ua = options.user_agent.as_deref().unwrap_or("bugfound/0.1");
+    let builder = apply_proxy(
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            // Redirects are disabled: following one could land on an internal
+            // address that passed validation only for the original target.
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(ua),
+        options,
+    );
+    builder.build().unwrap_or_else(|_| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .user_agent(ua)
+            .build()
+            .expect("http client")
+    })
+}
+
+/// Consume a response body one chunk at a time, accumulating at most the cap
+/// (plus a small slack for the chunk that crosses it). This avoids buffering an
+/// unbounded response in memory the way `resp.bytes()` would. Returns the bytes
+/// collected so far and whether the body was truncated at the cap.
+async fn read_body_capped(
+    resp: &mut reqwest::Response,
+    read_timeout: Duration,
+) -> Result<(Vec<u8>, bool)> {
+    let cap = MAX_HTTP_BODY_BYTES + MAX_HTTP_BODY_SLACK;
+    let mut body = Vec::with_capacity(MAX_HTTP_BODY_BYTES);
+    while let Some(chunk) = timeout(read_timeout, resp.chunk())
+        .await
+        .context("read body timeout")??
+    {
+        if body.len() + chunk.len() > cap {
+            return Ok((body, true));
+        }
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_HTTP_BODY_BYTES {
+            return Ok((body, true));
+        }
+    }
+    Ok((body, false))
+}
+
+/// Wait until an outgoing request fits inside the configured ROE rate limit.
+async fn obey_rate_limit(options: &ToolOptions) {
+    let Some(max_rps) = options.max_rps.filter(|value| *value > 0) else {
+        return;
+    };
+    loop {
+        let wait = {
+            let mut window = options.rate_window.lock().unwrap();
+            let now = Instant::now();
+            window.retain(|at| now.duration_since(*at) < Duration::from_secs(1));
+            if window.len() < max_rps as usize {
+                window.push_back(now);
+                None
+            } else {
+                window
+                    .front()
+                    .map(|at| Duration::from_secs(1) - now.duration_since(*at))
+            }
+        };
+        match wait {
+            None => return,
+            Some(delay) => sleep(delay.max(Duration::from_millis(1))).await,
+        }
+    }
+}
+
+/// Proxy configuration is operator-supplied and must stay local. Anything
+/// other than an http(s) proxy on a concrete loopback host is rejected in
+/// `run()` so a bad configuration cannot silently route scoped traffic off-box.
+/// `0.0.0.0` is rejected: it is a wildcard bind address, not a loopback
+/// destination. A configured proxy is a trusted egress boundary where DNS
+/// pinning does not apply, so scope and host validation are always enforced
+/// in code before a proxied request is issued.
+fn validate_proxy_url(options: &ToolOptions) -> Result<()> {
+    if !options.allow_proxy {
+        return Ok(());
+    }
+    let Some(raw) = options.proxy_url.as_deref() else {
+        return Ok(());
+    };
+    let parsed = url::Url::parse(raw).context("invalid proxy_url")?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => anyhow::bail!("proxy_url must use http or https"),
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("proxy_url has no host"))?;
+    let host = host
+        .trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+        Ok(())
+    } else {
+        anyhow::bail!("proxy_url host must be loopback, got '{host}'")
+    }
+}
+
+/// A fail-closed denial returned as a structured `ToolResult` rather than an
+/// error, so callers can inspect the machine-readable reason.
+fn denial_result(reason: &str, fields: Value) -> ToolResult {
+    // Denials frequently echo the attempted URL and the redirect chain. Both
+    // can carry a canary reflected by the target, so scrub every field before
+    // it is handed back to the model. Raw `capture` bytes are built separately
+    // and never routed through this helper.
+    let fields = redact_canaries(&fields);
+    let mut map = serde_json::Map::new();
+    map.insert("ok".into(), Value::Bool(false));
+    map.insert("error".into(), Value::String(reason.to_string()));
+    if let Value::Object(extra) = fields {
+        for (key, value) in extra {
+            map.insert(key, value);
+        }
+    }
+    ToolResult {
+        ok: false,
+        output: truncate(reason),
+        structured: Some(Value::Object(map)),
+    }
+}
+
+/// Render the outbound request in HTTP wire form. This is the authoritative
+/// request representation pinned into `HttpCapture`.
+fn build_request_repr(
+    method: &str,
+    url: &url::Url,
+    options: &ToolOptions,
+    headers: Option<&serde_json::Map<String, Value>>,
+    body: Option<&str>,
+) -> String {
+    let host = url.host_str().unwrap_or("");
+    let authority = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    let target = match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    };
+    let mut text = format!(
+        "{method} {target} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: {}\r\n",
+        options.user_agent.as_deref().unwrap_or("bugfound/0.1")
+    );
+    if let Some(headers) = headers {
+        for (name, value) in headers {
+            if let Some(value) = value.as_str() {
+                text.push_str(&format!("{name}: {value}\r\n"));
+            }
+        }
+    }
+    text.push_str("\r\n");
+    if let Some(body) = body {
+        text.push_str(body);
+    }
+    text
+}
+
+/// Render the selected response headers and capped body in HTTP wire form.
+fn build_response_repr(
+    status: u16,
+    headers: &serde_json::Map<String, Value>,
+    body: &str,
+) -> String {
+    let reason = reqwest::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|code| code.canonical_reason().map(str::to_string))
+        .unwrap_or_default();
+    let mut text = format!("HTTP/1.1 {status} {reason}\r\n");
+    for (name, value) in headers {
+        text.push_str(&format!("{}: {}\r\n", name, value.as_str().unwrap_or("")));
+    }
+    text.push_str("\r\n");
+    text.push_str(body);
+    text
+}
+
+/// Mint the capture canary from the exact request bytes plus a fresh nanosecond
+/// nonce. The nonce makes the token unguessable by the model: only the tool can
+/// mint one, and core stores the resulting bytes as evidence.
+fn canary_for(request: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut input = request.as_bytes().to_vec();
+    input.extend_from_slice(&nanos.to_be_bytes());
+    format!("bugfound-canary-{}", hex_encode(&Sha256::digest(&input)))
+}
+
+fn build_capture(request: String, response: String, canary: String) -> HttpCapture {
+    HttpCapture {
+        request,
+        response,
+        canary,
+    }
+}
+
+impl HttpCapture {
+    /// Exact byte sequence hashed for evidence. Redaction must never be applied
+    /// before this: the verifier replays these bytes, not the model view.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes =
+            Vec::with_capacity(self.request.len() + self.response.len() + self.canary.len());
+        bytes.extend_from_slice(self.request.as_bytes());
+        bytes.extend_from_slice(self.response.as_bytes());
+        bytes.extend_from_slice(self.canary.as_bytes());
+        bytes
+    }
+
+    /// SHA-256 over the authoritative wire bytes.
+    pub fn sha256(&self) -> String {
+        sha256_hex(&self.to_bytes())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cookie jar. Keys are `(domain, name)` joined with a unit separator; values
+// are `(value, path, expires)`. Everything here is local and deterministic.
+// ---------------------------------------------------------------------------
+
+fn cookie_jar_key(domain: &str, name: &str) -> String {
+    format!("{domain}{COOKIE_JAR_KEY_SEP}{name}")
+}
+
+/// Parse `Cookie` input supplied either as a JSON object or a raw
+/// `a=1; b=2` header string.
+fn parse_cookie_pairs(value: Option<&Value>) -> Vec<(String, String)> {
+    match value {
+        Some(Value::Object(map)) => map
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .as_str()
+                    .map(|value| (name.clone(), value.to_string()))
+            })
+            .collect(),
+        Some(Value::String(raw)) => raw
+            .split(';')
+            .filter_map(|pair| {
+                let (name, value) = pair.trim().split_once('=')?;
+                Some((name.trim().to_string(), value.trim().to_string()))
+            })
+            .filter(|(name, _)| !name.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedSetCookie {
+    name: String,
+    value: String,
+    domain: Option<String>,
+    path: Option<String>,
+    expires: String,
+}
+
+fn parse_set_cookie_line(line: &str) -> Option<ParsedSetCookie> {
+    let (pair, attrs) = line.split_once(';').unwrap_or((line, ""));
+    let (name, value) = pair.trim().split_once('=')?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let value = value.trim().to_string();
+    let mut domain = None;
+    let mut path = None;
+    let mut expires = String::new();
+    for attr in attrs.split(';') {
+        let (key, val) = attr.trim().split_once('=').unwrap_or((attr.trim(), ""));
+        if key.eq_ignore_ascii_case("domain") {
+            domain = Some(val.trim().trim_start_matches('.').to_ascii_lowercase());
+        } else if key.eq_ignore_ascii_case("path") {
+            path = Some(val.trim().to_string());
+        } else if key.eq_ignore_ascii_case("expires") {
+            expires = val.trim().to_string();
+        }
+    }
+    Some(ParsedSetCookie {
+        name,
+        value,
+        domain,
+        path,
+        expires,
+    })
+}
+
+/// Read `Set-Cookie:` lines out of a synthesized HTTP response representation.
+fn set_cookies_from_repr(repr: &str) -> Vec<ParsedSetCookie> {
+    repr.lines()
+        .filter_map(|line| {
+            let value = line
+                .trim()
+                .strip_prefix("set-cookie:")
+                .or_else(|| line.trim().strip_prefix("Set-Cookie:"))?;
+            parse_set_cookie_line(value.trim())
+        })
+        .collect()
+}
+
+/// Only numeric epoch-seconds expiry is enforced. HTTP-date strings are kept
+/// verbatim in the jar (they cannot be parsed without a date dependency).
+fn cookie_expired(expires: &str) -> bool {
+    let Ok(secs) = expires.parse::<i64>() else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    secs <= now
+}
+
+/// Public suffixes that must never be accepted as a `Domain` attribute: a
+/// response from `example.com` must not be able to set a cookie for all of
+/// `.com` or `.co.uk`.
+fn is_public_suffix_only(domain: &str) -> bool {
+    matches!(
+        domain,
+        "com"
+            | "net"
+            | "org"
+            | "edu"
+            | "gov"
+            | "mil"
+            | "int"
+            | "io"
+            | "dev"
+            | "info"
+            | "biz"
+            | "co.uk"
+            | "org.uk"
+            | "ac.uk"
+            | "com.au"
+    )
+}
+
+/// A `Domain` attribute is valid only for the exact response host or one of its
+/// parents, with a dot boundary (`example.com` covers `api.example.com` but not
+/// `evil-example.com`).
+fn cookie_domain_allowed(domain: &str, response_host: &str) -> bool {
+    if domain.is_empty() || is_public_suffix_only(domain) {
+        return false;
+    }
+    domain == response_host || response_host.ends_with(&format!(".{domain}"))
+}
+
+fn cookie_jar_store(jar: &CookieJar, cookies: &[ParsedSetCookie], default_domain: &str) {
+    let host = normalize_host(default_domain);
+    let mut guard = jar.lock().unwrap();
+    for cookie in cookies {
+        let domain = normalize_host(cookie.domain.as_deref().unwrap_or(host.as_str()));
+        if !cookie_domain_allowed(&domain, &host) {
+            continue;
+        }
+        let key = cookie_jar_key(&domain, &cookie.name);
+        if !guard.contains_key(&key) && guard.len() >= MAX_COOKIE_JAR_ENTRIES {
+            continue;
+        }
+        let path = cookie.path.clone().unwrap_or_else(|| "/".to_string());
+        guard.insert(key, (cookie.value.clone(), path, cookie.expires.clone()));
+    }
+}
+
+/// Jar cookies whose domain is a host suffix and whose path covers `path`.
+fn cookies_for_url(jar: &CookieJar, host: &str, path: &str) -> Vec<(String, String)> {
+    let host = normalize_host(host);
+    let guard = jar.lock().unwrap();
+    let mut out: Vec<(String, String)> = guard
+        .iter()
+        .filter_map(|(key, (value, cookie_path, expires))| {
+            let (domain, name) = key.split_once(COOKIE_JAR_KEY_SEP)?;
+            let domain_match = cookie_domain_allowed(domain, &host);
+            let path_match =
+                cookie_path.is_empty() || cookie_path == "/" || path.starts_with(cookie_path);
+            if !domain_match || !path_match || cookie_expired(expires) {
+                return None;
+            }
+            Some((name.to_string(), value.clone()))
+        })
+        .collect();
+    out.sort();
+    // Cap the assembled header deterministically: the sorted order decides
+    // which cookies survive when the budget is exceeded.
+    let mut total = 0usize;
+    out.retain(|(name, value)| {
+        let cost = name.len() + value.len() + 3; // "name=value; "
+        if total.saturating_add(cost) > MAX_COOKIE_HEADER_BYTES {
+            return false;
+        }
+        total += cost;
+        true
+    });
+    out
+}
+
+impl HttpRequestTool {
+    pub fn new() -> Self {
+        Self::with_options(ToolOptions::default())
+    }
+
+    pub fn with_options(options: ToolOptions) -> Self {
+        let client = build_http_client(&options);
+        Self { client, options }
+    }
+
+    /// Render the final hop's outcome. The raw wire buffers go straight into
+    /// `HttpCapture`; redaction is applied only to the model-visible `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn finalize(
+        ok: bool,
+        current: &url::Url,
+        status: u16,
+        raw_headers: &serde_json::Map<String, Value>,
+        raw_body: &str,
+        truncated: bool,
+        body_len: usize,
+        canary: &str,
+        request_repr: String,
+        redirect_chain: Vec<Value>,
+    ) -> ToolResult {
+        // Scrub the final hop's canary exactly. Earlier hops mint their own
+        // canaries, and a reflected `Location` can carry one into the chain, so
+        // strip every canary-shaped token as well. The authoritative capture
+        // below is built from the unscrubbed headers/body and stays raw, so a
+        // hash replayed from capture bytes reproduces the original exchange.
+        let scrub = |value: &str| redact_canary_text(&value.replace(canary, REDACTED_CANARY));
+        let out_headers: serde_json::Map<String, Value> = raw_headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    Value::String(scrub(&redact(value.as_str().unwrap_or("")))),
+                )
+            })
+            .collect();
+        let out_chain: Vec<Value> = redirect_chain
+            .iter()
+            .map(|entry| {
+                let mut entry = entry.clone();
+                if let Some(from) = entry.get("from").and_then(Value::as_str) {
+                    entry["from"] = Value::String(scrub(from));
+                }
+                if let Some(to) = entry.get("to").and_then(Value::as_str) {
+                    entry["to"] = Value::String(scrub(to));
+                }
+                entry
+            })
+            .collect();
+        let out = json!({
+            "ok": ok,
+            "url": scrub(current.as_str()),
+            "status": status,
+            "headers": out_headers,
+            "body": scrub(&redact(raw_body)),
+            "body_truncated": truncated,
+            "body_bytes": body_len,
+            "redirect_chain": out_chain
+        });
+        let capture = build_capture(
+            request_repr,
+            build_response_repr(status, raw_headers, raw_body),
+            canary.to_string(),
+        );
+        let mut structured = out.clone();
+        structured["capture"] = capture.as_value();
+        ToolResult {
+            ok,
+            output: truncate(&out.to_string()),
+            structured: Some(structured),
+        }
+    }
+}
+#[async_trait]
+impl Tool for HttpRequestTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "http_request".into(),
+            description: "Perform an HTTP request to an in-scope target for reconnaissance/validation. Returns status, selected headers, a truncated body, and a byte-authoritative capture (request/response/canary). An unguessable X-BugFound-Canary header is injected into the real request and scrubbed from the model-visible output; the verifier requires the target to reflect it. Localhost/.local/metadata targets are blocked; engagement scope and allowed_methods are enforced in code. A configured proxy is a trusted egress boundary where DNS pinning does not apply, so scope and host validation still run before any request. Optional cookie jar (Set-Cookie upserts, host/path matching) and manual redirects: every hop is revalidated against scope, host policy and DNS pin, POST is rewritten to GET for 301/302/303, and the full scope decision is recorded in `redirect_chain`; redirects are off by default.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "url":{"type":"string","description":"Absolute http/https URL"},
+                    "method":{"type":"string","enum":["GET","HEAD","POST","PUT","DELETE","PATCH","OPTIONS"],"default":"GET"},
+                    "headers":{"type":"object","additionalProperties":{"type":"string"}},
+                    "body":{"type":"string"},
+                    "timeout_ms":{"type":"integer","default":15000},
+                    "cookies":{"description":"Cookie pairs as an object or a raw `a=1; b=2` string", "oneOf":[{"type":"object","additionalProperties":{"type":"string"}},{"type":"string"}]},
+                    "use_cookie_jar":{"type":"boolean","default":false,"description":"Attach matching cookies from the shared jar and store Set-Cookie responses"},
+                    "follow_redirects":{"type":"boolean","default":false,"description":"Manually follow 301/302/303/307/308 after revalidating every hop"},
+                    "max_redirects":{"type":"integer","minimum":0,"maximum":100,"default":0}
+                },
+                "required":["url"]
+            }),
+            risk: "network".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let url = input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("url required"))?;
+        let parsed = url::Url::parse(url).context("invalid url")?;
+        match parsed.scheme() {
+            "http" | "https" => {}
+            _ => anyhow::bail!("only http/https allowed"),
+        }
+        let method = input
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET")
+            .to_ascii_uppercase();
+        // B19: state-changing methods are denied by default. An explicit
+        // method policy or the operator's network-write opt-in is required;
+        // without one a prompt-injected call cannot replay a PUT/DELETE/PATCH.
+        if matches!(method.as_str(), "PUT" | "DELETE" | "PATCH") {
+            let explicitly_allowed = self
+                .options
+                .allowed_methods
+                .as_ref()
+                .is_some_and(|allowed| allowed.iter().any(|m| m.eq_ignore_ascii_case(&method)));
+            if !explicitly_allowed && !self.options.allow_network_write {
+                return Ok(denial_result(
+                    "method_requires_network_write",
+                    json!({"method": method}),
+                ));
+            }
+        }
+        // Central ROE method gate. Every HTTP-backed tool goes through this
+        // method, so the decision is inherited by validate_poc/http_fuzz/etc.
+        if let Some(allowed) = &self.options.allowed_methods {
+            if !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method)) {
+                return Ok(denial_result(
+                    "method_not_allowed",
+                    json!({"method": method, "allowed_methods": allowed}),
+                ));
+            }
+        }
+        // Validate the proxy configuration and engagement scope before any
+        // network work. Scope is enforced in code even when a proxy is in use,
+        // because the DNS pin below does not apply to proxied requests.
+        validate_proxy_url(&self.options)?;
+        let timeout_ms = input
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(15_000)
+            .min(30_000);
+        let explicit_cookies = parse_cookie_pairs(input.get("cookies"));
+        let use_cookie_jar = input
+            .get("use_cookie_jar")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let follow_redirects = input
+            .get("follow_redirects")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let max_redirects = input
+            .get("max_redirects")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(100) as usize;
+
+        let mut current = parsed.clone();
+        let mut current_method = method.clone();
+        let mut current_body = input
+            .get("body")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let mut redirect_chain: Vec<Value> = Vec::new();
+        let mut redirects_followed = 0usize;
+
+        // The reqwest client keeps `Policy::none()`: redirects are performed
+        // here so every hop is revalidated against scope, host policy and DNS
+        // before a single byte leaves the runner.
+        loop {
+            let is_first = redirects_followed == 0 && redirect_chain.is_empty();
+            let host = current
+                .host_str()
+                .ok_or_else(|| anyhow!("url has no host"))?
+                .to_string();
+            // Pass the full URL: a path-scoped out-of-scope rule only applies
+            // when the request actually carries that path.
+            if !scope_target_allowed(
+                current.as_str(),
+                &self.options.scope_in,
+                &self.options.scope_out,
+            ) {
+                if is_first {
+                    anyhow::bail!("target '{host}' is not permitted by scope policy");
+                }
+                return Ok(denial_result(
+                    "redirect_out_of_scope",
+                    json!({"url": current.as_str(), "redirect_chain": redirect_chain}),
+                ));
+            }
+            if let Err(err) = validate_host_with_options(&host, &self.options) {
+                if is_first {
+                    return Err(err);
+                }
+                return Ok(denial_result(
+                    "redirect_host_not_allowed",
+                    json!({
+                        "url": current.as_str(),
+                        "reason": redact(&err.to_string()),
+                        "redirect_chain": redirect_chain
+                    }),
+                ));
+            }
+            let pinned_ip = if host.parse::<IpAddr>().is_ok() {
+                None
+            } else if host_is_trusted(&host, &self.options.trusted_local_targets) {
+                match resolve_trusted_host(&host, &self.options).await {
+                    Ok(ip) => Some(ip),
+                    Err(err) => {
+                        if is_first {
+                            return Err(err);
+                        }
+                        return Ok(denial_result(
+                            "redirect_resolution_failed",
+                            json!({"url": current.as_str(), "reason": redact(&err.to_string())}),
+                        ));
+                    }
+                }
+            } else {
+                match resolve_public_ip(&host).await {
+                    Ok(ip) => Some(ip),
+                    Err(err) => {
+                        if is_first {
+                            return Err(err);
+                        }
+                        return Ok(denial_result(
+                            "redirect_resolution_failed",
+                            json!({"url": current.as_str(), "reason": redact(&err.to_string())}),
+                        ));
+                    }
+                }
+            };
+            // Pin the connection to the IP we validated; TLS SNI and Host still
+            // use the original hostname.
+            let client = if let Some(ip) = pinned_ip {
+                match apply_proxy(
+                    reqwest::Client::builder()
+                        .timeout(Duration::from_secs(30))
+                        .redirect(reqwest::redirect::Policy::none())
+                        .user_agent(self.options.user_agent.as_deref().unwrap_or("bugfound/0.1"))
+                        .resolve(&host, ip),
+                    &self.options,
+                )
+                .build()
+                {
+                    Ok(client) => client,
+                    Err(err) => {
+                        if is_first {
+                            return Err(err).context("build pinned http client");
+                        }
+                        return Ok(denial_result(
+                            "redirect_client_error",
+                            json!({"url": current.as_str(), "reason": redact(&err.to_string())}),
+                        ));
+                    }
+                }
+            } else {
+                self.client.clone()
+            };
+
+            // Jar cookies attach first; explicit cookies override by name. Both
+            // are rendered into the authoritative bytes so the canary covers
+            // them.
+            let mut effective_headers = input
+                .get("headers")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let mut cookie_pairs: Vec<(String, String)> = Vec::new();
+            if use_cookie_jar {
+                cookie_pairs.extend(cookies_for_url(
+                    &self.options.cookie_jar,
+                    &host,
+                    current.path(),
+                ));
+            }
+            for (name, value) in &explicit_cookies {
+                cookie_pairs.retain(|(existing, _)| existing != name);
+                cookie_pairs.push((name.clone(), value.clone()));
+            }
+            if !cookie_pairs.is_empty() {
+                let header = cookie_pairs
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                effective_headers.insert("Cookie".to_string(), Value::String(header));
+            }
+
+            let mut req = match current_method.as_str() {
+                "GET" => client.get(current.clone()),
+                "HEAD" => client.head(current.clone()),
+                "POST" => client.post(current.clone()),
+                "PUT" => client.put(current.clone()),
+                "DELETE" => client.delete(current.clone()),
+                "PATCH" => client.request(reqwest::Method::PATCH, current.clone()),
+                "OPTIONS" => client.request(reqwest::Method::OPTIONS, current.clone()),
+                _ => {
+                    return Ok(denial_result(
+                        "unsupported_method",
+                        json!({"method": current_method}),
+                    ))
+                }
+            };
+            for (name, value) in &effective_headers {
+                if let Some(value) = value.as_str() {
+                    req = req.header(name, value);
+                }
+            }
+            if let Some(body) = &current_body {
+                req = req.body(body.clone());
+            }
+            // Build the authoritative request bytes before the send so both the
+            // success and error paths can pin the same evidence.
+            let mut request_repr = build_request_repr(
+                &current_method,
+                &current,
+                &self.options,
+                Some(&effective_headers),
+                current_body.as_deref(),
+            );
+            // Mint once and actually transmit the canary. The verifier requires
+            // the target to reflect it, so a token that is only stored as
+            // evidence can never be satisfied by a real response. Keep it out
+            // of the LLM-visible output; it lives only in the outbound request
+            // and the capture.
+            let canary = canary_for(&request_repr);
+            request_repr = request_repr.replacen(
+                "\r\n\r\n",
+                &format!("\r\nX-BugFound-Canary: {canary}\r\n\r\n"),
+                1,
+            );
+            req = req.header("X-BugFound-Canary", &canary);
+            obey_rate_limit(&self.options).await;
+            let mut resp = match timeout(Duration::from_millis(timeout_ms), req.send()).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(err)) => {
+                    let message = redact(&err.to_string());
+                    let capture =
+                        build_capture(request_repr, format!("(no response) {message}"), canary);
+                    let mut structured = json!({"ok": false, "error": message});
+                    structured["capture"] = capture.as_value();
+                    structured["redirect_chain"] = json!(redact_canaries(&json!(redirect_chain)));
+                    return Ok(ToolResult {
+                        ok: false,
+                        output: truncate(&format!("http request failed: {message}")),
+                        structured: Some(structured),
+                    });
+                }
+                Err(_) => {
+                    let capture =
+                        build_capture(request_repr, "(no response) http timeout".into(), canary);
+                    let mut structured = json!({"ok": false, "error": "http timeout"});
+                    structured["capture"] = capture.as_value();
+                    structured["redirect_chain"] = json!(redact_canaries(&json!(redirect_chain)));
+                    return Ok(ToolResult {
+                        ok: false,
+                        output: "http timeout".into(),
+                        structured: Some(structured),
+                    });
+                }
+            };
+            let status = resp.status().as_u16();
+            // Authoritative wire headers: no `redact` here. The model-visible
+            // view is scrubbed in `finalize`; the capture keeps the raw bytes.
+            let mut raw_headers = serde_json::Map::new();
+            for (k, v) in resp.headers().iter().take(40) {
+                let value = v
+                    .to_str()
+                    .unwrap_or("<binary>")
+                    .chars()
+                    .take(200)
+                    .collect::<String>();
+                raw_headers.insert(k.to_string(), Value::String(value));
+            }
+            let (bytes, truncated) =
+                match read_body_capped(&mut resp, Duration::from_millis(timeout_ms)).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        let message = redact(&err.to_string());
+                        let capture = build_capture(
+                            request_repr,
+                            build_response_repr(
+                                status,
+                                &raw_headers,
+                                &format!("(read error) {message}"),
+                            ),
+                            canary,
+                        );
+                        let mut structured =
+                            json!({"ok": false, "status": status, "error": message});
+                        structured["capture"] = capture.as_value();
+                        structured["redirect_chain"] =
+                            json!(redact_canaries(&json!(redirect_chain)));
+                        return Ok(ToolResult {
+                            ok: false,
+                            output: truncate(&format!("http read failed: {message}")),
+                            structured: Some(structured),
+                        });
+                    }
+                };
+            let slice = &bytes[..bytes.len().min(MAX_HTTP_BODY_BYTES)];
+            // Lossy UTF-8 decoding is the only transformation applied to the
+            // authoritative bytes: no canary/credential redaction.
+            let raw_body = String::from_utf8_lossy(slice).into_owned();
+            let ok = (200..400).contains(&status);
+
+            // Parse Set-Cookie from a synthesized, unredacted response repr
+            // before credential redaction can mask cookie values. Keeping the
+            // raw header lines (rather than a name-keyed map) preserves every
+            // Set-Cookie in a multi-cookie response.
+            if use_cookie_jar {
+                let mut repr = format!("HTTP/1.1 {status}\r\n");
+                for (name, value) in resp.headers().iter().take(40) {
+                    if let Ok(value) = value.to_str() {
+                        repr.push_str(&format!("{name}: {value}\r\n"));
+                    }
+                }
+                repr.push_str("\r\n");
+                repr.push_str(&raw_body);
+                let set_cookies = set_cookies_from_repr(&repr);
+                cookie_jar_store(&self.options.cookie_jar, &set_cookies, &host);
+            }
+
+            // Manual redirect handling. Every Location is resolved against the
+            // current URL and scope/host validated before it is requested.
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let is_redirect = matches!(status, 301 | 302 | 303 | 307 | 308) && location.is_some();
+            if is_redirect && follow_redirects && redirects_followed < max_redirects {
+                let location = location.unwrap_or_default();
+                let next = match current.join(&location) {
+                    Ok(next) => next,
+                    Err(_) => {
+                        // A malformed Location is not an out-of-scope target;
+                        // report the redirect response itself instead.
+                        return Ok(Self::finalize(
+                            ok,
+                            &current,
+                            status,
+                            &raw_headers,
+                            &raw_body,
+                            truncated,
+                            bytes.len(),
+                            &canary,
+                            request_repr,
+                            redirect_chain,
+                        ));
+                    }
+                };
+                // 301/302/303 from POST become GET, matching ZAP and browsers.
+                let next_method = if (301..=303).contains(&status) && current_method == "POST" {
+                    "GET".to_string()
+                } else {
+                    current_method.clone()
+                };
+                let next_body = if next_method == "GET" {
+                    None
+                } else {
+                    current_body.clone()
+                };
+                if !matches!(next.scheme(), "http" | "https") {
+                    redirect_chain.push(json!({
+                        "from": current.as_str(),
+                        "to": next.as_str(),
+                        "status": status,
+                        "in_scope": false,
+                        "host_allowed": false
+                    }));
+                    return Ok(denial_result(
+                        "redirect_scheme_not_allowed",
+                        json!({"url": next.as_str(), "redirect_chain": redirect_chain}),
+                    ));
+                }
+                let next_host = next.host_str().unwrap_or("").to_string();
+                let in_scope = scope_target_allowed(
+                    next.as_str(),
+                    &self.options.scope_in,
+                    &self.options.scope_out,
+                );
+                let host_allowed = validate_host_with_options(&next_host, &self.options).is_ok();
+                redirect_chain.push(json!({
+                    "from": current.as_str(),
+                    "to": next.as_str(),
+                    "status": status,
+                    "method": next_method,
+                    "in_scope": in_scope,
+                    "host_allowed": host_allowed
+                }));
+                if !in_scope {
+                    return Ok(denial_result(
+                        "redirect_out_of_scope",
+                        json!({"url": next.as_str(), "redirect_chain": redirect_chain}),
+                    ));
+                }
+                if !host_allowed {
+                    return Ok(denial_result(
+                        "redirect_host_not_allowed",
+                        json!({"url": next.as_str(), "redirect_chain": redirect_chain}),
+                    ));
+                }
+                redirects_followed += 1;
+                current = next;
+                current_method = next_method;
+                current_body = next_body;
+                continue;
+            }
+
+            return Ok(Self::finalize(
+                ok,
+                &current,
+                status,
+                &raw_headers,
+                &raw_body,
+                truncated,
+                bytes.len(),
+                &canary,
+                request_repr,
+                redirect_chain,
+            ));
+        }
+    }
+}
+
+/// Pure verdict logic for PoC validation. Kept public so it can be tested
+/// without performing any network request.
+pub fn poc_verdict(status: u16, expected: u16, marker_found: bool, marker_required: bool) -> bool {
+    status == expected && (!marker_required || marker_found)
+}
+
+/// A benign-control transport error must downgrade the advisory verdict to
+/// inconclusive instead of being silently dropped with `.ok()`. The primary
+/// capture is already in `structured` and is deliberately preserved.
+fn apply_benign_control_error(structured: &mut Value, error: &str) -> String {
+    let error = redact(error);
+    structured["advisory"] = Value::Bool(true);
+    structured["valid"] = Value::Bool(false);
+    structured["inconclusive"] = Value::Bool(true);
+    structured["error"] = Value::String(error.clone());
+    format!(
+        "Advisory PoC inconclusive: benign control failed ({error}). Independent verification required."
+    )
+}
+
+/// Validate a proof-of-concept: replay a request through the scoped HTTP tool
+/// and check the response status and optional body marker.
+pub struct ValidatePoCTool {
+    http: HttpRequestTool,
+}
+
+impl ValidatePoCTool {
+    pub fn new() -> Self {
+        Self::with_options(ToolOptions::default())
+    }
+
+    pub fn with_options(options: ToolOptions) -> Self {
+        Self {
+            http: HttpRequestTool::with_options(options),
+        }
+    }
+}
+
+impl Default for ValidatePoCTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for ValidatePoCTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "validate_poc".into(),
+            description: "Replay a proof-of-concept request and validate its status code and optional response marker.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "finding_id": {"type": "string", "description": "Id of the finding this advisory result belongs to"},
+                    "url": {"type": "string", "description": "Absolute http/https URL to validate"},
+                    "method": {"type": "string", "enum": ["GET","HEAD","POST","PUT","DELETE","PATCH","OPTIONS"], "default": "GET"},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "body": {"type": "string"},
+                    "expected_status": {"type": "number", "default": 200},
+                    "marker": {"type": "string", "description": "Substring that must appear in the response body"}
+                },
+                "required": ["finding_id", "url"]
+            }),
+            risk: "network-write".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let Some(finding_id) = input
+            .get("finding_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return Ok(ToolResult {
+                ok: false,
+                output: "finding_id required".into(),
+                structured: Some(json!({"valid": false, "error": "finding_id required"})),
+            });
+        };
+        let url = input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("url required"))?;
+        let method = input
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET");
+        // Mirror the HTTP tool's B19 gate so an explicitly state-changing PoC
+        // cannot be replayed through this wrapper without an opt-in.
+        if matches!(
+            method.to_ascii_uppercase().as_str(),
+            "PUT" | "DELETE" | "PATCH"
+        ) {
+            let explicitly_allowed = self
+                .http
+                .options
+                .allowed_methods
+                .as_ref()
+                .is_some_and(|allowed| allowed.iter().any(|m| m.eq_ignore_ascii_case(method)));
+            if !explicitly_allowed && !self.http.options.allow_network_write {
+                return Ok(denial_result(
+                    "method_requires_network_write",
+                    json!({"method": method}),
+                ));
+            }
+        }
+        let expected_status = input
+            .get("expected_status")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(200);
+        let expected_status =
+            u16::try_from(expected_status).context("expected_status out of range")?;
+        let marker = input.get("marker").and_then(|v| v.as_str());
+
+        // Replay exactly what was supplied: headers and body are part of the
+        // proof-of-concept and must reach the request, not just the URL/method.
+        let mut replay = json!({"url": url, "method": method});
+        if let Some(headers) = input.get("headers") {
+            replay["headers"] = headers.clone();
+        }
+        if let Some(body) = input.get("body") {
+            replay["body"] = body.clone();
+        }
+        let response = self.http.run(replay).await?;
+        // Tool-minted benign control: same endpoint and method, but a distinct
+        // local label in the request. The HTTP tool derives a fresh canary from
+        // the request bytes, so the benign and payload captures can never share
+        // a marker. The model never supplies or sees the benign label.
+        let benign_label = format!(
+            "benign-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let mut benign_replay = json!({"url": url, "method": method});
+        if let Some(headers) = input.get("headers") {
+            benign_replay["headers"] = headers.clone();
+        }
+        if benign_replay.get("headers").is_none() {
+            benign_replay["headers"] = json!({});
+        }
+        benign_replay["headers"]["X-BugFound-Control"] = json!(benign_label);
+        if let Some(body) = input.get("body") {
+            benign_replay["body"] = body.clone();
+        }
+        // B24: keep the error instead of swallowing it with `.ok()`.
+        let (benign_response, benign_error) = match self.http.run(benign_replay).await {
+            Ok(response) => (Some(response), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
+        let status = response
+            .structured
+            .as_ref()
+            .and_then(|v| v.get("status"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let status = u16::try_from(status).unwrap_or(0);
+        let body = response
+            .structured
+            .as_ref()
+            .and_then(|v| v.get("body"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let marker_found = marker.map(|m| body.contains(m)).unwrap_or(false);
+        let valid =
+            response.ok && poc_verdict(status, expected_status, marker_found, marker.is_some());
+
+        // Advisory only: a caller-supplied expected_status/marker is not an
+        // authoritative oracle. Core runs an independent canary verifier and
+        // is solely responsible for promoting a finding; this verdict never
+        // changes finding state.
+        let mut structured = json!({
+            "advisory": true,
+            "finding_id": finding_id,
+            "valid": valid,
+            "status": status,
+            "marker_found": marker_found,
+            "url": url,
+        });
+        // Forward the authoritative capture (and any ROE denial reason) from
+        // the replay so core can pin the exact bytes as finding evidence.
+        if let Some(http_structured) = response.structured.as_ref() {
+            if let Some(capture) = http_structured.get("capture") {
+                structured["capture"] = capture.clone();
+                if let Some(benign) = benign_response
+                    .as_ref()
+                    .and_then(|r| r.structured.as_ref().and_then(|v| v.get("capture")))
+                {
+                    structured["paired_capture"] = json!({
+                        "benign": benign,
+                        "payload": capture,
+                    });
+                }
+            }
+            if let Some(error) = http_structured.get("error") {
+                structured["error"] = error.clone();
+            }
+        }
+        if let Some(error) = benign_error {
+            let output = apply_benign_control_error(&mut structured, &error);
+            return Ok(ToolResult {
+                ok: false,
+                output: truncate(&output),
+                structured: Some(structured),
+            });
+        }
+        let output = if valid {
+            format!(
+                "Advisory PoC result for finding {finding_id} ({url}): status {status}, marker found: {marker_found}. Independent verification required."
+            )
+        } else {
+            format!(
+                "Advisory PoC result for finding {finding_id} ({url}): status {status} (expected {expected_status}), ok={}, marker found: {marker_found}. Independent verification required.",
+                response.ok
+            )
+        };
+        Ok(ToolResult {
+            ok: valid,
+            output: truncate(&output),
+            structured: Some(structured),
+        })
+    }
+}
+
+pub struct DnsLookupTool {
+    timeout_ms: u64,
+    options: ToolOptions,
+}
+impl DnsLookupTool {
+    pub fn new() -> Self {
+        Self::new_with_options(ToolOptions::default())
+    }
+
+    /// Construct the resolver with engagement scope and host policy. Both are
+    /// applied before the lookup, and every returned address is re-checked.
+    pub fn new_with_options(options: ToolOptions) -> Self {
+        Self {
+            timeout_ms: 10000,
+            options,
+        }
+    }
+}
+impl Default for DnsLookupTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[async_trait]
+impl Tool for DnsLookupTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "dns_lookup".into(),
+            description: "Resolve a hostname to IP addresses.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "host":{"type":"string"},
+                    "domain":{"type":"string"},
+                    "name":{"type":"string"},
+                    "target":{"type":"string"}
+                },
+                "required":[]
+            }),
+            risk: "network".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let host = input
+            .get("host")
+            .or_else(|| input.get("domain"))
+            .or_else(|| input.get("name"))
+            .or_else(|| input.get("target"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing host"))?;
+        let host = host.trim();
+        let host_key = normalize_scope_target(host);
+        // Host-only by design: a DNS lookup has no request path, so a
+        // path-scoped exclusion must not apply to it.
+        if !scope_target_allowed(&host_key, &self.options.scope_in, &self.options.scope_out) {
+            return Ok(denial_result(
+                "target_not_in_scope",
+                json!({"host": host, "target": host_key}),
+            ));
+        }
+        if let Err(err) = validate_host_with_options(&host_key, &self.options) {
+            return Ok(denial_result(
+                "host_not_allowed",
+                json!({"host": host, "reason": redact(&err.to_string())}),
+            ));
+        }
+        let target = format!(
+            "{}:0",
+            host.trim_start_matches("http://")
+                .trim_start_matches("https://")
+        );
+        let fut = tokio::net::lookup_host(&target);
+        let addrs = tokio::time::timeout(std::time::Duration::from_millis(self.timeout_ms), fut)
+            .await
+            .context("dns timeout")??;
+        let mut ips: Vec<String> = Vec::new();
+        let mut blocked: Vec<String> = Vec::new();
+        for addr in addrs {
+            let ip = addr.ip();
+            if is_blocked_ip(ip)
+                && !ip_is_explicitly_trusted(ip, &self.options.trusted_local_targets)
+            {
+                blocked.push(ip.to_string());
+            }
+            ips.push(ip.to_string());
+        }
+        ips.sort();
+        ips.dedup();
+        blocked.sort();
+        blocked.dedup();
+        if !blocked.is_empty() {
+            // Never echo blocked address values: an injected or surprising
+            // resolution must not leak private infrastructure back to the model.
+            return Ok(ToolResult {
+                ok: false,
+                output: truncate(&format!(
+                    "resolved {host} to blocked addresses (count: {})",
+                    blocked.len()
+                )),
+                structured: Some(json!({
+                    "host": host,
+                    "ip_count": ips.len(),
+                    "blocked_ip_count": blocked.len(),
+                    "error": "blocked_ip",
+                })),
+            });
+        }
+        let out = if ips.is_empty() {
+            format!("no addresses resolved for {host}")
+        } else {
+            format!("resolved {host}: {}", ips.join(", "))
+        };
+        Ok(ToolResult {
+            ok: !ips.is_empty(),
+            output: truncate(&out),
+            structured: Some(json!({"host": host, "ips": ips})),
+        })
+    }
+}
+
+pub struct FsWriteTool {
+    cwd: PathBuf,
+}
+impl FsWriteTool {
+    pub fn new(cwd: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            cwd: resolve_cwd(cwd)?,
+        })
+    }
+}
+#[async_trait]
+impl Tool for FsWriteTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "fs_write".into(),
+            description: "Write text content to a workspace-relative file path.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "path":{"type":"string"},
+                    "content":{"type":"string"},
+                    "append":{"type":"boolean"}
+                },
+                "required":["path","content"]
+            }),
+            risk: "write".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let path = input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing path"))?;
+        let content = input
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing content"))?;
+        let append = input
+            .get("append")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let resolved = resolve_in_cwd(&self.cwd, path, false, true)?;
+        if let Some(parent) = resolved.parent() {
+            std::fs::create_dir_all(parent).context("create parent dirs")?;
+        }
+        use std::io::Write;
+        if append {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&resolved)
+                .context("open file")?;
+            f.write_all(content.as_bytes()).context("write file")?;
+        } else {
+            std::fs::write(&resolved, content).context("write file")?;
+        }
+        let bytes = content.len();
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&format!("wrote {bytes} bytes to {path}")),
+            structured: Some(json!({"path": path, "bytes": bytes, "append": append})),
+        })
+    }
+}
+
+/// Canonical falsification columns, in the order reported to the model. The
+/// engagement layer persists these exact column names.
+const FALSIFICATION_FIELDS: &[&str] = &[
+    "counterevidence",
+    "confidence",
+    "confidence_rationale",
+    "severity_change_conditions",
+    "oracle_type",
+];
+
+/// Model-friendly aliases accepted at the save/validate boundary. Canonical
+/// names always win when both spellings are supplied.
+const FALSIFICATION_ALIASES: &[(&str, &str)] = &[
+    ("against", "counterevidence"),
+    ("why", "confidence_rationale"),
+    ("breaks_if", "severity_change_conditions"),
+    ("oracle", "oracle_type"),
+];
+
+const ORACLE_TYPES: &[&str] = &[
+    "canary_echo",
+    "differential",
+    "state_delta",
+    "timing",
+    "oob_hit",
+    "browser_deferred",
+];
+/// Rewrite alias spellings into the canonical store columns before validation
+/// and before handing the finding back to the runner.
+fn canonicalize_finding_input(input: &Value) -> Value {
+    let mut canonical = input.clone();
+    let Some(object) = canonical.as_object_mut() else {
+        return canonical;
+    };
+    for (alias, field) in FALSIFICATION_ALIASES {
+        let field_missing = object
+            .get(*field)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .is_empty();
+        if field_missing {
+            if let Some(value) = object.get(*alias).cloned() {
+                object.insert((*field).to_string(), value);
+            }
+        }
+        object.remove(*alias);
+    }
+    canonical
+}
+
+fn is_known_oracle(oracle: &str) -> bool {
+    ORACLE_TYPES.contains(&oracle)
+}
+
+/// Proof the deterministic verifier still needs for an oracle class.
+/// `canary_echo` and `differential` both have authoritative confirm paths in
+/// `bugfound-engagement::verify_candidate`; every other class stays an open
+/// proof gap. Keep this in sync with the verifier, not with older docs.
+fn oracle_proof_gap(oracle: &str) -> Option<&'static str> {
+    match oracle {
+        "canary_echo" | "differential" => None,
+        "state_delta" => Some("pre/post state snapshot plus a reset recipe"),
+        "timing" => Some("repeated timing samples with baseline and noise threshold"),
+        "oob_hit" => Some("external DNS/HTTP listener hit bound to the canary"),
+        "browser_deferred" => Some("browser-executed DOM or artifact proof"),
+        _ => Some(
+            "a recognized oracle_type (canary_echo, differential, state_delta, timing, oob_hit, browser_deferred)",
+        ),
+    }
+}
+
+#[derive(Debug)]
+struct FalsificationStatus {
+    missing: Vec<String>,
+    invalid_oracle: bool,
+}
+
+impl FalsificationStatus {
+    fn ready(&self) -> bool {
+        self.missing.is_empty() && !self.invalid_oracle
+    }
+
+    fn paths(&self) -> Vec<String> {
+        if self.invalid_oracle {
+            vec!["oracle_type".to_string()]
+        } else {
+            self.missing.clone()
+        }
+    }
+
+    fn output(&self) -> String {
+        if self.invalid_oracle {
+            "falsification incomplete: invalid oracle_type".to_string()
+        } else {
+            format!("falsification incomplete: {}", self.missing.join(", "))
+        }
+    }
+
+    fn error_structured(&self) -> Value {
+        json!({"error": "falsification_incomplete", "paths": self.paths()})
+    }
+}
+
+/// Single source of truth for the five falsification columns. The save
+/// boundary and the pre-flight validator both call this, so their rejection
+/// messages cannot drift.
+fn check_falsification(input: &Value) -> FalsificationStatus {
+    let missing = FALSIFICATION_FIELDS
+        .iter()
+        .filter(|field| {
+            input
+                .get(**field)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+        })
+        .map(|field| (*field).to_string())
+        .collect::<Vec<_>>();
+    // An absent or empty oracle is already reported as a missing field. A
+    // present but unknown oracle needs the dedicated invalid-oracle message.
+    let invalid_oracle = !missing.iter().any(|field| field == "oracle_type")
+        && input
+            .get("oracle_type")
+            .and_then(Value::as_str)
+            .is_some_and(|oracle| !is_known_oracle(oracle));
+    FalsificationStatus {
+        missing,
+        invalid_oracle,
+    }
+}
+
+/// The deterministic verifier only works with tool-minted references. Free-form
+/// model text (`evidence`, `request`, `response`) is advisory and must not make
+/// a candidate look ready for promotion.
+fn is_tool_capture_reference(value: &Value) -> bool {
+    match value {
+        Value::String(text) => {
+            let Some(hex) = text.trim().strip_prefix("bugfound-capture-") else {
+                return false;
+            };
+            !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }
+        Value::Object(object) => {
+            let source = object
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            let sha256 = object
+                .get("sha256")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            ["http_request", "validate_poc"].contains(&source.as_str())
+                && sha256.len() >= 32
+                && sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }
+        Value::Array(values) => values.iter().any(is_tool_capture_reference),
+        _ => false,
+    }
+}
+
+fn has_capture_reference(input: &Value) -> bool {
+    ["capture", "captures", "evidence", "capture_id"]
+        .iter()
+        .any(|key| input.get(*key).is_some_and(is_tool_capture_reference))
+}
+
+fn candidate_falsified(input: &Value) -> bool {
+    input
+        .get("falsified")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || matches!(
+            input.get("status").and_then(Value::as_str),
+            Some("ruled_out" | "falsified" | "disproved")
+        )
+}
+
+/// Shared property schema for the finding-producing tools. Descriptions make
+/// the falsification contract (and its accepted aliases) visible to the model.
+fn finding_input_properties() -> Value {
+    json!({
+        "title":{"type":"string"},
+        "severity":{"type":"string","enum":["info","low","medium","high","critical"]},
+        "asset":{"type":"string"},
+        "vuln_type":{"type":"string"},
+        "description":{"type":"string"},
+        "reproduction":{"type":"string"},
+        "impact":{"type":"string"},
+        "remediation":{"type":"string"},
+        "evidence":{"type":"string","description":"Reference to tool-produced capture bytes; the canary itself is never shown to the model."},
+        "request":{"type":"string"},
+        "response":{"type":"string"},
+        "cvss":{"type":"string"},
+        "cwe":{"type":"string"},
+        "counterevidence":{"type":"string","description":"Strongest specific case against the finding: name the control and location actually checked."},
+        "confidence":{
+            "type":"string","enum":["low","medium","high"],
+            "description":"Honest confidence; static-only evidence is at most medium.",
+            "x-enumDescriptions":{
+                "low":"Mostly speculative; no tool-backed observation.",
+                "medium":"Static evidence or partial tool observation; important gaps remain.",
+                "high":"Tool-backed observation plus counterevidence pass; claims are matched by captures."
+            }
+        },
+        "confidence_rationale":{"type":"string","description":"Why this confidence is justified given the evidence and counterevidence."},
+        "severity_change_conditions":{"type":"string","description":"Concrete conditions that would raise or lower the severity."},
+        "oracle_type":{
+            "type":"string","enum":ORACLE_TYPES,
+            "description":"Oracle that matches the captures actually produced; only canary_echo can be auto-confirmed.",
+            "x-enumDescriptions":{
+                "canary_echo":"Tool-minted canary reflected in a 2xx tool-captured response.",
+                "differential":"Cross-owner differential capture with positive and negative ownership controls.",
+                "state_delta":"Pre/post state snapshot plus a reset recipe.",
+                "timing":"Repeated timing samples with baseline and noise threshold.",
+                "oob_hit":"External DNS/HTTP listener hit bound to the canary.",
+                "browser_deferred":"Browser-executed DOM or artifact proof."
+            }
+        },
+        "against":{"type":"string","description":"Alias for counterevidence."},
+        "why":{"type":"string","description":"Alias for confidence_rationale."},
+        "breaks_if":{"type":"string","description":"Alias for severity_change_conditions."},
+        "oracle":{"type":"string","description":"Alias for oracle_type."},
+        "finding_id":{"type":"string","description":"Optional correlation id for validate_finding."}
+    })
+}
+
+#[derive(Clone)]
+pub struct SaveFindingTool {
+    pub require_falsification: bool,
+}
+
+impl Default for SaveFindingTool {
+    fn default() -> Self {
+        Self {
+            require_falsification: true,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SaveFindingTool {
+    fn spec(&self) -> ToolSpec {
+        let properties = finding_input_properties();
+        ToolSpec {
+            name: "save_finding".into(),
+            description: r#"Record a validated security finding for the current session/report. Provide clear evidence and reproduction steps. Falsification is mandatory: all five fields (counterevidence, confidence, confidence_rationale, severity_change_conditions, oracle_type) must be NON-EMPTY strings; whitespace-only is rejected. Set oracle_type to the oracle that matches the captures you actually produced - do not declare an oracle the evidence cannot support. The canary is tool-minted by http_request, is never shown to you, and must never be guessed, copied, or repeated in any field. Example: {"title":"Reflected probe on /search","severity":"high","description":"Untrusted query parameter is reflected verbatim in a 2xx HTML response.","evidence":"Tool capture from http_request on /search; benign control did not reflect.","counterevidence":"Checked the output encoder on the same path; the captured response encodes < and > but not the injected marker.","confidence":"high","confidence_rationale":"Tool capture reflects the injected probe while the benign control does not.","severity_change_conditions":"Downgrade to medium if the endpoint requires authentication.","oracle_type":"canary_echo"}. Canonical aliases are accepted: against=counterevidence, why=confidence_rationale, breaks_if=severity_change_conditions, oracle=oracle_type. Call validate_finding first to check the same contract before saving."#.into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":properties,
+                "required":["title","severity","description"]
+            }),
+            risk: "write".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let title = input
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("(untitled)");
+        let sev = input
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or("info");
+        let canonical = canonicalize_finding_input(&input);
+        if self.require_falsification {
+            let status = check_falsification(&canonical);
+            if !status.ready() {
+                return Ok(ToolResult {
+                    ok: false,
+                    output: status.output(),
+                    structured: Some(status.error_structured()),
+                });
+            }
+        }
+        // Canaries are tool-minted and never shown to the model. Scrub the
+        // human-readable output and every structured field before returning.
+        let title = redact_canary_text(title);
+        let sev = redact_canary_text(sev);
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&redact_canary_text(&format!(
+                "finding recorded (persisted by runner): [{sev}] {title}"
+            ))),
+            structured: Some(redact_canaries(&canonical)),
+        })
+    }
+}
+
+/// Local, read-only pre-flight check for a candidate finding. It applies the
+/// exact same falsification contract as `save_finding` but never persists a
+/// finding and never touches a validation status.
+#[derive(Default, Clone)]
+pub struct ValidateFindingTool;
+
+#[async_trait]
+impl Tool for ValidateFindingTool {
+    fn spec(&self) -> ToolSpec {
+        let properties = finding_input_properties();
+        ToolSpec {
+            name: "validate_finding".into(),
+            description: r#"Local CONTRACT pre-flight before calling save_finding (not authoritative evidence validation). No network, no writes, and no store lookup: capture references are self-reported, and this tool never persists a finding or sets a validation status. Authoritative verification is verify_findings, which replays tool-captured bytes. Supply the same object you would pass to save_finding (plus an optional finding_id for correlation). All five falsification fields must be non-empty strings and oracle_type must match the captures you produced; canary_echo and differential are the auto-confirmable classes. The canary is tool-minted and never shown to you - do not guess it, and any token found in the candidate is redacted to <redacted-canary> in the result. Returns {"ok":true,"ready":bool,"missing_fields":[...],"declared_oracle":...,"missing_evidence":[...],"falsified":bool,"reasons":[...]}; when fields are missing the {"error":"falsification_incomplete","paths":[...]} shape matches save_finding exactly."#.into(),
+            // No schema-level requirements: fields are enforced in `run` so the
+            // model receives the same structured error it would get from save.
+            input_schema: json!({"type":"object","properties":properties,"required":[]}),
+            risk: "safe".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let canonical = canonicalize_finding_input(&input);
+        let status = check_falsification(&canonical);
+        let oracle = canonical
+            .get("oracle_type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let missing_evidence: Vec<String> = if !status.ready() || oracle.is_empty() {
+            Vec::new()
+        } else {
+            match oracle_proof_gap(oracle) {
+                Some(gap) => vec![gap.to_string()],
+                None if !has_capture_reference(&canonical) => {
+                    vec!["tool-canary reflection in a 2xx response".to_string()]
+                }
+                None => Vec::new(),
+            }
+        };
+        let falsified = candidate_falsified(&canonical);
+        let ready = status.ready() && missing_evidence.is_empty() && !falsified;
+        let mut reasons = Vec::new();
+        if status.invalid_oracle {
+            reasons.push(format!(
+                "oracle_type '{oracle}' is not a recognized oracle class"
+            ));
+        }
+        if !status.missing.is_empty() {
+            reasons.push(format!(
+                "missing falsification fields: {}",
+                status.missing.join(", ")
+            ));
+        }
+        for gap in &missing_evidence {
+            reasons.push(format!("missing evidence for {oracle}: {gap}"));
+        }
+        if falsified {
+            reasons.push("candidate is marked falsified by counterevidence".to_string());
+        }
+        if ready {
+            reasons
+                .push("falsification contract satisfied; save_finding can be called".to_string());
+        }
+        let output = if status.ready() {
+            format!(
+                "finding validation ready={ready} missing_evidence={}",
+                missing_evidence.len()
+            )
+        } else {
+            status.output()
+        };
+        let mut structured = json!({
+            "ok": true,
+            "advisory": true,
+            "ready": ready,
+            "missing_fields": status.missing.clone(),
+            "declared_oracle": if oracle.is_empty() { Value::Null } else { json!(oracle) },
+            "missing_evidence": missing_evidence,
+            "falsified": falsified,
+            "reasons": reasons,
+            "candidate": canonical,
+        });
+        if let Some(finding_id) = input.get("finding_id") {
+            structured["finding_id"] = finding_id.clone();
+        }
+        if !status.ready() {
+            structured["error"] = json!("falsification_incomplete");
+            structured["paths"] = json!(status.paths());
+        }
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&redact_canary_text(&output)),
+            structured: Some(redact_canaries(&structured)),
+        })
+    }
+}
+
+pub struct RecordAssetTool;
+#[async_trait]
+impl Tool for RecordAssetTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "record_asset".into(),
+            description: "Record or update a discovered in-scope asset (host, url, endpoint, ip, service, parameter, etc.) for the session.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "kind":{"type":"string"},
+                    "value":{"type":"string"},
+                    "metadata":{"type":"object"}
+                },
+                "required":["kind","value"]
+            }),
+            risk: "write".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let kind = input
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("asset");
+        let value = input.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&format!(
+                "asset recorded (persisted by runner): {kind}={value}"
+            )),
+            structured: Some(input),
+        })
+    }
+}
+
+pub struct SaveArtifactTool {
+    cwd: PathBuf,
+}
+impl SaveArtifactTool {
+    pub fn new(cwd: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            cwd: resolve_cwd(cwd)?,
+        })
+    }
+}
+#[async_trait]
+impl Tool for SaveArtifactTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "save_artifact".into(),
+            description: "Save evidence/output as an artifact record. Optionally write content to a workspace-relative file path.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "kind":{"type":"string"},
+                    "path":{"type":"string"},
+                    "content":{"type":"string"},
+                    "metadata":{"type":"object"}
+                },
+                "required":["kind"]
+            }),
+            risk: "write".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let kind = input.get("kind").and_then(|v| v.as_str()).unwrap_or("note");
+        let path = input.get("path").and_then(|v| v.as_str());
+        let content = input.get("content").and_then(|v| v.as_str());
+        let mut written: Option<String> = None;
+        if let (Some(p), Some(c)) = (path, content) {
+            let full = resolve_in_cwd(&self.cwd, p, false, true)?;
+            tokio::fs::write(&full, c)
+                .await
+                .with_context(|| format!("write {}", full.display()))?;
+            written = Some(p.to_string());
+        }
+        let out = json!({"ok":true,"kind":kind,"path":written,"bytes":content.map(|c| c.len()).unwrap_or(0)});
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&out.to_string()),
+            structured: Some(
+                json!({"kind": kind, "path": written, "content": content.map(|s| s.to_string()), "metadata": input.get("metadata").cloned()}),
+            ),
+        })
+    }
+}
+
+pub struct EchoTool;
+#[async_trait]
+impl Tool for EchoTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "echo".into(),
+            description: "Echo back the provided text (safe).".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{"text":{"type":"string"}},
+                "required":["text"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let text = input.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        Ok(ToolResult {
+            ok: true,
+            output: text.to_string(),
+            structured: Some(json!({"text": text})),
+        })
+    }
+}
+
+/// Chain pre-registered tools into a recon pipeline. Each step receives the
+/// previous step's first non-empty output line as its `target`. No shell and
+/// no dynamic code are involved: steps are looked up in the registry only.
+pub struct PipelineTool {
+    registry: ToolRegistry,
+    cwd: PathBuf,
+    options: ToolOptions,
+}
+
+impl PipelineTool {
+    /// Compatibility constructor with an unconstrained policy. Callers that
+    /// own an engagement should prefer [`PipelineTool::from_filtered_registry`]
+    /// so intermediate targets are re-validated against its scope.
+    pub fn new(registry: ToolRegistry, cwd: impl AsRef<Path>) -> Self {
+        Self::from_filtered_registry(registry, cwd, &ToolOptions::default())
+    }
+
+    /// Build a pipeline over an already filtered registry, carrying the
+    /// engagement policy so every intermediate target is re-checked.
+    pub fn from_filtered_registry(
+        registry: ToolRegistry,
+        cwd: impl AsRef<Path>,
+        options: &ToolOptions,
+    ) -> Self {
+        Self {
+            registry,
+            cwd: cwd.as_ref().to_path_buf(),
+            options: options.clone(),
+        }
+    }
+
+    /// Attach/replace the policy on an existing pipeline.
+    pub fn with_options(mut self, options: &ToolOptions) -> Self {
+        self.options = options.clone();
+        self
+    }
+}
+
+#[async_trait]
+impl Tool for PipelineTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "recon_pipeline".into(),
+            description: "Run an ordered list of registered recon tools, feeding each step's first output line into the next step's target.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "steps": {"type": "array", "items": {"type": "string"}, "description": "Ordered tool names"},
+                    "target": {"type": "string", "description": "Initial target for the first step"}
+                },
+                "required": ["steps", "target"]
+            }),
+            risk: "network".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let steps = input
+            .get("steps")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow!("steps required"))?;
+        let mut target = input
+            .get("target")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("target required"))?
+            .to_string();
+        let mut report: Vec<Value> = Vec::new();
+        for step in steps {
+            let name = step
+                .as_str()
+                .ok_or_else(|| anyhow!("pipeline step names must be strings"))?;
+            // Re-validate on every step: an earlier tool may have produced an
+            // out-of-scope intermediate target from untrusted output. A bare
+            // host has no path, so give it a synthetic root path before the
+            // scope check; full URLs are passed through unchanged.
+            let scope_target = if target.contains("://") || target.contains('/') {
+                target.clone()
+            } else {
+                format!("http://{target}/")
+            };
+            if !scope_target_allowed(
+                &scope_target,
+                &self.options.scope_in,
+                &self.options.scope_out,
+            ) {
+                anyhow::bail!("pipeline target '{target}' is not permitted by scope policy");
+            }
+            validate_host_with_options(&target, &self.options)
+                .with_context(|| format!("pipeline target '{target}' failed host validation"))?;
+            let tool = self
+                .registry
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown pipeline step: {name}"))?;
+            let result = tool.run(json!({"target": target})).await?;
+            let first_line = result
+                .output
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            report.push(json!({
+                "name": name,
+                "ok": result.ok,
+                "output_first_line": first_line,
+            }));
+            target = first_line;
+        }
+        let all_ok = report
+            .iter()
+            .all(|step| step.get("ok").and_then(|v| v.as_bool()).unwrap_or(false));
+        let output = format!(
+            "recon pipeline completed {} step(s) in {}: {}",
+            report.len(),
+            self.cwd.display(),
+            if all_ok {
+                "all steps succeeded"
+            } else {
+                "at least one step failed"
+            }
+        );
+        Ok(ToolResult {
+            ok: all_ok,
+            output: truncate(&output),
+            structured: Some(json!({"steps": report})),
+        })
+    }
+}
+
+const MAX_EXTERNAL_LINES: usize = 200;
+
+/// Single-pass placeholder substitution. Values are never re-scanned, so an
+/// untrusted input cannot inject another placeholder through its value.
+fn substitute_placeholder(arg: &str, input: &Value) -> String {
+    let mut out = String::with_capacity(arg.len());
+    let mut rest = arg;
+    while let Some(pos) = rest.find('{') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        let Some(end) = after.find('}') else {
+            out.push('{');
+            rest = after;
+            continue;
+        };
+        let key = &after[..end];
+        if [
+            "target", "host", "url", "word", "domain", "ports", "param", "marker", "action",
+            "selector", "script", "match", "path", "key", "value", "text",
+        ]
+        .contains(&key)
+        {
+            out.push_str(input.get(key).and_then(|v| v.as_str()).unwrap_or(""));
+            rest = &after[end + 1..];
+            continue;
+        }
+        out.push('{');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Build the exact argv for an external adapter from its template and input.
+/// Kept public so the substitution can be tested without spawning a process.
+pub fn build_external_args(template: &[String], input: &Value) -> Vec<String> {
+    template
+        .iter()
+        .map(|arg| substitute_placeholder(arg, input))
+        .collect()
+}
+
+/// Every value that can be substituted into an external adapter's argv must be
+/// scope-checked. This includes `script`/`selector`: a browser adapter can
+/// navigate through JS or a DOM selector, so an external URL smuggled into
+/// either is an out-of-scope target and must be rejected before spawn.
+const SCOPE_PLACEHOLDER_KEYS: &[&str] = &[
+    "target", "host", "url", "word", "domain", "ports", "param", "marker", "match", "action",
+    "selector", "script", "path", "key", "value", "text",
+];
+
+/// Collect all non-empty values that would be substituted into scope-bearing
+/// placeholders by `build_external_args`, so each is scope-checked. A bare
+/// `target` in the input is also returned when no template placeholder exists,
+/// preserving the check for templates that receive a target out of band.
+pub fn external_scope_values(template: &[String], input: &Value) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut has_target_placeholder = false;
+    for key in SCOPE_PLACEHOLDER_KEYS {
+        let placeholder = format!("{{{key}}}");
+        if !template.iter().any(|arg| arg.contains(&placeholder)) {
+            continue;
+        }
+        if *key == "target" {
+            has_target_placeholder = true;
+        }
+        if let Some(value) = input.get(*key).and_then(Value::as_str) {
+            if !value.is_empty() {
+                values.push(value.to_string());
+            }
+        }
+    }
+    if !has_target_placeholder {
+        if let Some(target) = input.get("target").and_then(Value::as_str) {
+            if !target.is_empty() {
+                values.push(target.to_string());
+            }
+        }
+    }
+    values
+}
+
+/// A pre-approved external recon adapter. Arguments are passed as a discrete
+/// argv vector, never interpolated into a shell command string.
+pub struct ExternalCommandTool {
+    pub name: String,
+    pub description: String,
+    pub command: String,
+    pub arg_template: Vec<String>,
+    /// Optional action map (action -> argv template). When non-empty, the tool
+    /// requires `input.action` and renders the matching template. When empty,
+    /// `arg_template` is used as before.
+    pub actions: BTreeMap<String, Vec<String>>,
+    pub risk: String,
+    cwd: PathBuf,
+    scope_in: Vec<String>,
+    scope_out: Vec<String>,
+    timeout: Duration,
+    allow_network_write: bool,
+}
+
+impl ExternalCommandTool {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        command: impl Into<String>,
+        arg_template: Vec<String>,
+        risk: impl Into<String>,
+        cwd: impl AsRef<Path>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            command: command.into(),
+            arg_template,
+            actions: BTreeMap::new(),
+            risk: risk.into(),
+            cwd: cwd.as_ref().to_path_buf(),
+            scope_in: Vec::new(),
+            scope_out: Vec::new(),
+            timeout: Duration::from_secs(60),
+            allow_network_write: false,
+        }
+    }
+
+    /// Attach a pre-approved action map. When present, `run` resolves
+    /// `input.action` to one of these templates and rejects unknown actions.
+    pub fn with_actions(mut self, actions: BTreeMap<String, Vec<String>>) -> Self {
+        self.actions = actions;
+        self
+    }
+
+    pub fn with_allow_network_write(mut self, allow: bool) -> Self {
+        self.allow_network_write = allow;
+        self
+    }
+    pub fn with_cwd(mut self, cwd: impl AsRef<Path>) -> Self {
+        self.cwd = cwd.as_ref().to_path_buf();
+        self
+    }
+
+    /// Override the spawn timeout. Primarily useful for tests that exercise
+    /// the kill-on-timeout path without waiting the full production minute.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Attach the engagement scope so the tool can fail closed on its own,
+    /// independently of the runner's approval gate.
+    pub fn with_scope(mut self, scope_in: Vec<String>, scope_out: Vec<String>) -> Self {
+        self.scope_in = scope_in;
+        self.scope_out = scope_out;
+        self
+    }
+}
+
+/// Kill a timed-out adapter and every process it spawned. On Windows
+/// `taskkill /T /F` walks the process tree. On Unix the child is started as a
+/// process-group leader, so `kill(-pid)` signals the whole group; the direct
+/// child is killed afterwards as a best-effort fallback and reaped.
+fn kill_process_tree(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        kill_process_tree_by_pid(pid);
+    }
+}
+
+/// PID-based variant for the case where the `Child` has already exited but a
+/// grandchild still holds the output pipes.
+fn kill_process_tree_by_pid(pid: u32) {
+    let pid = pid.to_string();
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid, "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .arg(format!("-{pid}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+#[async_trait]
+impl Tool for ExternalCommandTool {
+    fn spec(&self) -> ToolSpec {
+        let mut properties = serde_json::Map::new();
+        for key in [
+            "target", "host", "url", "word", "action", "script", "selector", "value", "text",
+            "code", "snapshot", "session", "profile",
+        ] {
+            properties.insert(key.to_string(), json!({"type": "string"}));
+        }
+        // Action adapters are dispatched by `action`; a URL is only required by
+        // the actions whose template references it.
+        let required = if self.actions.is_empty() {
+            vec!["target"]
+        } else {
+            vec!["action"]
+        };
+        ToolSpec {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            input_schema: json!({
+                "type": "object",
+                "properties": properties,
+                "required": required
+            }),
+            risk: self.risk.clone(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let template = if self.actions.is_empty() {
+            if let Some(action) = action {
+                anyhow::bail!(
+                    "action '{}' not supported by '{}' (no action map configured)",
+                    action,
+                    self.name
+                );
+            }
+            self.arg_template.clone()
+        } else {
+            let Some(action) = action else {
+                anyhow::bail!(
+                    "action is required for '{}'; allowed: {}",
+                    self.name,
+                    self.actions.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+            };
+            let Some(tpl) = self.actions.get(action) else {
+                anyhow::bail!(
+                    "unknown action '{}' for '{}'; allowed: {}",
+                    action,
+                    self.name,
+                    self.actions.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+            };
+            let action_risk = external_action_risk(action);
+            if action_risk == "network-write" && !self.allow_network_write {
+                anyhow::bail!(
+                    "action '{}' for '{}' is network-write and requires explicit network-write opt-in",
+                    action,
+                    self.name
+                );
+            }
+            tpl.clone()
+        };
+
+        let args = build_external_args(&template, &input);
+        // Scope is enforced here as well as by the runner: a prompt-injected
+        // or unapproved call must not spawn a process against an out-of-scope
+        // target even if it somehow bypasses the outer approval gate. Every
+        // substituted value is checked, not just `{target}`.
+        for value in external_scope_values(&template, &input) {
+            if !scope_target_allowed(&value, &self.scope_in, &self.scope_out) {
+                anyhow::bail!("target '{value}' is not permitted by scope policy");
+            }
+        }
+        let cwd = resolve_cwd(&self.cwd).unwrap_or_else(|_| self.cwd.clone());
+        let mut command = Command::new(&self.command);
+        command
+            .args(&args)
+            .current_dir(cwd)
+            .env_clear()
+            .envs(safe_process_env())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().context("spawn external command")?;
+        // Bounded pipe drains replace wait_with_output(): only the first
+        // MAX_CHILD_STREAM_BYTES of each stream is kept, the rest is discarded
+        // so a grandchild cannot hold the pipes open past the kill deadline.
+        let (status, out_stdout, out_stderr) = collect_capped_output(&mut child, self.timeout)
+            .await
+            .context("external command timeout")?;
+        let stdout = redact(&String::from_utf8_lossy(&out_stdout));
+        let stderr = redact(&String::from_utf8_lossy(&out_stderr));
+        let lines: Vec<String> = stdout
+            .lines()
+            .take(MAX_EXTERNAL_LINES)
+            .map(truncate)
+            .collect();
+        let text = format!(
+            "exit={}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            status.code().unwrap_or(-1),
+            stdout,
+            stderr
+        );
+        Ok(ToolResult {
+            ok: status.success(),
+            output: truncate(&text),
+            structured: Some(json!({"lines": lines})),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Burp Sequencer equivalent. Pure computation: no network, no gate.
+// ---------------------------------------------------------------------------
+
+/// Longest common byte prefix of every sample, in bytes.
+fn longest_common_prefix(samples: &[&str]) -> usize {
+    let Some(first) = samples.first() else {
+        return 0;
+    };
+    samples.iter().skip(1).fold(first.len(), |common, sample| {
+        let bytes = first.as_bytes();
+        let other = sample.as_bytes();
+        let mut shared = 0;
+        while shared < common && shared < other.len() && bytes[shared] == other[shared] {
+            shared += 1;
+        }
+        shared
+    })
+}
+
+/// Analyze the randomness quality of a token sample (Burp Sequencer analogue).
+#[derive(Default)]
+pub struct SequencerTool;
+
+#[async_trait]
+impl Tool for SequencerTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "sequencer".into(),
+            description: "Analyze a sample of tokens for randomness quality (Burp Sequencer equivalent). Reports sample/distinct counts, per-position byte entropy, 0/1 bit balance, longest common prefix and an approximate chi-square statistic against a uniform byte distribution, plus a verdict. Pure local computation: no network and no gate.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "tokens":{"type":"array","items":{"type":"string"},"description":"Sampled token strings"},
+                    "min_samples":{"type":"integer","default":8}
+                },
+                "required":["tokens"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let tokens = input
+            .get("tokens")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("tokens required"))?;
+        let samples: Vec<&str> = tokens.iter().filter_map(Value::as_str).collect();
+        let min_samples = input
+            .get("min_samples")
+            .and_then(Value::as_u64)
+            .unwrap_or(8) as usize;
+        let sample_count = samples.len();
+        let distinct_count: usize = samples.iter().copied().collect::<BTreeSet<_>>().len();
+        let longest_common_prefix = longest_common_prefix(&samples);
+
+        // Shannon entropy (bits) at each byte position across the samples.
+        let max_len = samples.iter().map(|sample| sample.len()).max().unwrap_or(0);
+        let mut position_entropy: Vec<f64> = Vec::with_capacity(max_len);
+        for position in 0..max_len {
+            let mut counts: BTreeMap<u8, usize> = BTreeMap::new();
+            for sample in &samples {
+                if let Some(&byte) = sample.as_bytes().get(position) {
+                    *counts.entry(byte).or_default() += 1;
+                }
+            }
+            let total: usize = counts.values().sum();
+            let entropy = if total == 0 {
+                0.0
+            } else {
+                counts
+                    .values()
+                    .map(|&count| {
+                        let p = count as f64 / total as f64;
+                        -p * p.log2()
+                    })
+                    .sum::<f64>()
+            };
+            position_entropy.push((entropy * 1000.0).round() / 1000.0);
+        }
+
+        // 0/1 bit balance across every byte of every sample, in [-1.0, 1.0].
+        let (mut ones, mut zeros) = (0usize, 0usize);
+        for sample in &samples {
+            for byte in sample.bytes() {
+                for bit in 0..8 {
+                    if (byte >> bit) & 1 == 1 {
+                        ones += 1;
+                    } else {
+                        zeros += 1;
+                    }
+                }
+            }
+        }
+        let total_bits = ones + zeros;
+        let bit_balance = if total_bits == 0 {
+            0.0
+        } else {
+            ((ones as f64 - zeros as f64) / total_bits as f64 * 1000.0).round() / 1000.0
+        };
+
+        // Approximate chi-square against a uniform byte distribution.
+        let mut char_counts: BTreeMap<u8, usize> = BTreeMap::new();
+        for sample in &samples {
+            for byte in sample.bytes() {
+                *char_counts.entry(byte).or_default() += 1;
+            }
+        }
+        let char_total: usize = char_counts.values().sum();
+        let bins = char_counts.len();
+        let chi_square = if bins == 0 {
+            0.0
+        } else {
+            let expected = char_total as f64 / bins as f64;
+            char_counts
+                .values()
+                .map(|&count| {
+                    let delta = count as f64 - expected;
+                    delta * delta / expected
+                })
+                .sum::<f64>()
+        };
+
+        let average_entropy = if position_entropy.is_empty() {
+            0.0
+        } else {
+            position_entropy.iter().sum::<f64>() / position_entropy.len() as f64
+        };
+        let verdict = if sample_count < min_samples {
+            "insufficient_samples"
+        } else if distinct_count < 2
+            || longest_common_prefix >= 4
+            || bit_balance.abs() > 0.25
+            || (!position_entropy.is_empty() && average_entropy < 1.0)
+        {
+            "suspicious"
+        } else {
+            "plausible"
+        };
+
+        let out = json!({
+            "verdict": verdict,
+            "sample_count": sample_count,
+            "distinct_count": distinct_count,
+            "position_entropy": position_entropy,
+            "average_position_entropy": (average_entropy * 1000.0).round() / 1000.0,
+            "bit_balance": bit_balance,
+            "ones": ones,
+            "zeros": zeros,
+            "longest_common_prefix": longest_common_prefix,
+            "chi_square": (chi_square * 1000.0).round() / 1000.0
+        });
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&out.to_string()),
+            structured: Some(out),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Local Collaborator simulation. This is deliberately loopback-only: there is
+// no external DNS, no public listener and no egress, so a real external target
+// cannot reach it.
+// ---------------------------------------------------------------------------
+
+static OOB_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub struct CollaboratorTool {
+    options: ToolOptions,
+}
+
+impl CollaboratorTool {
+    pub fn new() -> Self {
+        Self::with_options(ToolOptions::default())
+    }
+
+    pub fn with_options(options: ToolOptions) -> Self {
+        Self { options }
+    }
+
+    /// Route operations to the external self-hosted oracle. Every failure is
+    /// reported as a structured `ok:false` result so callers fail closed.
+    async fn run_external(&self, operation: &str, input: &Value) -> Result<ToolResult> {
+        match operation {
+            "start" => match oob_external_start(&self.options).await {
+                Ok(started) => {
+                    let out = json!({
+                        "ok": true,
+                        "token": started.token,
+                        "payload": started.payload,
+                        "server_location": started.server_location,
+                        "domain_suffix": started.domain_suffix,
+                        "local_only": false,
+                        "external": true,
+                        "oob_proof": {
+                            "token": started.token,
+                            "server_location": started.server_location,
+                        },
+                    });
+                    Ok(ToolResult {
+                        ok: true,
+                        output: truncate(&out.to_string()),
+                        structured: Some(out),
+                    })
+                }
+                Err(err) => Ok(denial_result(
+                    "oob_start_failed",
+                    json!({"reason": redact(&err.to_string())}),
+                )),
+            },
+            "fetch" => {
+                // This is the OOB interaction token (a query parameter), never
+                // the admin bearer credential. The admin token is always the
+                // operator/engagement-minted `oob_admin_token`, so a model-
+                // supplied `token` cannot overwrite it on the admin API.
+                let token = input
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .or(self.options.oob_token.as_deref())
+                    .unwrap_or("")
+                    .to_string();
+                if token.is_empty() {
+                    return Ok(denial_result(
+                        "token_required",
+                        json!({"operation": "fetch"}),
+                    ));
+                }
+                match oob_external_fetch(&self.options, &token).await {
+                    Ok(interactions) => {
+                        let count = interactions.as_array().map(Vec::len).unwrap_or(0);
+                        let out = json!({
+                            "ok": true,
+                            "token": token,
+                            "interactions": interactions,
+                            "interaction_count": count,
+                            "server_location": self.options.oob_endpoint,
+                            "cleared": false,
+                            "local_only": false,
+                            "external": true,
+                        });
+                        Ok(ToolResult {
+                            ok: true,
+                            output: truncate(&out.to_string()),
+                            structured: Some(out),
+                        })
+                    }
+                    Err(err) => Ok(denial_result(
+                        "oob_fetch_failed",
+                        json!({"reason": redact(&err.to_string())}),
+                    )),
+                }
+            }
+            other => Err(anyhow!("unsupported collaborator operation: {other}")),
+        }
+    }
+}
+
+impl Default for CollaboratorTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Short-lived client for the oracle's loopback admin API. Proxying is disabled
+/// so an environment proxy cannot reroute admin traffic off the host.
+fn oob_admin_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .no_proxy()
+                .build()
+                .expect("oob admin client")
+        })
+}
+
+/// The OOB admin endpoint is operator-supplied but must still be pinned to a
+/// concrete loopback destination: `0.0.0.0` is a wildcard bind, not a host, and
+/// a non-loopback endpoint would let a remote server mint evidence tokens.
+fn validate_oob_endpoint(endpoint: &str) -> Result<()> {
+    let parsed = url::Url::parse(endpoint).context("invalid oob_endpoint")?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => anyhow::bail!("oob_endpoint must use http or https"),
+    }
+    if parsed.username() != "" || parsed.password().is_some() {
+        anyhow::bail!("oob_endpoint must not carry userinfo");
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("oob_endpoint has no host"))?
+        .trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host == "0.0.0.0" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_unspecified()) {
+        anyhow::bail!("oob_endpoint host must be loopback, got '{host}'");
+    }
+    if matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+        Ok(())
+    } else {
+        anyhow::bail!("oob_endpoint host must be loopback, got '{host}'")
+    }
+}
+
+/// Validate the token shape server-supplied to the OOB API. The model never
+/// mints tokens; anything outside this alphabet is rejected.
+fn is_valid_oob_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Extract the authoritative OOB token from a collaborator `start` result.
+/// Tokens from any other shape (e.g. a model-supplied `structured.oob_proof`)
+/// are ignored by the store via `tool_produces_oob_token`; this helper still
+/// validates the token shape before returning it.
+pub fn oob_token_from_structured(v: &Value) -> Option<String> {
+    let token = v.get("oob_proof")?.get("token")?.as_str()?.to_string();
+    if is_valid_oob_token(&token) {
+        Some(token)
+    } else {
+        None
+    }
+}
+
+/// A server-supplied domain suffix must be one plain hostname: no IP, no
+/// userinfo, no port, no path and no loopback/metadata name.
+fn validate_oob_domain_suffix(domain: &str) -> Result<()> {
+    let domain = domain.trim();
+    if domain.is_empty()
+        || domain.len() > 253
+        || domain.chars().any(|c| {
+            c.is_whitespace() || matches!(c, '/' | '\\' | '@' | ':' | '%' | '[' | ']' | '?' | '#')
+        })
+    {
+        anyhow::bail!("oob domain_suffix is not a single hostname");
+    }
+    let parsed = url::Url::parse(&format!("http://{domain}/"))
+        .map_err(|_| anyhow!("oob domain_suffix is not a single hostname"))?;
+    if parsed.host_str() != Some(domain)
+        || parsed.port().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        anyhow::bail!("oob domain_suffix is not a single hostname");
+    }
+    if domain.parse::<IpAddr>().is_ok()
+        || is_local_name(domain)
+        || domain == "0.0.0.0"
+        || domain.starts_with("169.254.")
+    {
+        anyhow::bail!("oob domain_suffix must not be an IP or loopback/metadata host");
+    }
+    Ok(())
+}
+
+/// Extract the OOB domain suffix from a `server_location` value, which may be a
+/// bare domain, a `host:port`, or a full URL (optionally including the token as
+/// its leftmost label).
+fn oob_domain_from_location(location: &str, token: &str) -> Option<String> {
+    let location = location.trim();
+    if location.is_empty() {
+        return None;
+    }
+    let host = if location.contains("://") {
+        url::Url::parse(location).ok()?.host_str()?.to_string()
+    } else {
+        location.split('/').next().unwrap_or(location).to_string()
+    };
+    let mut host = host
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if let Some((name, _port)) = host.split_once(':') {
+        host = name.to_string();
+    }
+    if !token.is_empty() {
+        if let Some(rest) = host.strip_prefix(&format!("{token}.")) {
+            host = rest.to_string();
+        }
+    }
+    if host.is_empty() {
+        return None;
+    }
+    Some(host)
+}
+
+/// Result of a successful external `start`: everything the model needs to use
+/// the payload, but nothing that is written to disk or logged.
+struct ExternalStart {
+    token: String,
+    payload: String,
+    domain_suffix: String,
+    server_location: String,
+}
+
+async fn oob_external_start(options: &ToolOptions) -> Result<ExternalStart> {
+    let endpoint = options
+        .oob_endpoint
+        .as_deref()
+        .context("oob_endpoint is not configured")?
+        .trim_end_matches('/');
+    validate_oob_endpoint(endpoint)?;
+    let mut request = oob_admin_client().post(format!("{endpoint}/token"));
+    if !options.oob_admin_token.is_empty() {
+        request = request.header(
+            "Authorization",
+            format!("Bearer {}", options.oob_admin_token),
+        );
+    }
+    let response = request.send().await.context("oob token request failed")?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "oob token request returned HTTP {}",
+            response.status().as_u16()
+        );
+    }
+    let payload_json: Value = response
+        .json()
+        .await
+        .context("oob token response is not JSON")?;
+
+    let server_token = payload_json
+        .get("token")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let token = options
+        .oob_token
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&server_token)
+        .to_string();
+    if !is_valid_oob_token(&token) {
+        anyhow::bail!("oob token contains disallowed characters");
+    }
+
+    let domain_suffix = payload_json
+        .get("domain_suffix")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            payload_json
+                .get("server_location")
+                .and_then(Value::as_str)
+                .and_then(|location| oob_domain_from_location(location, &token))
+        })
+        .context("oob token response contained no domain_suffix")?;
+    validate_oob_domain_suffix(&domain_suffix)?;
+
+    let server_location = payload_json
+        .get("server_location")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&domain_suffix)
+        .to_string();
+    Ok(ExternalStart {
+        payload: format!("http://{token}.{domain_suffix}/"),
+        token,
+        domain_suffix,
+        server_location,
+    })
+}
+
+async fn oob_external_fetch(options: &ToolOptions, token: &str) -> Result<Value> {
+    let endpoint = options
+        .oob_endpoint
+        .as_deref()
+        .context("oob_endpoint is not configured")?
+        .trim_end_matches('/');
+    validate_oob_endpoint(endpoint)?;
+    if !is_valid_oob_token(token) {
+        anyhow::bail!("oob token contains disallowed characters");
+    }
+    let mut request = oob_admin_client()
+        .get(format!("{endpoint}/interactions"))
+        .query(&[("token", token)]);
+    if !options.oob_admin_token.is_empty() {
+        request = request.header(
+            "Authorization",
+            format!("Bearer {}", options.oob_admin_token),
+        );
+    }
+    let response = request
+        .send()
+        .await
+        .context("oob interactions request failed")?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "oob interactions request returned HTTP {}",
+            response.status().as_u16()
+        );
+    }
+    let interactions: Value = response
+        .json()
+        .await
+        .context("oob interactions response is not JSON")?;
+    if !interactions.is_array() {
+        anyhow::bail!("oob interactions response was not an array");
+    }
+    Ok(interactions)
+}
+
+#[async_trait]
+impl Tool for CollaboratorTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "collaborator".into(),
+            description: "Out-of-band (OOB) interaction oracle (Burp Collaborator equivalent). With no configured endpoint it is a LOCAL-ONLY simulation: `start` binds a loopback TCP listener on 127.0.0.1:0 and returns an http://<token>.localhost:<port>/ payload; `fetch` polls interactions (KEPT, so polling is non-destructive) and caps at 32 hits. When an external self-hosted oracle endpoint is configured, `start` mints a token there and returns an http://<token>.<domain-suffix>/ payload, and `fetch` reads that token's recorded HTTP/DNS interactions. External errors fail closed. No auto-submit and no report transmission.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "operation":{"type":"string","enum":["start","fetch"]},
+                    "token":{"type":"string","description":"Token returned by a previous start call"}
+                },
+                "required":["operation"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let operation = input.get("operation").and_then(Value::as_str).unwrap_or("");
+        if self.options.oob_endpoint.is_some() {
+            return self.run_external(operation, &input).await;
+        }
+        match operation {
+            "start" => {
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let counter = OOB_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let mut seed = nanos.to_be_bytes().to_vec();
+                seed.extend_from_slice(&counter.to_be_bytes());
+                let token = hex_encode(&Sha256::digest(&seed)[..16]);
+
+                let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        let reason = redact(&err.to_string());
+                        return Ok(ToolResult {
+                            ok: false,
+                            output: truncate(&format!("collaborator bind failed: {reason}")),
+                            structured: Some(json!({
+                                "ok": false,
+                                "error": "bind_failed",
+                                "reason": reason
+                            })),
+                        });
+                    }
+                };
+                let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
+                let server_location = format!("127.0.0.1:{port}");
+                let payload = format!("http://{token}.localhost:{port}/");
+                {
+                    let mut map = self.options.oob_interactions.lock().unwrap();
+                    map.insert(token.clone(), Vec::new());
+                    map.insert(
+                        format!("__server__{token}"),
+                        vec![json!({
+                            "server_location": server_location,
+                            "payload": payload
+                        })],
+                    );
+                }
+                let interactions = self.options.oob_interactions.clone();
+                let recorded_token = token.clone();
+                tokio::spawn(async move {
+                    use base64::Engine;
+                    use tokio::io::AsyncReadExt;
+                    let engine = base64::engine::general_purpose::STANDARD;
+                    let mut count = 0usize;
+                    while count < MAX_OOB_INTERACTIONS {
+                        let Ok((mut socket, peer)) = listener.accept().await else {
+                            break;
+                        };
+                        let mut buffer = [0u8; 4096];
+                        let read = socket.read(&mut buffer).await.unwrap_or(0);
+                        let timestamp = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64;
+                        let interaction = json!({
+                            "type": "http",
+                            "client_ip": peer.ip().to_string(),
+                            "time_stamp": timestamp,
+                            "request_b64": engine.encode(&buffer[..read])
+                        });
+                        if let Ok(mut map) = interactions.lock() {
+                            if let Some(list) = map.get_mut(&recorded_token) {
+                                list.push(interaction);
+                            }
+                        }
+                        count += 1;
+                    }
+                });
+                let out = json!({
+                    "ok": true,
+                    "token": token,
+                    "payload": payload,
+                    "server_location": server_location,
+                    "local_only": true,
+                    "oob_proof": {
+                        "token": token,
+                        "server_location": server_location,
+                    },
+                });
+                Ok(ToolResult {
+                    ok: true,
+                    output: truncate(&out.to_string()),
+                    structured: Some(out),
+                })
+            }
+            "fetch" => {
+                let token = input.get("token").and_then(Value::as_str).unwrap_or("");
+                if token.is_empty() {
+                    return Ok(denial_result(
+                        "token_required",
+                        json!({"operation": "fetch"}),
+                    ));
+                }
+                let map = self.options.oob_interactions.lock().unwrap();
+                let interactions = map.get(token).cloned().unwrap_or_default();
+                let meta = map
+                    .get(&format!("__server__{token}"))
+                    .and_then(|entries| entries.first())
+                    .cloned();
+                drop(map);
+                let out = json!({
+                    "ok": true,
+                    "token": token,
+                    "interactions": interactions,
+                    "interaction_count": interactions.len(),
+                    "server_location": meta.as_ref()
+                        .and_then(|value| value.get("server_location"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    "cleared": false,
+                    "local_only": true
+                });
+                Ok(ToolResult {
+                    ok: true,
+                    output: truncate(&out.to_string()),
+                    structured: Some(out),
+                })
+            }
+            other => Err(anyhow!("unsupported collaborator operation: {other}")),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded active scan. All network work goes through HttpRequestTool, so scope,
+// allowed_methods, rate limiting, DNS pinning and the canary are inherited.
+// ---------------------------------------------------------------------------
+
+pub struct ActiveScanTool {
+    http: HttpRequestTool,
+}
+
+impl ActiveScanTool {
+    pub fn new() -> Self {
+        Self::with_options(ToolOptions::default())
+    }
+
+    pub fn with_options(options: ToolOptions) -> Self {
+        Self {
+            http: HttpRequestTool::with_options(options),
+        }
+    }
+}
+
+impl Default for ActiveScanTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for ActiveScanTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "active_scan".into(),
+            description: "Bounded active scan over parameter positions and payloads using the scoped HTTP client. Substitutes `§name§` markers in the URL and optional body template, records status and length_delta per payload via http_diff, and stops gracefully at max_requests. Every request inherits scope, allowed_methods, rate limiting, DNS pinning and the canary; no LLM call is made.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "url":{"type":"string","description":"Absolute http/https URL with optional §name§ markers; top-level url is used for policy extraction"},
+                    "positions":{"type":"array","items":{"type":"string"}},
+                    "payloads":{"type":"array","items":{"type":"string"}},
+                    "max_requests":{"type":"integer","default":20,"minimum":1,"maximum":200},
+                    "method":{"type":"string","enum":FUZZ_METHODS,"default":"GET"},
+                    "body_template":{"type":"string"}
+                },
+                "required":["url","positions","payloads"]
+            }),
+            risk: "network-write".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let raw_url = input
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("url required"))?;
+        let base = url::Url::parse(raw_url).context("invalid url")?;
+        let positions: Vec<&str> = input
+            .get("positions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("positions required"))?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let payloads = input
+            .get("payloads")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("payloads required"))?;
+        let method = input
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("GET")
+            .to_ascii_uppercase();
+        if !FUZZ_METHODS.contains(&method.as_str()) {
+            anyhow::bail!("method '{method}' is not allowed for active_scan (only GET/HEAD/POST)");
+        }
+        let max_requests = input
+            .get("max_requests")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, MAX_SCAN_REQUESTS as u64) as usize;
+        let body_template = input.get("body_template").and_then(Value::as_str);
+        let capped_payloads = payloads.len() > MAX_SCAN_PAYLOADS;
+
+        let mut requests = 0usize;
+        // One unmodified baseline gives `length_delta` a reference point. It is
+        // counted toward the hard cap so the cap is never exceeded.
+        let mut baseline_call = json!({"url": raw_url, "method": method});
+        for key in ["headers", "cookies", "use_cookie_jar"] {
+            if let Some(value) = input.get(key) {
+                baseline_call[key] = value.clone();
+            }
+        }
+        if let Some(template) = body_template {
+            baseline_call["body"] = json!(template);
+        }
+        let baseline = if requests < max_requests {
+            requests += 1;
+            self.http.run(baseline_call).await.ok()
+        } else {
+            None
+        };
+        let baseline_body = baseline
+            .as_ref()
+            .and_then(|result| result.structured.as_ref())
+            .and_then(|value| value.get("body"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        let diff = HttpDiffTool;
+        let mut results: Vec<Value> = Vec::new();
+        let mut stopped_at_cap = false;
+        'outer: for position in &positions {
+            let marker = format!("§{position}§");
+            for payload in payloads
+                .iter()
+                .filter_map(Value::as_str)
+                .take(MAX_SCAN_PAYLOADS)
+            {
+                if requests >= max_requests {
+                    stopped_at_cap = true;
+                    break 'outer;
+                }
+                requests += 1;
+                let candidate_url = if raw_url.contains(&marker) {
+                    raw_url.replace(&marker, payload)
+                } else {
+                    fuzz_candidate(&base, &marker, Some(position), payload)
+                        .map(|url| url.to_string())
+                        .unwrap_or_else(|| raw_url.to_string())
+                };
+                let mut call = json!({"url": candidate_url, "method": method});
+                if let Some(template) = body_template {
+                    call["body"] = json!(template.replace(&marker, payload));
+                }
+                for key in [
+                    "headers",
+                    "cookies",
+                    "use_cookie_jar",
+                    "follow_redirects",
+                    "max_redirects",
+                ] {
+                    if let Some(value) = input.get(key) {
+                        call[key] = value.clone();
+                    }
+                }
+                let mut entry = serde_json::Map::new();
+                entry.insert("payload".into(), Value::String(payload.to_string()));
+                entry.insert("position".into(), Value::String((*position).to_string()));
+                match self.http.run(call).await {
+                    Ok(response) => {
+                        let data = response.structured.unwrap_or_else(|| json!({}));
+                        let status = data.get("status").and_then(Value::as_u64).unwrap_or(0);
+                        let body = data.get("body").and_then(Value::as_str).unwrap_or("");
+                        let length_delta = match &baseline_body {
+                            Some(baseline) => diff
+                                .run(json!({"a": baseline, "b": body}))
+                                .await
+                                .ok()
+                                .and_then(|result| result.structured)
+                                .and_then(|value| value.get("length_delta").and_then(Value::as_i64))
+                                .unwrap_or(0),
+                            None => 0,
+                        };
+                        entry.insert("ok".into(), Value::Bool(response.ok));
+                        entry.insert("status".into(), json!(status));
+                        entry.insert("length_delta".into(), json!(length_delta));
+                        if let Some(capture) = data.get("capture") {
+                            entry.insert("capture".into(), capture.clone());
+                        }
+                        if let Some(error) = data.get("error") {
+                            entry.insert("error".into(), error.clone());
+                        }
+                    }
+                    Err(err) => {
+                        entry.insert("ok".into(), Value::Bool(false));
+                        entry.insert("status".into(), json!(0));
+                        entry.insert("length_delta".into(), json!(0));
+                        entry.insert("error".into(), Value::String(redact(&err.to_string())));
+                    }
+                }
+                results.push(Value::Object(entry));
+            }
+        }
+        let any_ok = results
+            .iter()
+            .any(|result| result.get("ok").and_then(Value::as_bool).unwrap_or(false));
+        let structured = json!({
+            "ok": any_ok,
+            "url": raw_url,
+            "method": method,
+            "positions": positions,
+            "payload_total": payloads.len(),
+            "max_requests": max_requests,
+            "requests": requests,
+            "stopped_at_cap": stopped_at_cap,
+            "capped_payloads": capped_payloads,
+            "results": results
+        });
+        Ok(ToolResult {
+            ok: any_ok,
+            output: truncate(&format!(
+                "active_scan: {requests} request(s), {}",
+                if stopped_at_cap {
+                    "stopped at cap"
+                } else {
+                    "complete"
+                }
+            )),
+            structured: Some(structured),
+        })
+    }
+}
+
+/// Non-panicking registry constructor for untrusted CLI input.
+pub fn try_default_registry(cwd: impl AsRef<Path>) -> Result<ToolRegistry> {
+    try_default_registry_with_options(cwd, ToolOptions::default())
+}
+
+/// Registry constructor with explicit tool policy. External recon adapters are
+/// only present when `enable_external_tools` is set, and `dnsx` then belongs to
+/// the adapter rather than the built-in DNS alias.
+/// How strictly tool arguments are checked against their advertised schema.
+/// Default `Off` keeps existing callers byte-identical; `Warn` only emits an
+/// audit event; `Enforce` blocks before any guard state or budget is consumed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaValidationMode {
+    #[default]
+    Off,
+    Warn,
+    Enforce,
+}
+
+/// Validate arguments against `ToolSpec.input_schema`. External `$ref`
+/// resolution is disabled by the dependency's default-feature choice.
+pub fn validate_tool_args(spec: &ToolSpec, args: &Value) -> Result<(), String> {
+    let validator = jsonschema::validator_for(&spec.input_schema)
+        .map_err(|error| format!("invalid tool schema: {error}"))?;
+    let errors: Vec<String> = validator
+        .iter_errors(args)
+        .map(|error| error.instance_path.to_string())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join(", "))
+    }
+}
+
+pub const SESSION_FINISH_TOOL: &str = "session_finish";
+
+/// Explicit terminal tool. The kernel intercepts it; `run` is never called on
+/// the production path, but returning a harmless result keeps the type usable
+/// in isolation.
+pub struct SessionFinishTool;
+
+#[async_trait]
+impl Tool for SessionFinishTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: SESSION_FINISH_TOOL.to_string(),
+            description: "End the current session with an explicit state and reason.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string"},
+                    "state": {"type": "string", "enum": ["completed", "failed"]}
+                },
+                "required": ["reason"]
+            }),
+            risk: "safe".to_string(),
+        }
+    }
+
+    async fn run(&self, _input: Value) -> Result<ToolResult> {
+        Ok(ToolResult {
+            ok: true,
+            output: "finish accepted".to_string(),
+            structured: None,
+        })
+    }
+}
+
+/// Burp Decoder equivalent. Fully local; no network and no gate.
+pub struct DecodeTool;
+
+fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn url_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+                {
+                    out.push(high * 16 + low);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn url_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else if byte == b' ' {
+            out.push('+');
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn hex_encode_str(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn hex_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        out.push(hex_value(pair[0])? * 16 + hex_value(pair[1])?);
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+#[async_trait]
+impl Tool for DecodeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "decode".into(),
+            description:
+                "Encode or decode URL, base64 and hex values locally (Burp Decoder equivalent)."
+                    .into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "operation":{"type":"string","enum":["url_decode","url_encode","base64_decode","base64_encode","hex_decode","hex_encode"]},
+                    "input":{"type":"string"}
+                },
+                "required":["operation","input"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let operation = input
+            .get("operation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let value = input.get("input").and_then(|v| v.as_str()).unwrap_or("");
+        use base64::Engine;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let result = match operation {
+            "url_decode" => url_decode(value),
+            "url_encode" => url_encode(value),
+            "base64_encode" => engine.encode(value.as_bytes()),
+            "base64_decode" => engine
+                .decode(value)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_else(|_| format!("invalid base64: {}", redact(value))),
+            "hex_encode" => hex_encode_str(value),
+            "hex_decode" => {
+                hex_decode(value).unwrap_or_else(|| format!("invalid hex: {}", redact(value)))
+            }
+            other => return Err(anyhow!("unsupported decode operation: {other}")),
+        };
+        Ok(ToolResult {
+            ok: true,
+            output: inline_view(&result),
+            structured: Some(json!({"operation": operation, "result": result})),
+        })
+    }
+}
+
+/// Burp Scanner/Intruder insertion-point equivalent (ZAP `VariantFactory`).
+/// Purely local: it only describes where parameters are, it never sends them.
+pub struct InsertionPointsTool;
+
+#[async_trait]
+impl Tool for InsertionPointsTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "enumerate_insertion_points".into(),
+            description: "Enumerate URL, form, cookie, header and path parameter positions with byte offsets in a reconstructed request (Burp Scanner/Intruder insertion points). Local only.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "url":{"type":"string","description":"Absolute http/https URL"},
+                    "method":{"type":"string","default":"GET"},
+                    "headers":{"type":"object","additionalProperties":{"type":"string"}},
+                    "cookies":{"type":"string","description":"Raw Cookie header value"},
+                    "body":{"type":"string"}
+                },
+                "required":["url"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let url = input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("url is required"))?;
+        let parsed = url::Url::parse(url).map_err(|e| anyhow!("invalid url: {e}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(anyhow!("url must be http or https"));
+        }
+        let method = input
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET")
+            .to_ascii_uppercase();
+        let host = parsed.host_str().unwrap_or_default();
+        let path = parsed.path();
+        let query = parsed.query().unwrap_or("");
+        let target = if query.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{query}")
+        };
+        let mut request = format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\n");
+        let mut points: Vec<Value> = Vec::new();
+
+        let path_start = method.len() + 1;
+        for segment in path.split('/').filter(|part| !part.is_empty()) {
+            if let Some(offset) = request[path_start..].find(segment) {
+                let start = path_start + offset;
+                points.push(json!({
+                    "type":"path","name":segment,"value":segment,
+                    "value_start":start,"value_end":start + segment.len()
+                }));
+            }
+        }
+
+        let headers: Vec<(String, String)> = input
+            .get("headers")
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (name.clone(), value.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (name, value) in &headers {
+            let value_start = request.len();
+            request.push_str(&format!("{name}: {value}\r\n"));
+            let start = value_start + name.len() + 2;
+            points.push(json!({
+                "type":"header","name":name,"value":value,
+                "value_start":start,"value_end":start + value.len()
+            }));
+        }
+
+        let cookie = input.get("cookies").and_then(|v| v.as_str()).unwrap_or("");
+        if !cookie.is_empty() {
+            let cookie_start = request.len();
+            request.push_str(&format!("Cookie: {cookie}\r\n"));
+            for pair in cookie.split(';') {
+                if let Some((name, value)) = pair.trim().split_once('=') {
+                    if let Some(offset) = cookie[..].find(pair.trim()) {
+                        let start = cookie_start + "Cookie: ".len() + offset;
+                        let value_start = start + name.len() + 1;
+                        points.push(json!({
+                            "type":"cookie","name":name,"value":value,
+                            "value_start":value_start,
+                            "value_end":value_start + value.len()
+                        }));
+                    }
+                }
+            }
+        }
+
+        let body = input.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        let content_type = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("");
+        let body_offset = request.len() + 2;
+        request.push_str("\r\n");
+        if !body.is_empty() {
+            request.push_str(body);
+            // ZAP only exposes form parameters for urlencoded bodies.
+            if content_type.starts_with("application/x-www-form-urlencoded") {
+                for (name, value) in url::form_urlencoded::parse(body.as_bytes()) {
+                    if let Some(offset) = body.find(&format!("{name}={value}")) {
+                        let value_start = body_offset + offset + name.len() + 1;
+                        points.push(json!({
+                            "type":"form","name":name,"value":value,
+                            "value_start":value_start,
+                            "value_end":value_start + value.len()
+                        }));
+                    }
+                }
+            }
+        }
+        for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            if let Some(offset) = query.find(&format!("{name}={value}")) {
+                let query_start = request.find(query).unwrap_or(0);
+                let value_start = query_start + offset + name.len() + 1;
+                points.push(json!({
+                    "type":"url","name":name,"value":value,
+                    "value_start":value_start,
+                    "value_end":value_start + value.len()
+                }));
+            }
+        }
+
+        Ok(ToolResult {
+            ok: true,
+            output: format!("{} insertion point(s)", points.len()),
+            structured: Some(json!({
+                "request": request,
+                "body_offset": body_offset,
+                "points": points
+            })),
+        })
+    }
+}
+
+/// Burp Comparer / ZAP `analyzeResponseVariations` equivalent. Local only.
+pub struct HttpDiffTool;
+
+#[async_trait]
+impl Tool for HttpDiffTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "http_diff".into(),
+            description: "Compare two captured responses and report variant/invariant lines (Burp Comparer equivalent). Local only.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "a":{"type":"string"},
+                    "b":{"type":"string"},
+                    "max_lines":{"type":"integer","default":40}
+                },
+                "required":["a","b"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let a = input.get("a").and_then(|v| v.as_str()).unwrap_or("");
+        let b = input.get("b").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = input
+            .get("max_lines")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(40)
+            .min(200) as usize;
+        let lines_a: Vec<&str> = a.lines().map(str::trim_end).collect();
+        let lines_b: Vec<&str> = b.lines().map(str::trim_end).collect();
+        let set_b: std::collections::BTreeSet<&str> = lines_b.iter().copied().collect();
+        let set_a: std::collections::BTreeSet<&str> = lines_a.iter().copied().collect();
+        let invariant: Vec<&str> = set_a.intersection(&set_b).copied().collect();
+        let added: Vec<&str> = set_b.difference(&set_a).copied().collect();
+        let removed: Vec<&str> = set_a.difference(&set_b).copied().collect();
+        let status_a = lines_a.first().and_then(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .and_then(|code| code.parse::<u16>().ok())
+        });
+        let status_b = lines_b.first().and_then(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .and_then(|code| code.parse::<u16>().ok())
+        });
+        Ok(ToolResult {
+            ok: true,
+            output: format!(
+                "diff: {} added, {} removed, {} invariant ({} vs {} bytes)",
+                added.len(),
+                removed.len(),
+                invariant.len(),
+                a.len(),
+                b.len()
+            ),
+            structured: Some(json!({
+                "status_a": status_a,
+                "status_b": status_b,
+                "length_delta": b.len() as i64 - a.len() as i64,
+                "variant_count": added.len() + removed.len(),
+                "invariant_count": invariant.len(),
+                "added": added.into_iter().take(limit).collect::<Vec<_>>(),
+                "removed": removed.into_iter().take(limit).collect::<Vec<_>>(),
+                "invariant": invariant.into_iter().take(limit).collect::<Vec<_>>()
+            })),
+        })
+    }
+}
+
+pub fn try_default_registry_with_options(
+    cwd: impl AsRef<Path>,
+    options: ToolOptions,
+) -> Result<ToolRegistry> {
+    let cwd = cwd.as_ref();
+    let mut reg = ToolRegistry::new();
+    reg.register_with_host_risk(Arc::new(SessionFinishTool), "safe");
+    reg.register(Arc::new(FsReadTool::new(cwd)?));
+    reg.register(Arc::new(FsWriteTool::new(cwd)?));
+    reg.register(Arc::new(ShellExecTool::new(cwd)?));
+    reg.register(Arc::new(HttpRequestTool::with_options(options.clone())));
+    reg.register(Arc::new(DnsLookupTool::new_with_options(options.clone())));
+    reg.register_with_host_risk(
+        Arc::new(SaveFindingTool {
+            require_falsification: options.require_falsification,
+        }),
+        "write",
+    );
+    reg.register(Arc::new(ValidateFindingTool));
+    reg.register(Arc::new(RecordAssetTool));
+    reg.register(Arc::new(SaveArtifactTool::new(cwd)?));
+    reg.register(Arc::new(EchoTool));
+    reg.register(Arc::new(ValidatePoCTool::with_options(options.clone())));
+    if options.enable_external_tools {
+        reg.register(Arc::new(PipelineTool::from_filtered_registry(
+            reg.clone(),
+            cwd,
+            &options,
+        )));
+    }
+    // Aliases for convenience / common tool names.
+    let fs_read = Arc::new(FsReadTool::new(cwd)?);
+    let fs_write = Arc::new(FsWriteTool::new(cwd)?);
+    let dns = Arc::new(DnsLookupTool::new_with_options(options.clone()));
+    reg.register_alias("read_file", fs_read.clone());
+    reg.register_alias("read", fs_read);
+    reg.register_alias("fs_write", fs_write.clone());
+    reg.register_alias("write_file", fs_write.clone());
+    reg.register_alias("write", fs_write);
+    reg.register_alias("dns", dns.clone());
+    reg.register_alias("dns_lookup", dns.clone());
+    reg.register_alias("dns_resolve", dns);
+    // Command adapters must exist before the ExternalBackedTools that hold a
+    // registry snapshot, otherwise a configured backend is invisible to them.
+    register_command_adapters(&mut reg, cwd, &options);
+    if options.enable_external_tools {
+        register_external_adapters(&mut reg, cwd, &options);
+    }
+
+    // New built-in tools. These are always present; network/intrusive ones
+    // that depend on an external binary return a gated result when absent.
+    reg.register(Arc::new(HttpFuzzTool {
+        http: HttpRequestTool::with_options(options.clone()),
+    }));
+    reg.register(Arc::new(HttpProbeTool {
+        http: HttpRequestTool::with_options(options.clone()),
+    }));
+    reg.register(Arc::new(PayloadForgeTool));
+    reg.register(Arc::new(JwtDecodeTool));
+    reg.register(Arc::new(HashUtilTool));
+    reg.register(Arc::new(KnowledgeLookupTool));
+    // Burp/ZAP-equivalent local analysis tools. No network, no gate.
+    reg.register(Arc::new(DecodeTool));
+    reg.register(Arc::new(InsertionPointsTool));
+    reg.register(Arc::new(HttpDiffTool));
+    reg.register(Arc::new(SequencerTool));
+    // LOCAL-ONLY Collaborator simulation: loopback listener, never an external
+    // OOB oracle. Risk is "safe" but no production egress is added.
+    reg.register(Arc::new(CollaboratorTool::with_options(options.clone())));
+    // Active scan wraps the scoped HTTP client; the host still decides whether
+    // a network-write tool is exposed.
+    reg.register(Arc::new(ActiveScanTool::with_options(options.clone())));
+    reg.register(Arc::new(ReportWriterTool));
+    reg.register(Arc::new(TaskPutTool));
+    reg.register(Arc::new(CluePutTool));
+
+    reg.register(Arc::new(ExternalBackedTool {
+        name: "subdomain_enum",
+        description:
+            "Enumerate subdomains via the registered subfinder adapter (gated when unavailable).",
+        risk: "network",
+        required: &["target", "domain"],
+        commands: &["subfinder"],
+        registry: reg.clone(),
+    }));
+    reg.register(Arc::new(ExternalBackedTool {
+        name: "port_scan",
+        description:
+            "Port scan via nmap/naabu; gated unless explicitly enabled in external_commands.",
+        risk: "intrusive",
+        required: &["host", "ports"],
+        commands: &["nmap", "naabu"],
+        registry: reg.clone(),
+    }));
+    reg.register(Arc::new(ExternalBackedTool {
+        name: "content_discovery",
+        description: "Discover content via ffuf/katana; gated when no adapter is available.",
+        risk: "network",
+        required: &["url", "wordlist"],
+        commands: &["ffuf", "katana"],
+        registry: reg.clone(),
+    }));
+    reg.register(Arc::new(ExternalBackedTool {
+        name: "vuln_scan",
+        description:
+            "Vulnerability scan via nuclei; gated unless explicitly enabled in external_commands.",
+        risk: "intrusive",
+        required: &["url", "target"],
+        commands: &["nuclei"],
+        registry: reg.clone(),
+    }));
+    reg.register(Arc::new(ExternalBackedTool {
+        name: "browser",
+        description: "Gated CLI adapter that forwards browser actions to a configured Playwright CLI (navigate/click/screenshot); NOT full browser automation. Requires an explicit external_commands entry and is gated when unavailable.",
+        risk: "network",
+        required: &["url", "action"],
+        commands: &["agent-browser", "chrome_mcp", "playwright", "chrome"],
+        registry: reg.clone(),
+    }));
+    Ok(reg)
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+/// Discover well-known recon binaries by scanning PATH (plus the common
+/// `/usr/local/bin`) with std only. Missing entries map to `None`.
+pub fn external_tool_availability() -> BTreeMap<String, Option<PathBuf>> {
+    const KEYS: &[&str] = &["subfinder", "dnsx", "katana", "ffuf", "nuclei", "nmap"];
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    dirs.push(PathBuf::from("/usr/local/bin"));
+
+    #[cfg(windows)]
+    let extensions: Vec<String> = {
+        let raw = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        raw.split(';')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    #[cfg(not(windows))]
+    let extensions: Vec<String> = vec![String::new()];
+
+    let mut out = BTreeMap::new();
+    for key in KEYS {
+        let mut found = None;
+        'search: for dir in &dirs {
+            for ext in &extensions {
+                let candidate = dir.join(format!("{key}{ext}"));
+                if is_executable_file(&candidate) {
+                    found = Some(candidate);
+                    break 'search;
+                }
+            }
+        }
+        out.insert((*key).to_string(), found);
+    }
+    out
+}
+
+/// Resolve a configured program to an absolute path with a which-like search
+/// implemented using std. Bare names are searched in `dirs` (normally PATH)
+/// rather than being left for the OS to resolve at spawn time: on Windows the
+/// OS searches the working directory first, which would let a stray binary in
+/// the workspace hijack an operator-configured tool. Unresolvable programs
+/// return `None` so registration can skip them instead of executing the wrong
+/// binary. A configured path (containing a separator) is canonicalized in
+/// place.
+fn resolve_program_in(program: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let path = Path::new(program);
+    if path
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty())
+    {
+        let canonical = std::fs::canonicalize(path).ok()?;
+        return is_executable_file(&canonical).then_some(canonical);
+    }
+
+    let mut extensions: Vec<String> = vec![String::new()];
+    #[cfg(windows)]
+    {
+        let raw = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        extensions.extend(
+            raw.split(';')
+                .filter(|ext| !ext.is_empty())
+                .map(|ext| ext.to_ascii_lowercase()),
+        );
+    }
+    for dir in dirs {
+        for ext in &extensions {
+            let candidate = dir.join(format!("{program}{ext}"));
+            if is_executable_file(&candidate) {
+                return std::fs::canonicalize(&candidate).ok();
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a configured program using the inherited PATH.
+fn resolve_program(program: &str) -> Option<PathBuf> {
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).collect())
+        .unwrap_or_default();
+    resolve_program_in(program, &dirs)
+}
+
+fn register_external_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &ToolOptions) {
+    let detected = if options.auto_detect_external {
+        Some(external_tool_availability())
+    } else {
+        None
+    };
+    let adapters = [
+        (
+            "subfinder",
+            "Discover subdomains for a target with subfinder.",
+            "subfinder",
+            vec![
+                "-d".to_string(),
+                "{target}".to_string(),
+                "-silent".to_string(),
+            ],
+            "network",
+        ),
+        (
+            "dnsx",
+            "Resolve hosts with dnsx.",
+            "dnsx",
+            vec![
+                "-d".to_string(),
+                "{host}".to_string(),
+                "-silent".to_string(),
+            ],
+            "network",
+        ),
+        (
+            "katana",
+            "Crawl URLs with katana.",
+            "katana",
+            vec!["-u".to_string(), "{url}".to_string(), "-silent".to_string()],
+            "network",
+        ),
+        (
+            "ffuf",
+            "Fuzz URLs with ffuf.",
+            "ffuf",
+            vec![
+                "-u".to_string(),
+                "{url}".to_string(),
+                "-w".to_string(),
+                "{word}".to_string(),
+                "-silent".to_string(),
+            ],
+            "network",
+        ),
+    ];
+    for (name, description, command, arg_template, risk) in adapters {
+        if reg.get(name).is_some() {
+            // An explicit command/action adapter is already registered; it
+            // carries the operator's argv templates and must not be replaced by
+            // the built-in default.
+            continue;
+        }
+        if let Some(map) = &detected {
+            if map.get(name).and_then(|v| v.as_ref()).is_none() {
+                continue;
+            }
+        }
+        // Always pin the program to a resolvable absolute path. Skipping this
+        // when `auto_detect_external=false` used to register a bare name that
+        // the OS resolved at spawn time (cwd-first on Windows), letting a stray
+        // binary in the workspace stand in for the operator-configured tool.
+        let Some(resolved) = resolve_program(command) else {
+            continue;
+        };
+        reg.register(Arc::new(
+            ExternalCommandTool::new(
+                name,
+                description,
+                resolved.to_string_lossy().into_owned(),
+                arg_template,
+                risk,
+                cwd,
+            )
+            .with_scope(options.scope_in.clone(), options.scope_out.clone()),
+        ));
+    }
+}
+
+fn external_action_risk(action: &str) -> &'static str {
+    match action.to_ascii_lowercase().as_str() {
+        // Read-only browser interactions.
+        "open" | "navigate" | "goto" | "snapshot" | "screenshot" | "content" | "dom" | "html"
+        | "text" | "title" | "url" | "wait" | "eval-read" => "network",
+        // State-changing browser interactions require explicit network-write opt-in.
+        "click" | "fill" | "type" | "press" | "select" | "check" | "uncheck" | "submit"
+        | "upload" | "eval" | "eval-js" | "run-js" | "script" => "network-write",
+        _ => "network-write",
+    }
+}
+
+fn default_agent_browser_actions() -> BTreeMap<String, Vec<String>> {
+    default_browser_actions()
+}
+
+/// The host-owned action table exposed for config validation and docs.
+pub fn default_browser_actions() -> BTreeMap<String, Vec<String>> {
+    let mut actions = BTreeMap::new();
+    // Read-only / navigation
+    actions.insert("open".into(), vec!["open".into(), "{url}".into()]);
+    actions.insert("snapshot".into(), vec!["snapshot".into()]);
+    actions.insert(
+        "screenshot".into(),
+        vec!["screenshot".into(), "{path}".into()],
+    );
+    actions.insert("wait".into(), vec!["wait".into(), "{selector}".into()]);
+    actions.insert("content".into(), vec!["content".into()]);
+    // State-changing / interactive
+    actions.insert("click".into(), vec!["click".into(), "{selector}".into()]);
+    actions.insert(
+        "fill".into(),
+        vec!["fill".into(), "{selector}".into(), "{value}".into()],
+    );
+    actions.insert(
+        "type".into(),
+        vec!["type".into(), "{selector}".into(), "{text}".into()],
+    );
+    actions.insert(
+        "press".into(),
+        vec!["press".into(), "{selector}".into(), "{key}".into()],
+    );
+    actions.insert("eval".into(), vec!["eval".into(), "{script}".into()]);
+    actions
+}
+
+fn external_adapter_action_map(
+    name: &str,
+    spec: Option<&ExternalAdapterSpec>,
+) -> BTreeMap<String, Vec<String>> {
+    if let Some(spec) = spec {
+        if !spec.actions.is_empty() {
+            return spec.actions.clone();
+        }
+    }
+    if name == "agent-browser" || name == "playwright" || name == "chrome" {
+        return default_agent_browser_actions();
+    }
+    BTreeMap::new()
+}
+
+fn external_adapter_risk(base_risk: &str, actions: &BTreeMap<String, Vec<String>>) -> String {
+    if actions.is_empty() {
+        return base_risk.to_string();
+    }
+    // Host classification follows the action map rather than a single label.
+    // A map that is entirely state-changing is `network-write`, so the
+    // engagement name-based deny and the approval gate both apply. A mixed map
+    // stays `network` so read-only browsing still works under a restrictive
+    // ROE; the per-action guard in `ExternalCommandTool::run` then rejects the
+    // write actions unless the operator opted in.
+    let write = actions
+        .keys()
+        .filter(|action| external_action_risk(action) == "network-write")
+        .count();
+    if write == 0 {
+        "network".to_string()
+    } else if write == actions.len() {
+        "network-write".to_string()
+    } else {
+        "network".to_string()
+    }
+}
+
+/// Command-driven adapters are gated solely by `external_commands`: providing
+/// a command is the explicit opt-in, independent of `enable_external_tools`.
+fn register_command_adapters(reg: &mut ToolRegistry, cwd: &Path, options: &ToolOptions) {
+    for name in [
+        "nmap",
+        "naabu",
+        "nuclei",
+        "playwright",
+        "chrome",
+        "chrome_mcp",
+        "ffuf",
+        "katana",
+        "agent-browser",
+    ] {
+        let spec = options.external_adapter_specs.get(name);
+        // A spec `command` is a single program path (spaces allowed, e.g.
+        // "C:\Program Files\...\agent-browser.exe"). A legacy `external_commands`
+        // entry is a full command line and is split as before.
+        let (program, args): (String, Vec<String>) = if let Some(spec) = spec {
+            match &spec.command {
+                Some(program) => (program.clone(), spec.base_args.clone()),
+                None => continue,
+            }
+        } else {
+            let Some(command) = options.external_commands.get(name) else {
+                continue;
+            };
+            let parts: Vec<String> = command.split_whitespace().map(String::from).collect();
+            let Some((program, args)) = parts.split_first() else {
+                continue;
+            };
+            (program.clone(), args.to_vec())
+        };
+        // Pin the program to an absolute path at registration time. Leaving a
+        // bare name in place would let the OS resolve it per spawn (cwd-first
+        // on Windows), undermining the explicit operator opt-in.
+        let Some(resolved) = resolve_program(&program) else {
+            continue;
+        };
+
+        let mut actions = external_adapter_action_map(name, spec);
+        // Global flags (`--user-data-dir`, `--proxy`, ...) are literal operator
+        // values and are prepended to every action argv. They are never model
+        // input, so they are not scope-checked as targets.
+        if !actions.is_empty() && !args.is_empty() {
+            for template in actions.values_mut() {
+                let mut combined = args.clone();
+                combined.extend(template.iter().cloned());
+                *template = combined;
+            }
+        }
+
+        let default_risk = match name {
+            "nuclei" => "network-write",
+            _ => "network",
+        };
+        let host_risk = external_adapter_risk(default_risk, &actions);
+        let description = if actions.is_empty() {
+            format!("Gated external tool: {name}.")
+        } else {
+            let mut read = Vec::new();
+            let mut write = Vec::new();
+            for a in actions.keys() {
+                if external_action_risk(a) == "network-write" {
+                    write.push(a.as_str());
+                } else {
+                    read.push(a.as_str());
+                }
+            }
+            format!(
+                "Gated external tool: {name}. Provide input.action. Read-only: [{}]. State-changing (network-write): [{}].",
+                read.join(", "),
+                write.join(", ")
+            )
+        };
+
+        let arg_template = if actions.is_empty() {
+            spec.and_then(|s| s.arg_template.clone())
+                .unwrap_or_else(|| args.to_vec())
+        } else {
+            // Action map drives argv; base args are not used.
+            Vec::new()
+        };
+
+        let mut tool = ExternalCommandTool::new(
+            name,
+            description,
+            resolved.to_string_lossy().to_string(),
+            arg_template,
+            host_risk.clone(),
+            cwd,
+        )
+        .with_scope(options.scope_in.clone(), options.scope_out.clone())
+        .with_actions(actions)
+        .with_allow_network_write(options.allow_network_write);
+        if let Some(ms) = spec.and_then(|s| s.timeout_ms) {
+            tool = tool.with_timeout(Duration::from_millis(ms.max(1)));
+        }
+        reg.register_with_host_risk(Arc::new(tool), host_risk);
+    }
+}
+
+/// Compatibility wrapper. Prefer [`try_default_registry`] for user-supplied paths.
+pub fn default_registry(cwd: impl AsRef<Path>) -> ToolRegistry {
+    default_registry_with_options(cwd, ToolOptions::default())
+}
+
+pub fn default_registry_with_options(cwd: impl AsRef<Path>, options: ToolOptions) -> ToolRegistry {
+    try_default_registry_with_options(cwd, options).expect("invalid workspace cwd")
+}
+
+// ---------------------------------------------------------------------------
+// Local encoding / hashing primitives.
+//
+// These are implemented in-tree so the crate does not need extra declared
+// dependencies. They back `jwt_decode`, `hash_util` and the evidence hashes in
+// `report_writer`.
+// ---------------------------------------------------------------------------
+
+const B64_STANDARD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_URLSAFE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+fn b64_encode(data: &[u8], url_safe: bool, pad: bool) -> String {
+    let table = if url_safe { B64_URLSAFE } else { B64_STANDARD };
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let (chunks, rem) = data.as_chunks::<3>();
+    for chunk in chunks {
+        let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
+        out.push(table[((n >> 18) & 63) as usize] as char);
+        out.push(table[((n >> 12) & 63) as usize] as char);
+        out.push(table[((n >> 6) & 63) as usize] as char);
+        out.push(table[(n & 63) as usize] as char);
+    }
+    if rem.len() == 1 {
+        let n = (rem[0] as u32) << 16;
+        out.push(table[((n >> 18) & 63) as usize] as char);
+        out.push(table[((n >> 12) & 63) as usize] as char);
+        if pad {
+            out.push_str("==");
+        }
+    } else if rem.len() == 2 {
+        let n = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
+        out.push(table[((n >> 18) & 63) as usize] as char);
+        out.push(table[((n >> 12) & 63) as usize] as char);
+        out.push(table[((n >> 6) & 63) as usize] as char);
+        if pad {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Accepts both standard and URL-safe alphabets, with or without padding.
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut vals: Vec<u8> = Vec::with_capacity(s.len());
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            b'\n' | b'\r' | b' ' | b'\t' => continue,
+            _ => return None,
+        };
+        vals.push(v);
+    }
+    if vals.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(vals.len() * 3 / 4);
+    let (full, rem) = vals.as_chunks::<4>();
+    for c in full {
+        let n =
+            ((c[0] as u32) << 18) | ((c[1] as u32) << 12) | ((c[2] as u32) << 6) | (c[3] as u32);
+        out.push((n >> 16) as u8);
+        out.push((n >> 8) as u8);
+        out.push(n as u8);
+    }
+    if rem.len() == 2 {
+        let n = ((rem[0] as u32) << 18) | ((rem[1] as u32) << 12);
+        out.push((n >> 16) as u8);
+    } else if rem.len() == 3 {
+        let n = ((rem[0] as u32) << 18) | ((rem[1] as u32) << 12) | ((rem[2] as u32) << 6);
+        out.push((n >> 16) as u8);
+        out.push((n >> 8) as u8);
+    }
+    Some(out)
+}
+
+fn hex_encode(data: &[u8]) -> String {
+    const H: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(data.len() * 2);
+    for &b in data {
+        out.push(H[(b >> 4) as usize] as char);
+        out.push(H[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn md5_hex(data: &[u8]) -> String {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const K: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+        0xeb86d391,
+    ];
+    let mut msg = data.to_vec();
+    let bit_len = (msg.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_le_bytes());
+
+    let (mut h0, mut h1, mut h2, mut h3) =
+        (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
+    for chunk in msg.as_chunks::<64>().0 {
+        let mut m = [0u32; 16];
+        for (i, word) in m.iter_mut().enumerate() {
+            let j = i * 4;
+            *word = u32::from_le_bytes([chunk[j], chunk[j + 1], chunk[j + 2], chunk[j + 3]]);
+        }
+        let (mut a, mut b, mut c, mut d) = (h0, h1, h2, h3);
+        for (i, (&k, &s)) in K.iter().zip(S.iter()).enumerate() {
+            let (f, g) = match i {
+                0..=15 => ((b & c) | (!b & d), i),
+                16..=31 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            let mixed = a
+                .wrapping_add(f)
+                .wrapping_add(k)
+                .wrapping_add(m[g])
+                .rotate_left(s);
+            let tmp = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(mixed);
+            a = tmp;
+        }
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+    }
+    let mut out = String::with_capacity(32);
+    // MD5 serialises each word in little-endian byte order.
+    for w in [h0, h1, h2, h3] {
+        out.push_str(&format!("{:08x}", w.swap_bytes()));
+    }
+    out
+}
+
+fn sha1_hex(data: &[u8]) -> String {
+    let mut msg = data.to_vec();
+    let bit_len = (msg.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    let mut h = [
+        0x67452301u32,
+        0xefcdab89,
+        0x98badcfe,
+        0x10325476,
+        0xc3d2e1f0,
+    ];
+    for chunk in msg.as_chunks::<64>().0 {
+        let mut w = [0u32; 80];
+        for (i, word) in w.iter_mut().enumerate().take(16) {
+            let j = i * 4;
+            *word = u32::from_be_bytes([chunk[j], chunk[j + 1], chunk[j + 2], chunk[j + 3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5a827999),
+                20..=39 => (b ^ c ^ d, 0x6ed9eba1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
+                _ => (b ^ c ^ d, 0xca62c1d6),
+            };
+            let t = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    let mut out = String::with_capacity(40);
+    for word in h {
+        out.push_str(&format!("{word:08x}"));
+    }
+    out
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut msg = data.to_vec();
+    let bit_len = (msg.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    let mut h = [
+        0x6a09e667u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    for chunk in msg.as_chunks::<64>().0 {
+        let mut w = [0u32; 64];
+        for (i, word) in w.iter_mut().enumerate().take(16) {
+            let j = i * 4;
+            *word = u32::from_be_bytes([chunk[j], chunk[j + 1], chunk[j + 2], chunk[j + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d) = (h[0], h[1], h[2], h[3]);
+        let (mut e, mut f, mut g, mut hh) = (h[4], h[5], h[6], h[7]);
+        for (i, &k) in K.iter().enumerate() {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(k)
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    let mut out = String::with_capacity(64);
+    for word in h {
+        out.push_str(&format!("{word:08x}"));
+    }
+    out
+}
+
+fn as_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+            .join(","),
+        _ => String::new(),
+    }
+}
+
+fn str_field<'a>(value: &'a Value, keys: &[&str], default: &'a str) -> &'a str {
+    for key in keys {
+        if let Some(s) = value.get(*key).and_then(Value::as_str) {
+            return s;
+        }
+    }
+    default
+}
+
+fn gated_result(name: &str, reason: &str, fields: Value) -> ToolResult {
+    let mut map = serde_json::Map::new();
+    map.insert("ok".into(), Value::Bool(false));
+    map.insert("gated".into(), Value::Bool(true));
+    map.insert("tool".into(), Value::String(name.to_string()));
+    map.insert("message".into(), Value::String(reason.to_string()));
+    if let Value::Object(extra) = fields {
+        for (key, value) in extra {
+            map.insert(key, value);
+        }
+    }
+    let structured = Value::Object(map);
+    ToolResult {
+        ok: false,
+        output: truncate(reason),
+        structured: Some(structured),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Safe, local-only tools.
+// ---------------------------------------------------------------------------
+
+/// Generate locally-computed payload strings for a vulnerability class.
+pub struct PayloadForgeTool;
+
+fn forge_payloads(kind: &str, context: &str, marker: &str) -> Vec<String> {
+    let mut payloads: Vec<String> = match kind {
+        "xss" => vec![
+            format!("<script>{marker}</script>"),
+            format!("<img src=x onerror=\"{marker}\">"),
+            format!("\"><svg onload={marker}>"),
+            format!("javascript:{marker}"),
+        ],
+        "sqli" => vec![
+            "' OR '1'='1".to_string(),
+            format!("' UNION SELECT NULL,{marker}--"),
+            "1' AND '1'='1".to_string(),
+            format!("' OR 1=1 -- {marker}"),
+        ],
+        "ssrf" => vec![
+            format!("http://{marker}/"),
+            "http://169.254.169.254/latest/meta-data/".to_string(),
+            "file:///etc/passwd".to_string(),
+            "gopher://127.0.0.1:6379/_INFO".to_string(),
+        ],
+        "ssti" => vec![
+            "{{7*7}}".to_string(),
+            "${7*7}".to_string(),
+            format!("<%= {marker} %>"),
+            format!("{{{{{marker}}}}}"),
+        ],
+        "cmdi" => vec![
+            format!("; {marker}"),
+            format!("| {marker}"),
+            format!("$({marker})"),
+            format!("`{marker}`"),
+        ],
+        _ => vec![marker.to_string()],
+    };
+    match context {
+        "html" => payloads.insert(0, format!("&lt;script&gt;{marker}&lt;/script&gt;")),
+        "attr" => {
+            for payload in &mut payloads {
+                *payload = format!("\" onmouseover=\"{payload}");
+            }
+        }
+        "js" => {
+            for payload in &mut payloads {
+                *payload = format!("'; {payload}; //");
+            }
+        }
+        "url" => {
+            for payload in &mut payloads {
+                *payload = b64_encode(payload.as_bytes(), true, false);
+            }
+        }
+        _ => {}
+    }
+    payloads
+}
+
+#[async_trait]
+impl Tool for PayloadForgeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "payload_forge".into(),
+            description: "Generate XSS/SQLi/SSRF/SSTI/CMDI payload strings locally without any network access.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["xss","sqli","ssrf","ssti","cmdi"]},
+                    "context": {"type": "string", "enum": ["html","attr","js","url","plain"]},
+                    "marker": {"type": "string"}
+                },
+                "required": ["kind"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let kind = input
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("kind required"))?;
+        let context = input
+            .get("context")
+            .and_then(Value::as_str)
+            .unwrap_or("plain");
+        let marker = input
+            .get("marker")
+            .and_then(Value::as_str)
+            .unwrap_or("BUGFOUND");
+        let payloads = forge_payloads(kind, context, marker);
+        let structured = json!({
+            "ok": true,
+            "kind": kind,
+            "context": context,
+            "marker": marker,
+            "payloads": payloads,
+            "count": payloads.len()
+        });
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&format!("generated {} {kind} payload(s)", payloads.len())),
+            structured: Some(structured),
+        })
+    }
+}
+
+/// Decode a JWT's header and payload without verifying the signature.
+pub struct JwtDecodeTool;
+
+#[async_trait]
+impl Tool for JwtDecodeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "jwt_decode".into(),
+            description: "Decode a JWT's header and payload segments with base64url. Signature is never verified.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"token": {"type": "string"}},
+                "required": ["token"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let token = input
+            .get("token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("token required"))?;
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() < 2 {
+            return Ok(ToolResult {
+                ok: false,
+                output: "jwt must contain at least two dot-separated segments".into(),
+                structured: Some(json!({"ok": false, "error": "too few segments"})),
+            });
+        }
+        let header_bytes = b64_decode(parts[0]);
+        let payload_bytes = b64_decode(parts[1]);
+        let header_json = header_bytes
+            .as_deref()
+            .and_then(|b| serde_json::from_slice::<Value>(b).ok());
+        let payload_json = payload_bytes
+            .as_deref()
+            .and_then(|b| serde_json::from_slice::<Value>(b).ok());
+        let signature_bytes = parts.get(2).and_then(|s| b64_decode(s));
+        let decoded_header = header_bytes
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        let decoded_payload = payload_bytes
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        let ok = header_json.is_some() && payload_json.is_some();
+        let structured = json!({
+            "ok": ok,
+            "verified": false,
+            "part_count": parts.len(),
+            "segments": {
+                "header": {"raw": parts[0], "decoded": decoded_header, "json": header_json},
+                "payload": {"raw": parts[1], "decoded": decoded_payload, "json": payload_json},
+                "signature": {
+                    "raw": parts.get(2).cloned().unwrap_or(""),
+                    "bytes": signature_bytes.as_ref().map(Vec::len).unwrap_or(0)
+                }
+            },
+            "header": header_json,
+            "payload": payload_json
+        });
+        Ok(ToolResult {
+            ok,
+            output: truncate(&format!(
+                "jwt decoded (unverified): header={}, payload={}",
+                ok, ok
+            )),
+            structured: Some(structured),
+        })
+    }
+}
+
+/// Hash / encode / decode a value locally.
+pub struct HashUtilTool;
+
+#[async_trait]
+impl Tool for HashUtilTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "hash_util".into(),
+            description:
+                "Local hashing/encoding utility: md5, sha1, sha256, b64encode, b64decode, hex."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string"},
+                    "op": {"type": "string", "enum": ["md5","sha1","sha256","b64encode","b64decode","hex"]}
+                },
+                "required": ["value", "op"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let value = input
+            .get("value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("value required"))?;
+        let op = input
+            .get("op")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("op required"))?;
+        let result = match op {
+            "md5" => md5_hex(value.as_bytes()),
+            "sha1" => sha1_hex(value.as_bytes()),
+            "sha256" => sha256_hex(value.as_bytes()),
+            "b64encode" => b64_encode(value.as_bytes(), false, true),
+            "b64decode" => b64_decode(value)
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default(),
+            "hex" => hex_encode(value.as_bytes()),
+            _ => {
+                return Ok(ToolResult {
+                    ok: false,
+                    output: format!("unsupported op '{op}'"),
+                    structured: Some(json!({
+                        "ok": false,
+                        "op": op,
+                        "error": "unsupported op",
+                        "supported": ["md5","sha1","sha256","b64encode","b64decode","hex"]
+                    })),
+                });
+            }
+        };
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&result),
+            structured: Some(json!({"ok": true, "op": op, "value": value, "result": result})),
+        })
+    }
+}
+
+const KNOWLEDGE_BASE: &[(&str, &str, &[&str], &[&str])] = &[
+    (
+        "WSTG-INFO-01",
+        "Information Gathering",
+        &["recon", "enumerate", "fingerprint", "discovery", "osint"],
+        &["CWE-200"],
+    ),
+    (
+        "WSTG-CONF-01",
+        "Configuration and Deployment Management",
+        &["config", "header", "misconfig", "default", "cms"],
+        &["CWE-16", "CWE-693"],
+    ),
+    (
+        "WSTG-IDNT-01",
+        "Identity Management Testing",
+        &["identity", "username", "user enumeration", "account"],
+        &["CWE-204", "CWE-799"],
+    ),
+    (
+        "WSTG-ATHN-01",
+        "Authentication Testing",
+        &["login", "password", "auth", "brute", "mfa", "jwt"],
+        &["CWE-287", "CWE-307"],
+    ),
+    (
+        "WSTG-ATHZ-01",
+        "Authorization Testing",
+        &["idor", "access control", "privilege", "bypass", "rbac"],
+        &["CWE-284", "CWE-639"],
+    ),
+    (
+        "WSTG-SESS-01",
+        "Session Management Testing",
+        &["session", "cookie", "csrf", "token", "logout"],
+        &["CWE-384", "CWE-352"],
+    ),
+    (
+        "WSTG-INPV-01",
+        "Input Validation Testing",
+        &[
+            "xss",
+            "sqli",
+            " injection",
+            "fuzz",
+            "validation",
+            "ssrf",
+            "ssti",
+            "cmdi",
+        ],
+        &["CWE-79", "CWE-89", "CWE-918", "CWE-94", "CWE-78", "CWE-20"],
+    ),
+    (
+        "WSTG-ERRH-01",
+        "Error Handling",
+        &["error", "stack trace", "verbose", "exception"],
+        &["CWE-209"],
+    ),
+    (
+        "WSTG-CRYP-01",
+        "Cryptography Testing",
+        &["tls", "ssl", "cipher", "crypto", "certificate", "hash"],
+        &["CWE-327", "CWE-295"],
+    ),
+    (
+        "WSTG-BUSL-01",
+        "Business Logic Testing",
+        &["logic", "workflow", "race", "price", "transaction"],
+        &["CWE-840"],
+    ),
+    (
+        "WSTG-CLNT-01",
+        "Client-side Testing",
+        &["dom", "javascript", "cors", "clickjack", "browser"],
+        &["CWE-79", "CWE-346", "CWE-1021"],
+    ),
+    (
+        "WSTG-APIT-01",
+        "API Testing",
+        &["api", "graphql", "rest", "endpoint", "swagger"],
+        &["CWE-200", "CWE-284"],
+    ),
+];
+
+/// Look up bundled OWASP WSTG categories and CWE hints by keyword.
+pub struct KnowledgeLookupTool;
+
+#[async_trait]
+impl Tool for KnowledgeLookupTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "knowledge_lookup".into(),
+            description: "Search the bundled OWASP WSTG category and CWE hint list by keyword (no external service).".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let query = input
+            .get("query")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("query required"))?;
+        let needle = query.trim().to_ascii_lowercase();
+        let mut matches: Vec<Value> = Vec::new();
+        for (id, category, keywords, cwes) in KNOWLEDGE_BASE {
+            let haystack = format!("{id} {category} {}", keywords.join(" ")).to_ascii_lowercase();
+            let score = needle
+                .split_whitespace()
+                .filter(|word| !word.is_empty() && haystack.contains(word))
+                .count();
+            if score > 0 {
+                matches.push(json!({
+                    "id": id,
+                    "category": category,
+                    "cwe": cwes,
+                    "keywords": keywords,
+                    "score": score
+                }));
+            }
+        }
+        matches.sort_by(|a, b| {
+            b["score"]
+                .as_u64()
+                .unwrap_or(0)
+                .cmp(&a["score"].as_u64().unwrap_or(0))
+        });
+        let count = matches.len();
+        let structured = json!({"ok": true, "query": query, "matches": matches, "count": count});
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&format!("{count} knowledge entry(ies) matched '{query}'")),
+            structured: Some(structured),
+        })
+    }
+}
+
+/// Platform hint derived only from an operator-supplied program URL.
+/// No network request and no model input; Generic when unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Platform {
+    HackerOne,
+    Bugcrowd,
+    #[default]
+    Generic,
+}
+
+impl Platform {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HackerOne => "HackerOne",
+            Self::Bugcrowd => "Bugcrowd",
+            Self::Generic => "Generic",
+        }
+    }
+}
+
+pub fn platform_from_program_url(raw: &str) -> Platform {
+    let host = url::Url::parse(raw)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default();
+    if host == "hackerone.com" || host.ends_with(".hackerone.com") {
+        Platform::HackerOne
+    } else if host == "bugcrowd.com" || host.ends_with(".bugcrowd.com") {
+        Platform::Bugcrowd
+    } else {
+        Platform::Generic
+    }
+}
+
+/// One verified finding as consumed by the canonical report renderer.
+#[derive(Debug, Clone, Default)]
+pub struct ReportFinding {
+    pub id: String,
+    pub title: String,
+    pub severity: String,
+    pub cvss: Option<f32>,
+    pub vector: Option<String>,
+    pub cwe: Option<String>,
+    pub cwe_rationale: Option<String>,
+    pub cvss_note: Option<String>,
+    pub asset: Option<String>,
+    pub description: String,
+    pub reproduction: Option<String>,
+    pub impact: Option<String>,
+    pub remediation: Option<String>,
+    pub evidence_hash: Option<String>,
+    /// Authoritative SHA-256 over tool bytes (`evidence.sha256`). Preferred by
+    /// the renderer over any model-supplied `evidence_hash`.
+    pub authoritative_evidence_hash: Option<String>,
+    pub verified: bool,
+    pub platform: Platform,
+    pub evidence_request_redacted: Option<String>,
+    pub evidence_response_redacted: Option<String>,
+    pub evidence_canary_redacted: Option<String>,
+    pub evidence_artifact_path: Option<String>,
+    pub evidence_capture_source: Option<String>,
+    pub evidence_captured_at: Option<String>,
+    pub evidence_target_binding: Option<String>,
+    pub evidence_paired_control_hash: Option<String>,
+}
+
+/// Everything the canonical renderer needs. Coverage and timeline tuples are
+/// `(target, method, path)` and `(timestamp, kind, detail)` respectively.
+#[derive(Debug, Clone, Default)]
+pub struct ReportInput {
+    pub program: String,
+    pub engagement: String,
+    pub scope_in: Vec<String>,
+    pub scope_out: Vec<String>,
+    pub rules: Vec<String>,
+    pub findings: Vec<ReportFinding>,
+    pub coverage: Vec<(String, String, String, String, String)>,
+    pub timeline: Vec<(String, String, String)>,
+    pub report_id: String,
+    pub platform: Platform,
+}
+
+/// Collapse captured bytes into one report line so a body cannot create a
+/// heading or a fake finding block. Backticks are escaped everywhere because
+/// every model-supplied field is interpolated inside a code span in at least
+/// one report path; leaving one raw would let a title close the span.
+fn inline_view(text: &str) -> String {
+    text.replace('\r', "")
+        .replace('\n', "\\n")
+        .replace('`', "&#96;")
+}
+
+/// Write raw evidence bytes under the workspace. The path is deterministic and
+/// confined by the existing `resolve_in_cwd` guard.
+pub fn write_evidence_artifact(
+    cwd: &std::path::Path,
+    finding_id: &str,
+    request: &[u8],
+    response: &[u8],
+    canary: &[u8],
+    digest_hex: &str,
+) -> Result<String> {
+    let safe_id: String = finding_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let short: String = digest_hex.chars().take(12).collect();
+    let rel = format!("evidence/{safe_id}-{short}.bin");
+    // Tool-owned writer: bypass the agent-facing evidence path guard while
+    // keeping the same traversal/canonicalisation confinement.
+    let full = resolve_in_cwd_inner(cwd, &rel, false, true, true)?;
+    let mut bytes = Vec::with_capacity(request.len() + response.len() + canary.len());
+    bytes.extend_from_slice(request);
+    bytes.extend_from_slice(response);
+    bytes.extend_from_slice(canary);
+    std::fs::create_dir_all(full.parent().unwrap_or(cwd))?;
+    std::fs::write(&full, &bytes)?;
+    Ok(rel)
+}
+
+/// The single canonical Markdown report renderer. Every report-producing path
+/// must delegate here so section names, ordering and evidence hashes agree.
+pub fn render_canonical_report(input: &ReportInput) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# {} Ã¢â‚¬â€ Security Assessment Report\n\n",
+        inline_view(&input.engagement)
+    ));
+
+    let verified_count = input.findings.iter().filter(|f| f.verified).count();
+    out.push_str("## Executive Summary\n\n");
+    out.push_str(&format!(
+        "Program: {}\n\nThis report documents {} finding(s), {} verified, from engagement `{}` (report `{}`). Findings include reproduction steps, proof of concept, impact, remediation and SHA-256 evidence hashes.\n\n",
+        inline_view(&input.program),
+        input.findings.len(),
+        verified_count,
+        inline_view(&input.engagement),
+        inline_view(&input.report_id)
+    ));
+
+    out.push_str("## Scope & ROE\n\n");
+    out.push_str("**In scope**\n\n");
+    for entry in &input.scope_in {
+        out.push_str(&format!("- `{}`\n", inline_view(entry)));
+    }
+    if input.scope_in.is_empty() {
+        out.push_str("- (none)\n");
+    }
+    out.push_str("\n**Out of scope**\n\n");
+    for entry in &input.scope_out {
+        out.push_str(&format!("- `{}`\n", inline_view(entry)));
+    }
+    if input.scope_out.is_empty() {
+        out.push_str("- (none)\n");
+    }
+    out.push_str("\n**Rules of engagement**\n\n");
+    for rule in &input.rules {
+        out.push_str(&format!("- {}\n", inline_view(rule)));
+    }
+    if input.rules.is_empty() {
+        out.push_str("- (none)\n");
+    }
+    out.push('\n');
+
+    out.push_str("## Methodology\n\n");
+    out.push_str(
+        "Testing combined passive reconnaissance, scoped HTTP probing, bounded parameter fuzzing and manual validation against OWASP WSTG and CWE guidance. Raw request/response bytes are pinned with SHA-256 so evidence can be replayed and verified independently.\n\n",
+    );
+
+    out.push_str("## Findings\n\n");
+    if input.findings.is_empty() {
+        out.push_str("_No findings were recorded._\n\n");
+    }
+    for (index, finding) in input.findings.iter().enumerate() {
+        let hash = finding
+            .authoritative_evidence_hash
+            .as_deref()
+            .or(finding.evidence_hash.as_deref())
+            .unwrap_or("unavailable");
+        // Model-supplied fields are rendered as single lines: a body containing
+        // a newline must not be able to emit a `### F-...` heading that score.py
+        // would count as a separate finding. Evidence fields stay byte-exact.
+        out.push_str(&format!(
+            "### F-{:03}: {}\n\n",
+            index + 1,
+            inline_view(&finding.title)
+        ));
+        out.push_str(&format!("- **ID:** {}\n", inline_view(&finding.id)));
+        out.push_str(&format!(
+            "- **Severity:** {}\n",
+            inline_view(&finding.severity)
+        ));
+        out.push_str(&format!(
+            "- **CVSS:** {}\n",
+            finding
+                .cvss
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "N/A".to_string())
+        ));
+        out.push_str(&format!(
+            "- **Vector:** {}\n",
+            inline_view(finding.vector.as_deref().unwrap_or("N/A"))
+        ));
+        out.push_str(&format!(
+            "- **CWE:** {}\n",
+            inline_view(finding.cwe.as_deref().unwrap_or("N/A"))
+        ));
+        if let Some(rationale) = finding.cwe_rationale.as_deref() {
+            out.push_str(&format!(
+                "- **CWE rationale:** {}\n",
+                inline_view(rationale)
+            ));
+        }
+        if let Some(note) = finding.cvss_note.as_deref() {
+            out.push_str(&format!("- **CVSS note:** {}\n", inline_view(note)));
+        }
+        out.push_str(&format!(
+            "- **Asset:** {}\n",
+            inline_view(finding.asset.as_deref().unwrap_or("N/A"))
+        ));
+        out.push_str(&format!("- **Verified:** {}\n", finding.verified));
+
+        for (label, value) in [
+            (
+                "Evidence artifact",
+                finding.evidence_artifact_path.as_deref(),
+            ),
+            ("Capture source", finding.evidence_capture_source.as_deref()),
+            ("Captured at", finding.evidence_captured_at.as_deref()),
+            ("Bound endpoint", finding.evidence_target_binding.as_deref()),
+            ("Canary", finding.evidence_canary_redacted.as_deref()),
+            (
+                "Paired-control SHA-256",
+                finding.evidence_paired_control_hash.as_deref(),
+            ),
+        ] {
+            if let Some(v) = value {
+                out.push_str(&format!("- **{label}:** `{}`\n", inline_view(v)));
+            }
+        }
+        if let Some(v) = finding.evidence_request_redacted.as_deref() {
+            out.push_str(&format!("- Request (redacted): `{}`\n", inline_view(v)));
+        }
+        if let Some(v) = finding.evidence_response_redacted.as_deref() {
+            out.push_str(&format!("- Response (redacted): `{}`\n", inline_view(v)));
+        }
+        out.push_str(&format!(
+            "- **Evidence SHA-256:** `{}`\n\n",
+            inline_view(hash)
+        ));
+        out.push_str(&format!("{}\n\n", inline_view(&finding.description)));
+        out.push_str("#### Steps to Reproduce\n\n");
+        out.push_str(&format!(
+            "{}\n\n",
+            inline_view(finding.reproduction.as_deref().unwrap_or("Not provided"))
+        ));
+        out.push_str("#### Proof of Concept\n\n");
+        out.push_str(&format!(
+            "Evidence bytes pinned by SHA-256 `{}`.\n\n",
+            inline_view(hash)
+        ));
+        out.push_str("#### Impact\n\n");
+        out.push_str(&format!(
+            "{}\n\n",
+            inline_view(finding.impact.as_deref().unwrap_or("Not provided"))
+        ));
+        out.push_str("#### Remediation\n\n");
+        out.push_str(&format!(
+            "{}\n\n",
+            inline_view(finding.remediation.as_deref().unwrap_or("Not provided"))
+        ));
+    }
+
+    out.push_str("## Coverage\n\n");
+    if input.coverage.is_empty() {
+        out.push_str("- No coverage rows were supplied.\n");
+    } else {
+        for (target, method, path, status, rationale) in &input.coverage {
+            let method = if method.is_empty() {
+                "ANY".to_string()
+            } else {
+                inline_view(method)
+            };
+            let status = if status.is_empty() {
+                "covered".to_string()
+            } else {
+                inline_view(status)
+            };
+            out.push_str(&format!(
+                "- `{} {}{}` — **{status}**{}\n",
+                method,
+                inline_view(target),
+                inline_view(path),
+                if rationale.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", inline_view(rationale))
+                }
+            ));
+        }
+    }
+    out.push('\n');
+
+    out.push_str("## Timeline\n\n");
+    if input.timeline.is_empty() {
+        out.push_str("- (none)\n");
+    } else {
+        for (timestamp, kind, detail) in &input.timeline {
+            out.push_str(&format!(
+                "- {} [{}] {}\n",
+                inline_view(timestamp),
+                inline_view(kind),
+                inline_view(detail)
+            ));
+        }
+    }
+    out.push('\n');
+
+    out.push_str("## Appendices\n\n");
+    out.push_str("### A. Evidence Integrity\n\n");
+    for (index, finding) in input.findings.iter().enumerate() {
+        out.push_str(&format!(
+            "- F-{:03}: `{}`\n",
+            index + 1,
+            inline_view(
+                finding
+                    .authoritative_evidence_hash
+                    .as_deref()
+                    .or(finding.evidence_hash.as_deref())
+                    .unwrap_or("unavailable")
+            )
+        ));
+    }
+    out.push_str("\n### B. References\n\n");
+    out.push_str("- OWASP Web Security Testing Guide (WSTG)\n");
+    out.push_str("- MITRE CWE / Common Vulnerability Scoring System (CVSS)\n");
+    out.push_str("\n### C. Platform Field Checklist\n\n");
+    out.push_str(
+        "Platform hint derived from the program URL; confirm against the current brief. \
+         BugFound-authored review aid, not a platform submission form. The operator submits manually.\n\n",
+    );
+    out.push_str(&format!("Platform: {}\n\n", input.platform.label()));
+    match input.platform {
+        Platform::HackerOne => {
+            out.push_str("- [ ] Affected in-scope asset selected from the program scope list\n");
+            out.push_str("- [ ] Weakness category required by that asset chosen and consistent with the finding\n");
+            out.push_str("- [ ] Asset confirmed report-eligible; reward eligibility checked where relevant\n");
+            out.push_str(
+                "- [ ] Asset-specific instructions and severity ceiling reflected in this draft\n",
+            );
+            out.push_str(
+                "- [ ] Deterministic reproduction and minimal evidence-derived PoC included\n",
+            );
+            out.push_str(
+                "- [ ] Concrete impact and actionable remediation with a re-test step included\n",
+            );
+            out.push_str(
+                "- [ ] Disclosure setting reviewed; no secret or third-party data exposed\n",
+            );
+        }
+        Platform::Bugcrowd => {
+            out.push_str("- [ ] Finding mapped to the program vulnerability-class taxonomy and target group\n");
+            out.push_str("- [ ] Class/target exclusion rules checked against this finding\n");
+            out.push_str("- [ ] Target group confirmed currently report-eligible; reward status checked where relevant\n");
+            out.push_str(
+                "- [ ] Prior-art / known-issue list checked before treating the issue as novel\n",
+            );
+            out.push_str("- [ ] Concise title, target location, reproduction and minimal evidence-derived PoC included\n");
+            out.push_str("- [ ] Demonstrated impact and actionable remediation with a re-test step included\n");
+            out.push_str(
+                "- [ ] Evidence manifest attached and any operator attestation left for sign-off\n",
+            );
+        }
+        Platform::Generic => {
+            out.push_str(
+                "- [ ] Affected host confirmed on the in-scope list and not on the excluded list\n",
+            );
+            out.push_str(
+                "- [ ] Any extra fields required by the program brief copied into this draft\n",
+            );
+            out.push_str("- [ ] Brief constraints (rate limits, prohibited techniques, disclosure) confirmed honored\n");
+            out.push_str(
+                "- [ ] Deterministic reproduction and minimal evidence-derived PoC included\n",
+            );
+            out.push_str(
+                "- [ ] Concrete impact and actionable remediation with a re-test step included\n",
+            );
+            out.push_str("- [ ] Draft contains no secrets or third-party personal data and is ready for operator review\n");
+        }
+    }
+    out
+}
+
+/// Adapt the legacy `report_writer` JSON input to [`render_canonical_report`].
+/// Returns the rendered Markdown plus the evidence hashes for tool callers.
+fn render_report(input: &Value) -> (String, Vec<String>) {
+    let program = str_field(input, &["program", "name", "title"], "Unnamed program").to_string();
+    let engagement = str_field(
+        input,
+        &["engagement", "program", "name", "title"],
+        "Unnamed engagement",
+    )
+    .to_string();
+    let report_id = str_field(input, &["report_id", "id"], "unspecified").to_string();
+
+    let as_strings = |key: &str| -> Vec<String> {
+        match input.get(key) {
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            Some(Value::String(s)) => vec![s.clone()],
+            _ => Vec::new(),
+        }
+    };
+    let scope_in = {
+        let mut values = as_strings("scope_in");
+        if values.is_empty() {
+            values = as_strings("scope");
+        }
+        values
+    };
+    let scope_out = as_strings("scope_out");
+    let rules = as_strings("rules");
+
+    let findings_value = input.get("findings").and_then(Value::as_array);
+    let mut findings: Vec<ReportFinding> = Vec::new();
+    let mut evidence_hashes: Vec<String> = Vec::new();
+    let mut derived_coverage: Vec<String> = Vec::new();
+    for (index, finding) in findings_value.into_iter().flatten().enumerate() {
+        let raw_cvss = str_field(finding, &["cvss", "cvss_score"], "");
+        let vector = str_field(finding, &["vector", "cvss_vector", "cvss"], "");
+        let steps = str_field(finding, &["steps", "reproduction", "repro"], "Not provided");
+        let poc = str_field(finding, &["poc", "proof_of_concept", "request"], "");
+        let reproduction = if poc.is_empty() {
+            steps.to_string()
+        } else {
+            format!("{steps}\n\nPoC: {poc}")
+        };
+        let evidence = str_field(finding, &["evidence", "response"], "");
+        // Authoritative bytes win over any model-supplied hash. A tool capture
+        // object carries the raw request/response/canary triplet; otherwise the
+        // evidence field is treated as the raw byte source.
+        let hash = if let Some(capture) = finding.get("capture").and_then(Value::as_object) {
+            let mut bytes = Vec::new();
+            for key in ["request", "response", "canary"] {
+                if let Some(text) = capture.get(key).and_then(Value::as_str) {
+                    bytes.extend_from_slice(text.as_bytes());
+                }
+            }
+            sha256_hex(&bytes)
+        } else {
+            sha256_hex(evidence.as_bytes())
+        };
+        evidence_hashes.push(hash.clone());
+        let asset = str_field(finding, &["asset", "target", "url", "host"], "");
+        if !asset.is_empty() && !derived_coverage.iter().any(|c| c == asset) {
+            derived_coverage.push(asset.to_string());
+        }
+        let id = str_field(finding, &["id"], "");
+        // B22: a model-supplied `verified`/`status` is never authoritative. Only
+        // an explicit verification marker from the caller can set this flag.
+        let canonical_id = if id.is_empty() {
+            format!("F-{:03}", index + 1)
+        } else {
+            id.to_string()
+        };
+        let verified = finding
+            .get("authoritative_verification")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || input
+                .get("verified_finding_ids")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| {
+                    ids.iter()
+                        .any(|v| v.as_str() == Some(canonical_id.as_str()))
+                });
+        findings.push(ReportFinding {
+            id: if id.is_empty() {
+                format!("F-{:03}", index + 1)
+            } else {
+                id.to_string()
+            },
+            title: str_field(finding, &["title", "name"], "(untitled)").to_string(),
+            severity: str_field(finding, &["severity", "risk"], "info").to_string(),
+            cvss: raw_cvss.parse::<f32>().ok(),
+            vector: (!vector.is_empty()).then(|| vector.to_string()),
+            cwe: str_field(finding, &["cwe"], "").to_string().into(),
+            cwe_rationale: None,
+            cvss_note: None,
+            asset: (!asset.is_empty()).then(|| asset.to_string()),
+            description: str_field(finding, &["description", "desc"], "").to_string(),
+            reproduction: Some(reproduction),
+            impact: str_field(finding, &["impact"], "").to_string().into(),
+            remediation: str_field(finding, &["remediation", "fix"], "")
+                .to_string()
+                .into(),
+            evidence_hash: Some(hash),
+            verified,
+            ..Default::default()
+        });
+    }
+
+    let coverage: Vec<(String, String, String, String, String)> = input
+        .get("coverage")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    if let Some(single) = item.as_str() {
+                        return Some((
+                            single.to_string(),
+                            String::new(),
+                            String::new(),
+                            String::new(),
+                            String::new(),
+                        ));
+                    }
+                    let parts = item.as_array()?;
+                    Some((
+                        as_text(parts.first()),
+                        as_text(parts.get(1)),
+                        as_text(parts.get(2)),
+                        as_text(parts.get(3)),
+                        as_text(parts.get(4)),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            derived_coverage
+                .into_iter()
+                .map(|asset| {
+                    (
+                        asset,
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    )
+                })
+                .collect()
+        });
+
+    let timeline: Vec<(String, String, String)> = input
+        .get("timeline")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let parts = item.as_array()?;
+                    Some((
+                        as_text(parts.first()),
+                        as_text(parts.get(1)),
+                        as_text(parts.get(2)),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            vec![(
+                format!("unix-{now}"),
+                "system".to_string(),
+                "Report generated".to_string(),
+            )]
+        });
+
+    let platform = platform_from_program_url(&program);
+    let canonical = ReportInput {
+        program,
+        engagement,
+        scope_in,
+        scope_out,
+        rules,
+        findings,
+        coverage,
+        timeline,
+        report_id,
+        platform,
+    };
+    (render_canonical_report(&canonical), evidence_hashes)
+}
+
+/// Render a Markdown report from structured findings.
+pub struct ReportWriterTool;
+
+#[async_trait]
+impl Tool for ReportWriterTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "report_writer".into(),
+            description: "Render a Markdown security report with Executive Summary, Scope, Methodology, Findings (CVSS/CWE/PoC/impact/remediation/evidence hash), Coverage, Timeline and Appendices.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "findings": {"type": "array", "items": {"type": "object"}},
+                    "program": {"type": "string"},
+                    "scope": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}
+                },
+                "required": ["findings"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let (markdown, hashes) = render_report(&input);
+        let finding_count = input
+            .get("findings")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let structured = json!({
+            "ok": true,
+            "markdown": markdown,
+            "finding_count": finding_count,
+            "evidence_hashes": hashes
+        });
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&markdown),
+            structured: Some(structured),
+        })
+    }
+}
+
+/// Echo a durable task record for the engagement layer to persist.
+pub struct TaskPutTool;
+
+#[async_trait]
+impl Tool for TaskPutTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "task_put".into(),
+            description: "Emit a structured task record (statement, playbook_id, target, priority) for the engagement layer to persist.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "statement": {"type": "string"},
+                    "playbook_id": {"type": "string"},
+                    "target": {"type": "string"},
+                    "priority": {"type": "string"}
+                },
+                "required": ["statement"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let task = json!({
+            "statement": as_text(input.get("statement")),
+            "playbook_id": as_text(input.get("playbook_id")),
+            "target": as_text(input.get("target")),
+            "priority": as_text(input.get("priority").or_else(|| input.get("severity"))),
+            "status": "pending"
+        });
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&format!(
+                "task queued (persisted by runner): {}",
+                task["statement"]
+            )),
+            structured: Some(json!({"ok": true, "task": task})),
+        })
+    }
+}
+
+/// Echo a durable clue record for the engagement layer to persist.
+pub struct CluePutTool;
+
+#[async_trait]
+impl Tool for CluePutTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "clue_put".into(),
+            description: "Emit a structured clue record (key, value, source_tool, task_id) for the engagement layer to persist.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "value": {"type": "string"},
+                    "source_tool": {"type": "string"},
+                    "task_id": {"type": "string"}
+                },
+                "required": ["key", "value"]
+            }),
+            risk: "safe".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let clue = json!({
+            "key": as_text(input.get("key")),
+            "value": as_text(input.get("value")),
+            "source_tool": as_text(input.get("source_tool")),
+            "task_id": as_text(input.get("task_id"))
+        });
+        Ok(ToolResult {
+            ok: true,
+            output: truncate(&format!(
+                "clue queued (persisted by runner): {}",
+                clue["key"]
+            )),
+            structured: Some(json!({"ok": true, "clue": clue})),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP-backed tools. All requests go through HttpRequestTool so scope, DNS
+// pinning and redaction rules are preserved.
+// ---------------------------------------------------------------------------
+
+/// Fuzz a parameter (or an explicit marker) and record per-payload results.
+pub struct HttpFuzzTool {
+    http: HttpRequestTool,
+}
+
+fn fuzz_candidate(
+    base: &url::Url,
+    marker: &str,
+    param: Option<&str>,
+    payload: &str,
+) -> Option<url::Url> {
+    if base.as_str().contains(marker) {
+        return url::Url::parse(&base.as_str().replace(marker, payload)).ok();
+    }
+    let Some(param) = param else {
+        return Some(base.clone());
+    };
+    let mut candidate = base.clone();
+    let pairs: Vec<(String, String)> = candidate.query_pairs().into_owned().collect();
+    {
+        let mut query = candidate.query_pairs_mut();
+        query.clear();
+        let mut replaced = false;
+        for (key, value) in pairs {
+            if key == param {
+                query.append_pair(&key, payload);
+                replaced = true;
+            } else {
+                query.append_pair(&key, &value);
+            }
+        }
+        if !replaced {
+            query.append_pair(param, payload);
+        }
+    }
+    Some(candidate)
+}
+
+#[async_trait]
+impl Tool for HttpFuzzTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "http_fuzz".into(),
+            description: "Fuzz a URL parameter or marker with a wordlist using the scoped HTTP client. Hard-capped at 200 wordlist items and 200 requests per call; only GET/HEAD/POST are allowed. Records status, response length and marker presence per payload and reports `capped` when input was truncated.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "method": {"type": "string", "enum": FUZZ_METHODS, "default": "GET"},
+                    "param": {"type": "string"},
+                    "wordlist": {"type": "array", "items": {"type": "string"}},
+                    "marker": {"type": "string", "default": "FUZZ"},
+                    "match": {"type": "string"}
+                },
+                "required": ["url", "wordlist"]
+            }),
+            risk: "network-write".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let raw_url = input
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("url required"))?;
+        let base = url::Url::parse(raw_url).context("invalid url")?;
+        let wordlist = input
+            .get("wordlist")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("wordlist required"))?;
+        let method = input
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("GET")
+            .to_ascii_uppercase();
+        if !FUZZ_METHODS.contains(&method.as_str()) {
+            anyhow::bail!("method '{method}' is not allowed for http_fuzz (only GET/HEAD/POST)");
+        }
+        let marker = input
+            .get("marker")
+            .and_then(Value::as_str)
+            .unwrap_or("FUZZ");
+        let param = input.get("param").and_then(Value::as_str);
+        let explicit_match = input.get("match").and_then(Value::as_str);
+        let wordlist_total = wordlist.len();
+        let mut capped = wordlist_total > MAX_FUZZ_WORDLIST;
+        let mut requests = 0usize;
+        let mut results: Vec<Value> = Vec::new();
+        for payload in wordlist
+            .iter()
+            .filter_map(Value::as_str)
+            .take(MAX_FUZZ_WORDLIST)
+        {
+            if requests >= MAX_FUZZ_REQUESTS {
+                capped = true;
+                break;
+            }
+            requests += 1;
+            let mut entry = serde_json::Map::new();
+            entry.insert("payload".into(), Value::String(payload.to_string()));
+            let Some(candidate) = fuzz_candidate(&base, marker, param, payload) else {
+                entry.insert("ok".into(), Value::Bool(false));
+                entry.insert(
+                    "error".into(),
+                    Value::String("payload could not be encoded into url".into()),
+                );
+                results.push(Value::Object(entry));
+                continue;
+            };
+            entry.insert("url".into(), Value::String(candidate.to_string()));
+            match self
+                .http
+                .run(json!({"url": candidate.as_str(), "method": method.as_str()}))
+                .await
+            {
+                Ok(response) => {
+                    let data = response.structured.unwrap_or_else(|| json!({}));
+                    let status = data.get("status").and_then(Value::as_u64).unwrap_or(0);
+                    let length = data.get("body_bytes").and_then(Value::as_u64).unwrap_or(0);
+                    let body = data.get("body").and_then(Value::as_str).unwrap_or("");
+                    let needle = explicit_match.unwrap_or(payload);
+                    let marker_found = !needle.is_empty() && body.contains(needle);
+                    entry.insert("status".into(), json!(status));
+                    entry.insert("length".into(), json!(length));
+                    entry.insert("marker_found".into(), Value::Bool(marker_found));
+                    entry.insert("ok".into(), Value::Bool(response.ok));
+                }
+                Err(err) => {
+                    entry.insert("status".into(), json!(0));
+                    entry.insert("length".into(), json!(0));
+                    entry.insert("marker_found".into(), Value::Bool(false));
+                    entry.insert("ok".into(), Value::Bool(false));
+                    entry.insert("error".into(), Value::String(redact(&err.to_string())));
+                }
+            }
+            results.push(Value::Object(entry));
+        }
+        let any_ok = results
+            .iter()
+            .any(|r| r.get("ok").and_then(Value::as_bool).unwrap_or(false));
+        let structured = json!({
+            "ok": any_ok,
+            "capped": capped,
+            "url": raw_url,
+            "param": param,
+            "marker": marker,
+            "method": method,
+            "wordlist_total": wordlist_total,
+            "requests": requests,
+            "results": results
+        });
+        Ok(ToolResult {
+            ok: any_ok,
+            output: truncate(&format!(
+                "fuzzed {requests} payload(s) against {raw_url}{}",
+                if capped { " (capped)" } else { "" }
+            )),
+            structured: Some(structured),
+        })
+    }
+}
+
+fn detect_tech(haystack: &str) -> Vec<String> {
+    const SIGNATURES: &[(&str, &str)] = &[
+        ("wp-content", "WordPress"),
+        ("wp-includes", "WordPress"),
+        ("joomla", "Joomla"),
+        ("drupal", "Drupal"),
+        ("django", "Django"),
+        ("laravel", "Laravel"),
+        ("express", "Express"),
+        ("next.js", "Next.js"),
+        ("react", "React"),
+        ("jquery", "jQuery"),
+        ("asp.net", "ASP.NET"),
+        ("php", "PHP"),
+        ("nginx", "nginx"),
+        ("apache", "Apache"),
+        ("cloudflare", "Cloudflare"),
+    ];
+    let mut tech: Vec<String> = Vec::new();
+    for (needle, name) in SIGNATURES {
+        if haystack.contains(needle) && !tech.iter().any(|t| t == name) {
+            tech.push((*name).to_string());
+        }
+    }
+    tech
+}
+
+fn extract_title(body: &str) -> Option<String> {
+    let lower = body.to_ascii_lowercase();
+    let start = lower.find("<title>")? + "<title>".len();
+    let end_rel = lower[start..].find("</title>")?;
+    Some(body[start..start + end_rel].trim().to_string())
+}
+
+/// Lightweight fingerprint of a single in-scope URL.
+pub struct HttpProbeTool {
+    http: HttpRequestTool,
+}
+
+#[async_trait]
+impl Tool for HttpProbeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "http_probe".into(),
+            description: "Probe a single in-scope URL for status, server header, technology hints and HTML title.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"]
+            }),
+            risk: "network".into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        let url = input
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("url required"))?;
+        let response = self.http.run(json!({"url": url})).await?;
+        let data = response.structured.unwrap_or_else(|| json!({}));
+        let headers = data.get("headers").cloned().unwrap_or_else(|| json!({}));
+        let body = data.get("body").and_then(Value::as_str).unwrap_or("");
+        let status = data.get("status").and_then(Value::as_u64).unwrap_or(0);
+        let server = headers
+            .as_object()
+            .and_then(|map| {
+                map.iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("server"))
+                    .and_then(|(_, value)| value.as_str())
+            })
+            .unwrap_or("")
+            .to_string();
+        let mut haystack = format!("{} {}", headers, body).to_ascii_lowercase();
+        if let Some(powered) = headers.as_object().and_then(|map| {
+            map.iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("x-powered-by"))
+                .and_then(|(_, value)| value.as_str())
+        }) {
+            haystack.push(' ');
+            haystack.push_str(&powered.to_ascii_lowercase());
+        }
+        let tech = detect_tech(&haystack);
+        let title = extract_title(body).unwrap_or_default();
+        let structured = json!({
+            "ok": response.ok,
+            "url": url,
+            "status": status,
+            "server": server,
+            "tech": tech,
+            "title": title,
+            "headers": headers
+        });
+        Ok(ToolResult {
+            ok: response.ok,
+            output: truncate(&format!(
+                "probe {url}: status {status}, server '{server}', tech {:?}, title '{title}'",
+                tech
+            )),
+            structured: Some(structured),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gated external adapters. Each tool is always registered; when its backing
+// command is unavailable it returns ok=false with a clear gated result.
+// ---------------------------------------------------------------------------
+
+struct ExternalBackedTool {
+    name: &'static str,
+    description: &'static str,
+    risk: &'static str,
+    required: &'static [&'static str],
+    commands: &'static [&'static str],
+    registry: ToolRegistry,
+}
+
+/// Merge derived aliases into the original input so any configured argv
+/// template (`{target}`, `{host}`, `{url}`, `{word}`, ...) can be satisfied.
+fn enrich_external_input(input: &Value) -> Value {
+    let mut map = input.as_object().cloned().unwrap_or_default();
+    // Providers sometimes emit a single-element array for a string field.
+    // Normalise target-like keys so the policy gate sees a clean URL/host
+    // instead of a JSON array literal.
+    for key in ["target", "host", "domain", "url", "word"] {
+        if let Some(Value::Array(items)) = map.get(key) {
+            if let Some(first) = items.first().and_then(Value::as_str) {
+                map.insert(key.to_string(), Value::String(first.to_string()));
+            }
+        }
+    }
+    let host = input
+        .get("host")
+        .and_then(Value::as_str)
+        .or_else(|| input.get("domain").and_then(Value::as_str))
+        .or_else(|| input.get("target").and_then(Value::as_str))
+        .unwrap_or("");
+    let url = input.get("url").and_then(Value::as_str).unwrap_or("");
+    let target = if url.is_empty() { host } else { url };
+    let word = as_text(input.get("wordlist").or_else(|| input.get("word")));
+    let ports = as_text(input.get("ports"));
+    map.entry("target")
+        .or_insert_with(|| Value::String(target.to_string()));
+    map.entry("host")
+        .or_insert_with(|| Value::String(host.to_string()));
+    map.entry("url")
+        .or_insert_with(|| Value::String(url.to_string()));
+    map.entry("word")
+        .or_insert_with(|| Value::String(if ports.is_empty() { word } else { ports }));
+    Value::Object(map)
+}
+
+#[async_trait]
+impl Tool for ExternalBackedTool {
+    fn spec(&self) -> ToolSpec {
+        let mut properties = serde_json::Map::new();
+        for key in self.required.iter().copied().chain(
+            ["marker", "selector", "script", "action", "ports"]
+                .iter()
+                .copied(),
+        ) {
+            properties.insert(key.to_string(), json!({"type": ["string", "array"]}));
+        }
+        ToolSpec {
+            name: self.name.into(),
+            description: self.description.into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": properties,
+                "required": self.required
+            }),
+            risk: self.risk.into(),
+        }
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolResult> {
+        if !self
+            .required
+            .iter()
+            .any(|key| !as_text(input.get(*key)).is_empty())
+        {
+            anyhow::bail!("one of {:?} is required", self.required);
+        }
+        let selected = self
+            .commands
+            .iter()
+            .find_map(|name| self.registry.get(name).map(|tool| (*name, tool)));
+        let Some((adapter_name, adapter)) = selected else {
+            let reason = format!(
+                "'{}' is gated: no configured external command ({}) is available. Explicitly enable it via ToolOptions.external_commands to allow execution.",
+                self.name,
+                self.commands.join(" or ")
+            );
+            return Ok(gated_result(
+                self.name,
+                &reason,
+                json!({
+                    "target": as_text(input.get("target").or_else(|| input.get("host")).or_else(|| input.get("url")))
+                }),
+            ));
+        };
+        let enriched = enrich_external_input(&input);
+        let result = adapter.run(enriched.clone()).await?;
+        let mut structured = result.structured.unwrap_or_else(|| json!({}));
+        if let Value::Object(map) = &mut structured {
+            map.insert("tool".into(), Value::String(self.name.to_string()));
+            map.insert("adapter".into(), Value::String(adapter_name.to_string()));
+            map.insert("ok".into(), Value::Bool(result.ok));
+            map.insert("input".into(), enriched);
+        }
+        Ok(ToolResult {
+            ok: result.ok,
+            output: result.output,
+            structured: Some(structured),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fs_read_confined() {
+        let dir = std::env::temp_dir().join(format!("mbt-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        let tool = FsReadTool::new(&dir).unwrap();
+        let ok = tool.run(json!({"path":"a.txt"})).await.unwrap();
+        assert_eq!(ok.output, "hello");
+        let bad = tool.run(json!({"path":"../outside.txt"})).await;
+        assert!(bad.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fs_read_cannot_read_evidence_artifact() {
+        let dir = std::env::temp_dir().join(format!("mbt-evidence-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join("evidence")).unwrap();
+        std::fs::write(dir.join("evidence/f-001.bin"), "raw canary bytes").unwrap();
+        std::fs::write(dir.join("note.txt"), "bugfound-canary-abc123").unwrap();
+        let tool = FsReadTool::new(&dir).unwrap();
+        assert!(tool
+            .run(json!({"path": "evidence/f-001.bin"}))
+            .await
+            .is_err());
+        assert!(tool.run(json!({"path": "evidence"})).await.is_err());
+        let safe = tool.run(json!({"path": "note.txt"})).await.unwrap();
+        assert!(!safe.output.contains("bugfound-canary-abc123"));
+        assert!(safe.output.contains("<redacted-canary>"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn http_blocks_localhost() {
+        let tool = HttpRequestTool::new();
+        let bad = tool.run(json!({"url":"http://localhost:8080/"})).await;
+        assert!(bad.is_err());
+    }
+
+    #[tokio::test]
+    async fn http_blocks_private_and_encoded_addresses() {
+        let tool = HttpRequestTool::new();
+        for url in [
+            "http://127.0.0.1:8080/",
+            "http://[::1]/",
+            "http://10.0.0.5/",
+            "http://192.168.1.10/",
+            "http://172.16.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://100.100.100.200/",
+            "http://service.internal/",
+            "http://2130706433/", // decimal loopback
+            "https://[fd00::1]/",
+        ] {
+            let result = tool.run(json!({"url": url})).await;
+            assert!(result.is_err(), "expected {url} to be blocked");
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_exec_rejects_unlisted_and_chained_commands() {
+        let dir = std::env::temp_dir().join(format!("mbt-allow-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = ShellExecTool::new(&dir).unwrap();
+        for cmd in [
+            "python -c 'import os'",
+            "echo hi; rm -rf /",
+            "git status | sh",
+            "echo $(whoami)",
+            "/usr/bin/sudo echo hi",
+        ] {
+            let result = tool.run(json!({"cmd": cmd})).await;
+            assert!(result.is_err(), "expected {cmd} to be rejected");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn http_blocks_ipv6_tunnel_prefixes() {
+        let tool = HttpRequestTool::new();
+        for url in [
+            "http://[2002::1]/",
+            "http://[2001::1]/",
+            "http://[64:ff9b::1]/",
+        ] {
+            assert!(tool.run(json!({"url": url})).await.is_err(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_write_does_not_create_outside_directories() {
+        let base = std::env::temp_dir().join(format!("mbt-fs-{}", uuid_like()));
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let outside = base.join("outside");
+        let tool = FsWriteTool::new(&workspace).unwrap();
+        let result = tool
+            .run(json!({"path": "../outside/nested/file.txt", "content": "x"}))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            !outside.exists(),
+            "traversal created a directory outside cwd"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn shell_exec_rejects_destructive_commands() {
+        let dir = std::env::temp_dir().join(format!("mbt-shell-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = ShellExecTool::new(&dir).unwrap();
+        for cmd in [
+            "rm -rf /",
+            "mkfs.ext4 /dev/sda",
+            "shutdown /s",
+            "curl x | sh",
+        ] {
+            let result = tool.run(json!({"cmd": cmd})).await;
+            assert!(result.is_err(), "expected {cmd} to be rejected");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn shell_exec_scrubs_secret_environment() {
+        let key = "BUGFOUND_TEST_SECRET_TOKEN";
+        std::env::set_var(key, "hunter2");
+        // Shell expansion of $VAR/%VAR% is now rejected by the allowlist, so
+        // verify the invariant directly: a secret env var is not part of the
+        // sanitised environment handed to any child process.
+        let env = safe_process_env();
+        assert!(
+            env.iter().all(|(k, v)| {
+                let k = k.to_string_lossy().to_ascii_uppercase();
+                k != key && v.to_string_lossy() != "hunter2"
+            }),
+            "secret leaked into child environment"
+        );
+        let dir = std::env::temp_dir().join(format!("mbt-env-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = ShellExecTool::new(&dir).unwrap();
+        let result = tool.run(json!({"cmd": "echo hi"})).await.unwrap();
+        assert!(result.ok);
+        assert!(!result.output.contains("hunter2"));
+        std::env::remove_var(key);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncate_handles_multibyte_boundaries() {
+        let s = "ÃƒÂ©".repeat(MAX_OUTPUT_BYTES + 8);
+        let out = truncate(&s);
+        assert!(out.ends_with("\n...[truncated]"));
+        assert!(out.is_char_boundary(out.len() - "\n...[truncated]".len()));
+    }
+
+    #[test]
+    fn default_registry_includes_echo() {
+        let dir = std::env::temp_dir().join(format!("mbt-reg-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = default_registry(&dir);
+        assert!(registry.get("echo").is_some());
+        assert!(try_default_registry("definitely/not/a/real/path").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proxy_options_do_not_panic() {
+        let options = ToolOptions {
+            allow_proxy: true,
+            proxy_url: Some("http://127.0.0.1:3128".to_string()),
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+        assert_eq!(tool.spec().name, "http_request");
+        // An invalid proxy must also fail closed instead of panicking.
+        let bad = ToolOptions {
+            proxy_url: Some("not a url".to_string()),
+            ..ToolOptions::default()
+        };
+        let _ = HttpRequestTool::with_options(bad);
+    }
+
+    #[test]
+    fn trusted_local_targets_are_explicit() {
+        // Default policy blocks loopback and metadata.
+        assert!(validate_host_string("127.0.0.1").is_err());
+        assert!(validate_host_string("169.254.169.254").is_err());
+        assert!(validate_host_string("localhost").is_err());
+        assert!(validate_host_string_with_default_options("localhost").is_err());
+
+        // Only an explicit entry lets a local host through.
+        let exact = vec!["127.0.0.1".to_string()];
+        assert!(host_is_trusted("127.0.0.1", &exact));
+        let options = ToolOptions {
+            trusted_local_targets: exact.clone(),
+            ..ToolOptions::default()
+        };
+        assert!(validate_host_with_options("127.0.0.1", &options).is_ok());
+        assert!(validate_host_with_options("10.0.0.5", &options).is_err());
+
+        let wildcard = vec!["*.lab.local".to_string()];
+        assert!(host_is_trusted("api.lab.local", &wildcard));
+        assert!(host_is_trusted("deep.api.lab.local", &wildcard));
+        assert!(!host_is_trusted("lab.local", &wildcard));
+        assert!(!host_is_trusted("api.example.com", &wildcard));
+
+        let cidr = vec!["10.0.0.0/8".to_string()];
+        assert!(host_is_trusted("10.1.2.3", &cidr));
+        assert!(host_is_trusted("10.0.0.1", &cidr));
+        assert!(!host_is_trusted("11.0.0.1", &cidr));
+
+        let prefix = vec!["192.168.1.".to_string()];
+        assert!(host_is_trusted("192.168.1.42", &prefix));
+        assert!(!host_is_trusted("192.168.2.42", &prefix));
+    }
+
+    fn validate_host_string_with_default_options(host: &str) -> Result<()> {
+        validate_host_with_options(host, &ToolOptions::default())
+    }
+
+    #[test]
+    fn build_external_args_substitutes_placeholders() {
+        let template: Vec<String> = [
+            "-d", "{target}", "--host", "{host}", "-u", "{url}", "-w", "{word}", "-p", "{path}",
+            "-k", "{key}", "-v", "{value}", "-t", "{text}",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let input = json!({
+            "target": "example.com",
+            "host": "ns1.example.com",
+            "url": "https://example.com/a",
+            "word": "paths.txt",
+            "path": "wordlists/all.txt",
+            "key": "role",
+            "value": "admin",
+            "text": "hello world"
+        });
+        assert_eq!(
+            build_external_args(&template, &input),
+            vec![
+                "-d",
+                "example.com",
+                "--host",
+                "ns1.example.com",
+                "-u",
+                "https://example.com/a",
+                "-w",
+                "paths.txt",
+                "-p",
+                "wordlists/all.txt",
+                "-k",
+                "role",
+                "-v",
+                "admin",
+                "-t",
+                "hello world"
+            ]
+        );
+        // Missing values become empty strings and values are not re-scanned.
+        let missing = build_external_args(&["{target}".to_string()], &json!({}));
+        assert_eq!(missing, vec![""]);
+        let chained = build_external_args(
+            &["{target}".to_string()],
+            &json!({"target": "{host}", "host": "evil"}),
+        );
+        assert_eq!(chained, vec!["{host}"]);
+    }
+
+    #[test]
+    fn external_adapters_are_opt_in() {
+        let dir = std::env::temp_dir().join(format!("mbt-ext-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = try_default_registry(&dir).unwrap();
+        assert!(plain.get("dns").is_some());
+        assert!(plain.get("dns_resolve").is_some());
+        assert!(plain.get("dnsx").is_none());
+        assert!(plain.get("subfinder").is_none());
+
+        // Configured commands are pinned to a resolvable absolute path at
+        // registration; a bare name that cannot be found is skipped.
+        let program = dir.join(if cfg!(windows) {
+            "nuclei.exe"
+        } else {
+            "nuclei"
+        });
+        std::fs::write(&program, b"fake nuclei").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut options = ToolOptions {
+            enable_external_tools: true,
+            ..ToolOptions::default()
+        };
+        options
+            .external_commands
+            .insert("nuclei".into(), format!("{} -u {{url}}", program.display()));
+        let reg = try_default_registry_with_options(&dir, options).unwrap();
+        assert!(
+            reg.get("nuclei").is_some(),
+            "an explicit configured command must register"
+        );
+        assert!(reg.get("nmap").is_none());
+        // Built-in adapters are still opt-in via `enable_external_tools`, and
+        // their binaries must resolve even when auto-detection is disabled.
+        for name in ["subfinder", "dnsx", "katana", "ffuf"] {
+            assert_eq!(
+                reg.get(name).is_some(),
+                resolve_program(name).is_some(),
+                "registration of {name} must follow binary resolution"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adapters_without_binaries_not_registered() {
+        let dir = std::env::temp_dir().join(format!("mbt-no-bin-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let options = ToolOptions {
+            enable_external_tools: true,
+            auto_detect_external: false,
+            ..ToolOptions::default()
+        };
+        let reg = try_default_registry_with_options(&dir, options).unwrap();
+        for name in ["subfinder", "dnsx", "katana", "ffuf"] {
+            let present = reg.get(name).is_some();
+            let resolvable = resolve_program(name).is_some();
+            assert!(!present || resolvable, "{name} registered without a binary");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scope_target_allowed_enforces_inclusion_and_exclusion() {
+        let empty: Vec<String> = Vec::new();
+        assert!(scope_target_allowed("example.com", &empty, &empty));
+        assert!(!scope_target_allowed("", &empty, &empty));
+
+        let in_scope = vec!["example.com".to_string()];
+        assert!(scope_target_allowed("example.com", &in_scope, &empty));
+        // A bare entry is exact only; use a full URL for the in-scope host.
+        assert!(scope_target_allowed(
+            "https://example.com/path",
+            &in_scope,
+            &empty
+        ));
+        assert!(!scope_target_allowed("api.example.com", &in_scope, &empty));
+        assert!(!scope_target_allowed("evil-example.com", &in_scope, &empty));
+        assert!(!scope_target_allowed("other.org", &in_scope, &empty));
+
+        let wildcard = vec!["*.example.com".to_string()];
+        assert!(scope_target_allowed("api.example.com", &wildcard, &empty));
+        // A wildcard needs at least one extra label; the apex is not covered.
+        assert!(!scope_target_allowed("example.com", &wildcard, &empty));
+
+        let suffix = vec![".example.com".to_string()];
+        assert!(scope_target_allowed("api.example.com", &suffix, &empty));
+        assert!(!scope_target_allowed("example.com", &suffix, &empty));
+
+        let cidr = vec!["10.0.0.0/8".to_string()];
+        assert!(scope_target_allowed("10.1.2.3", &cidr, &empty));
+        assert!(!scope_target_allowed("11.0.0.1", &cidr, &empty));
+
+        let out = vec!["admin.example.com".to_string()];
+        assert!(!scope_target_allowed("admin.example.com", &in_scope, &out));
+        let all_subdomains = vec!["*.example.com".to_string()];
+        assert!(!scope_target_allowed(
+            "api.example.com",
+            &empty,
+            &all_subdomains
+        ));
+    }
+
+    #[test]
+    fn scope_target_matches_host_of_path_bearing_pattern() {
+        let empty: Vec<String> = vec![];
+        // A path-bearing rule never matches a host-only target.
+        let wildcard = vec!["*.api.clockify.me/api/".to_string()];
+        assert!(!scope_target_allowed("api.clockify.me", &wildcard, &empty));
+        assert!(!scope_target_allowed(
+            "sub.api.clockify.me",
+            &wildcard,
+            &empty
+        ));
+        assert!(scope_target_allowed(
+            "https://sub.api.clockify.me/api/v1/users",
+            &wildcard,
+            &empty
+        ));
+        let exact = vec!["account.cake.com/api/".to_string()];
+        assert!(!scope_target_allowed("account.cake.com", &exact, &empty));
+        assert!(scope_target_allowed(
+            "https://account.cake.com/api/v1",
+            &exact,
+            &empty
+        ));
+        // Real CIDRs still work.
+        let cidr = vec!["10.1.2.0/24".to_string()];
+        assert!(scope_target_allowed("10.1.2.3", &cidr, &empty));
+        assert!(!scope_target_allowed("11.0.0.1", &cidr, &empty));
+    }
+
+    #[test]
+    fn path_scoped_exclusion_does_not_block_whole_host() {
+        let empty: Vec<String> = vec![];
+        let in_scope = vec!["*.api.clockify.me/api/".to_string()];
+        let out = vec![
+            "clockify.me/help/*".to_string(),
+            "nope.clockify.me".to_string(),
+        ];
+        // A path-scoped exclusion must not exclude the host itself; a bare
+        // exact out-of-scope host only excludes that host.
+        assert!(scope_target_allowed(
+            "https://sub.api.clockify.me/api/v1",
+            &in_scope,
+            &out
+        ));
+        // A genuinely excluded host remains excluded.
+        assert!(!scope_target_allowed("nope.clockify.me", &empty, &out));
+    }
+
+    #[test]
+    fn in_scope_path_rule_does_not_authorize_other_paths() {
+        let in_scope = vec!["api.example.com/admin/*".to_string()];
+        let empty: Vec<String> = vec![];
+        assert!(scope_target_allowed(
+            "https://api.example.com/admin/users",
+            &in_scope,
+            &empty
+        ));
+        assert!(!scope_target_allowed(
+            "https://api.example.com/login",
+            &in_scope,
+            &empty
+        ));
+        // Path normalization is case-insensitive and resolves dot segments.
+        assert!(scope_target_allowed(
+            "https://api.example.com/ADMIN/./users",
+            &in_scope,
+            &empty
+        ));
+        let out = vec!["api.example.com/SECRET/*".to_string()];
+        assert!(!scope_target_allowed(
+            "https://api.example.com/secret/x",
+            &empty,
+            &out
+        ));
+    }
+
+    #[test]
+    fn path_scoped_exclusion_blocks_only_the_excluded_path() {
+        let in_scope = vec!["clockify.me".to_string()];
+        let out = vec!["clockify.me/help/*".to_string()];
+        assert!(scope_target_allowed("clockify.me", &in_scope, &out));
+        assert!(scope_target_allowed(
+            "https://clockify.me/api/v1/users",
+            &in_scope,
+            &out
+        ));
+        assert!(!scope_target_allowed(
+            "https://clockify.me/help/private",
+            &in_scope,
+            &out
+        ));
+        assert!(!scope_target_allowed(
+            "clockify.me/help/private",
+            &in_scope,
+            &out
+        ));
+    }
+
+    #[test]
+    fn scope_matcher_has_policy_parity_for_wildcards_and_ipv6() {
+        let empty: Vec<String> = Vec::new();
+
+        // (a) `*.suffix` requires at least one extra label; the apex is not
+        // covered, matching ScopeConfig::matches.
+        let wildcard = vec!["*.example.com".to_string()];
+        assert!(!scope_target_allowed("example.com", &wildcard, &empty));
+        assert!(!scope_target_allowed(
+            "https://example.com/path",
+            &wildcard,
+            &empty
+        ));
+        assert!(scope_target_allowed("a.example.com", &wildcard, &empty));
+
+        // (b) IPv6 CIDR entries match IPv6 targets, but not IPv4 or other nets.
+        let v6 = vec!["2001:db8::/32".to_string()];
+        assert!(scope_target_allowed("2001:db8::1", &v6, &empty));
+        assert!(scope_target_allowed("[2001:db8::1]", &v6, &empty));
+        assert!(!scope_target_allowed("2001:db9::1", &v6, &empty));
+        assert!(!scope_target_allowed("10.1.2.3", &v6, &empty));
+
+        // (c) A bare `*` allows any target, including a raw IP.
+        let any = vec!["*".to_string()];
+        assert!(scope_target_allowed("anything.example", &any, &empty));
+        assert!(scope_target_allowed("10.1.2.3", &any, &empty));
+
+        // Exclusive rules always win: no specificity escape hatch.
+        let exact = vec!["api.example.com".to_string()];
+        let any_out = vec!["*".to_string()];
+        assert!(!scope_target_allowed("api.example.com", &exact, &any_out));
+        assert!(!scope_target_allowed("other.example.com", &empty, &any_out));
+    }
+
+    #[test]
+    fn bare_scope_entry_matches_exactly_and_wildcards_cover_subdomains() {
+        let empty: Vec<String> = Vec::new();
+        let exact = vec!["example.com".to_string()];
+        assert!(scope_target_allowed(
+            "https://example.com/path",
+            &exact,
+            &empty
+        ));
+        assert!(!scope_target_allowed("api.example.com", &exact, &empty));
+        assert!(!scope_target_allowed(
+            "https://api.example.com/path",
+            &exact,
+            &empty
+        ));
+        let wildcard = vec!["*.example.com".to_string()];
+        assert!(scope_target_allowed("api.example.com", &wildcard, &empty));
+        assert!(!scope_target_allowed("example.com", &wildcard, &empty));
+        let dotted = vec![".example.com".to_string()];
+        assert!(scope_target_allowed("api.example.com", &dotted, &empty));
+    }
+
+    #[test]
+    fn wildcard_out_beats_exact_in() {
+        let exact_in = vec!["example.com".to_string()];
+        let wildcard_out = vec!["*.example.com".to_string()];
+        // A wildcard out-rule needs at least one extra label, so the apex
+        // covered by the exact in-rule stays allowed.
+        assert!(scope_target_allowed(
+            "example.com",
+            &exact_in,
+            &wildcard_out
+        ));
+        assert!(!scope_target_allowed(
+            "api.example.com",
+            &exact_in,
+            &wildcard_out
+        ));
+    }
+
+    #[test]
+    fn proxy_url_requires_loopback_http() {
+        for url in [
+            "http://127.0.0.1:3128",
+            "http://localhost:8080",
+            "http://[::1]:3128",
+        ] {
+            let options = ToolOptions {
+                allow_proxy: true,
+                proxy_url: Some(url.to_string()),
+                ..ToolOptions::default()
+            };
+            assert!(validate_proxy_url(&options).is_ok(), "{url}");
+        }
+        for url in [
+            "https://0.0.0.0:443",
+            "http://0.0.0.0:3128",
+            "ftp://127.0.0.1:21",
+            "http://evil.example.com:8080",
+            "http://192.168.1.10:8080",
+            "not a url",
+            "http://",
+        ] {
+            let options = ToolOptions {
+                allow_proxy: true,
+                proxy_url: Some(url.to_string()),
+                ..ToolOptions::default()
+            };
+            assert!(validate_proxy_url(&options).is_err(), "{url}");
+        }
+        let disabled = ToolOptions {
+            proxy_url: Some("http://evil.example.com".to_string()),
+            ..ToolOptions::default()
+        };
+        assert!(validate_proxy_url(&disabled).is_ok());
+    }
+
+    #[tokio::test]
+    async fn http_rejects_bad_proxy_and_out_of_scope_without_network() {
+        let options = ToolOptions {
+            allow_proxy: true,
+            proxy_url: Some("http://evil.example.com:8080".to_string()),
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+        let err = tool
+            .run(json!({"url": "http://example.com/"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("loopback"), "{err}");
+
+        let options = ToolOptions {
+            scope_in: vec!["example.com".to_string()],
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+        let err = tool
+            .run(json!({"url": "http://other.org/"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("scope"), "{err}");
+    }
+
+    #[test]
+    fn poc_verdict_requires_status_and_optional_marker() {
+        assert!(poc_verdict(200, 200, false, false));
+        assert!(!poc_verdict(201, 200, false, false));
+        assert!(poc_verdict(200, 200, true, true));
+        assert!(!poc_verdict(200, 200, false, true));
+    }
+
+    #[test]
+    fn validate_poc_tool_has_expected_spec() {
+        let spec = ValidatePoCTool::new().spec();
+        assert_eq!(spec.name, "validate_poc");
+        assert_eq!(spec.risk, "network-write");
+        assert_eq!(spec.input_schema["required"], json!(["finding_id", "url"]));
+        assert!(spec.input_schema["properties"]["finding_id"].is_object());
+        assert!(spec.input_schema["properties"]["headers"].is_object());
+        assert!(spec.input_schema["properties"]["body"].is_object());
+        assert_eq!(
+            spec.input_schema["properties"]["method"]["default"],
+            json!("GET")
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["expected_status"]["default"],
+            json!(200)
+        );
+        assert!(spec.input_schema["properties"]["marker"].is_object());
+    }
+
+    struct StepTool;
+
+    #[async_trait]
+    impl Tool for StepTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "step".into(),
+                description: String::new(),
+                input_schema: json!({}),
+                risk: "safe".into(),
+            }
+        }
+        async fn run(&self, input: Value) -> Result<ToolResult> {
+            let target = input.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            Ok(ToolResult {
+                ok: true,
+                output: format!("value-{target}\nfooter"),
+                structured: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_feeds_previous_output_line_as_target() {
+        let dir = std::env::temp_dir().join(format!("mbt-pipe-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(StepTool));
+        let tool = PipelineTool::new(registry, &dir);
+        assert_eq!(tool.spec().name, "recon_pipeline");
+        let result = tool
+            .run(json!({"steps": ["step", "step"], "target": "example.com"}))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let steps = &result.structured.as_ref().unwrap()["steps"];
+        assert_eq!(steps[0]["name"], json!("step"));
+        assert_eq!(steps[0]["ok"], json!(true));
+        assert_eq!(steps[0]["output_first_line"], json!("value-example.com"));
+        assert_eq!(
+            steps[1]["output_first_line"],
+            json!("value-value-example.com")
+        );
+        let err = tool
+            .run(json!({"steps": ["missing"], "target": "x"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown pipeline step"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_tool_availability_has_expected_keys() {
+        let map = external_tool_availability();
+        for key in ["subfinder", "dnsx", "katana", "ffuf", "nuclei", "nmap"] {
+            assert!(map.contains_key(key), "missing {key}");
+        }
+    }
+
+    #[test]
+    fn configured_program_resolves_to_absolute_path() {
+        let dir = std::env::temp_dir().join(format!("mbt-which-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join(if cfg!(windows) { "nmap.exe" } else { "nmap" });
+        std::fs::write(&fake, b"fake nmap").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let dirs = std::slice::from_ref(&dir);
+        let resolved = resolve_program_in("nmap", dirs).expect("nmap should resolve");
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert_eq!(resolved, fake.canonicalize().unwrap());
+        assert!(resolve_program_in("bugfound_missing_nmap_binary", dirs).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unresolved_configured_commands_are_skipped() {
+        let dir = std::env::temp_dir().join(format!("mbt-skip-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut options = ToolOptions::default();
+        options
+            .external_commands
+            .insert("nmap".into(), "bugfound_missing_nmap_zzz --flag".into());
+        let reg = try_default_registry_with_options(&dir, options).unwrap();
+        assert!(
+            reg.get("nmap").is_none(),
+            "an unresolvable configured command must not be registered or executed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn external_command_timeout_bounds_pipe_drain_with_grandchild() {
+        let dir = std::env::temp_dir().join(format!("mbt-drain-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The direct shell exits immediately while its background grandchild
+        // keeps the inherited stdout pipe open. Without a bounded drain the
+        // wait_with_output() call would block until the grandchild exits.
+        #[cfg(windows)]
+        let (program, args) = (
+            "cmd",
+            vec![
+                "/C".to_string(),
+                "start /B cmd /C ping -n 10 127.0.0.1 & echo done".to_string(),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (program, args) = (
+            "sh",
+            vec!["-c".to_string(), "sleep 10 & echo done".to_string()],
+        );
+        let tool = ExternalCommandTool::new("drain", "drain", program, args, "safe", &dir)
+            .with_timeout(Duration::from_millis(300));
+        let start = Instant::now();
+        let err = tool.run(json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "pipe-drain timeout took too long: {:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn child_output_above_cap_truncated_not_buffered() {
+        let dir = std::env::temp_dir().join(format!("mbt-cap-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("big-stdout.txt");
+        std::fs::write(
+            &file,
+            format!("{}TAILSECRET", "A".repeat(MAX_CHILD_STREAM_BYTES * 2)),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        let (program, args) = (
+            "cmd",
+            vec!["/C".to_string(), "type big-stdout.txt".to_string()],
+        );
+        #[cfg(not(windows))]
+        let (program, args) = (
+            "sh",
+            vec!["-c".to_string(), format!("cat '{}'", file.display())],
+        );
+        let tool = ExternalCommandTool::new("cap", "cap", program, args, "safe", &dir);
+        let result = tool.run(json!({})).await.unwrap();
+        assert!(result.ok, "{:?}", result.output);
+        assert!(!result.output.contains("TAILSECRET"));
+        assert!(
+            result.output.contains("[truncated]"),
+            "capped output must be truncated: {:?}",
+            result.output
+        );
+        let lines = result.structured.unwrap()["lines"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(lines.len() <= MAX_EXTERNAL_LINES);
+        assert!(lines
+            .iter()
+            .all(|line| line.as_str().unwrap().len() <= MAX_OUTPUT_BYTES + "...[truncated]".len()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stderr_cap_enforced() {
+        let direct = std::io::Cursor::new(vec![b's'; MAX_CHILD_STREAM_BYTES * 3]);
+        let capped = drain_capped_pipe(direct, MAX_CHILD_STREAM_BYTES).await;
+        assert_eq!(capped.len(), MAX_CHILD_STREAM_BYTES);
+
+        let dir = std::env::temp_dir().join(format!("mbt-stderr-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("big-stderr.txt");
+        std::fs::write(
+            &file,
+            format!("{}STDERRTAIL", "B".repeat(MAX_CHILD_STREAM_BYTES * 2)),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        let (program, args) = (
+            "cmd",
+            vec!["/C".to_string(), "type big-stderr.txt 1>&2".to_string()],
+        );
+        #[cfg(not(windows))]
+        let (program, args) = (
+            "sh",
+            vec!["-c".to_string(), format!("cat '{}' >&2", file.display())],
+        );
+        let tool = ExternalCommandTool::new("cap-err", "cap-err", program, args, "safe", &dir);
+        let result = tool.run(json!({})).await.unwrap();
+        assert!(result.ok, "{:?}", result.output);
+        assert!(!result.output.contains("STDERRTAIL"));
+        let stderr_part = result.output.split("--- stderr ---").nth(1).unwrap_or("");
+        assert!(
+            stderr_part.contains("[truncated]"),
+            "stderr must be capped before redaction: {stderr_part:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redact_covers_pii_without_touching_common_numbers() {
+        let out = redact("mail alice@example.com or bob.smith+tag@sub.example.co.uk");
+        assert!(!out.contains("alice@example.com"));
+        assert!(!out.contains("bob.smith+tag"));
+
+        let out = redact("SSN 123-45-6789 and phone +1-555-123-4567");
+        assert!(!out.contains("123-45-6789"));
+        assert!(!out.contains("555-123-4567"));
+
+        let out = redact("card 4111111111111111 amex 378282246310005");
+        assert!(!out.contains("4111111111111111"));
+        assert!(!out.contains("378282246310005"));
+
+        let plain = "port 8080 status 200 date 2026-11-19 version 1.2.3";
+        assert_eq!(redact(plain), plain);
+    }
+
+    #[tokio::test]
+    async fn payload_forge_generates_local_payloads() {
+        let tool = PayloadForgeTool;
+        let result = tool
+            .run(json!({"kind": "xss", "marker": "PROBE", "context": "attr"}))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        let payloads = data["payloads"].as_array().unwrap();
+        assert_eq!(data["count"], json!(payloads.len()));
+        assert!(payloads
+            .iter()
+            .any(|p| p.as_str().unwrap().contains("PROBE")));
+        assert!(payloads
+            .iter()
+            .any(|p| p.as_str().unwrap().contains("onmouseover")));
+
+        for kind in ["sqli", "ssrf", "ssti", "cmdi"] {
+            let result = tool.run(json!({"kind": kind})).await.unwrap();
+            assert!(result.ok, "{kind}");
+            assert!(!result.structured.unwrap()["payloads"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn jwt_decode_decodes_segments_without_verifying() {
+        let header = json!({"alg": "HS256", "typ": "JWT"}).to_string();
+        let payload = json!({"sub": "1234567890", "admin": true}).to_string();
+        let token = format!(
+            "{}.{}.c2lnbmF0dXJl",
+            b64_encode(header.as_bytes(), true, false),
+            b64_encode(payload.as_bytes(), true, false)
+        );
+        let result = JwtDecodeTool.run(json!({"token": token})).await.unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["verified"], json!(false));
+        assert_eq!(data["header"]["alg"], json!("HS256"));
+        assert_eq!(data["payload"]["sub"], json!("1234567890"));
+        assert_eq!(data["payload"]["admin"], json!(true));
+        assert_eq!(data["segments"]["signature"]["raw"], json!("c2lnbmF0dXJl"));
+
+        let malformed = JwtDecodeTool.run(json!({"token": "abc"})).await.unwrap();
+        assert!(!malformed.ok);
+    }
+
+    #[tokio::test]
+    async fn hash_util_matches_known_vectors() {
+        let tool = HashUtilTool;
+        for (op, value, expected) in [
+            ("md5", "", "d41d8cd98f00b204e9800998ecf8427e"),
+            ("sha1", "abc", "a9993e364706816aba3e25717850c26c9cd0d89d"),
+            (
+                "sha256",
+                "abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            ("b64encode", "hi", "aGk="),
+            ("hex", "AB", "4142"),
+        ] {
+            let result = tool.run(json!({"op": op, "value": value})).await.unwrap();
+            assert!(result.ok, "{op}");
+            assert_eq!(
+                result.structured.unwrap()["result"],
+                json!(expected),
+                "{op}"
+            );
+        }
+        let decoded = tool
+            .run(json!({"op": "b64decode", "value": "aGk="}))
+            .await
+            .unwrap();
+        assert_eq!(decoded.structured.unwrap()["result"], json!("hi"));
+        let bad = tool.run(json!({"op": "nope", "value": "x"})).await.unwrap();
+        assert!(!bad.ok);
+    }
+
+    #[tokio::test]
+    async fn decode_round_trips_url_base64_and_hex() {
+        for (op, input, expected) in [
+            ("url_encode", "a b+c", "a+b%2Bc"),
+            ("url_decode", "a+b%2Bc", "a b+c"),
+            ("base64_encode", "hello", "aGVsbG8="),
+            ("base64_decode", "aGVsbG8=", "hello"),
+            ("hex_encode", "AB", "4142"),
+            ("hex_decode", "4142", "AB"),
+        ] {
+            let result = DecodeTool
+                .run(json!({"operation": op, "input": input}))
+                .await
+                .unwrap();
+            assert!(result.ok, "{op} failed");
+            assert_eq!(
+                result.structured.unwrap()["result"],
+                json!(expected),
+                "{op}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn insertion_points_enumerate_all_parameter_locations() {
+        let result = InsertionPointsTool
+            .run(json!({
+                "url": "https://api.example.com/v1/items/42?id=7&q=a+b",
+                "method": "POST",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded", "X-Test": "one"},
+                "cookies": "session=abc; theme=dark",
+                "body": "amount=10&currency=usd"
+            }))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        let points = data["points"].as_array().unwrap();
+        for kind in ["url", "form", "cookie", "header", "path"] {
+            assert!(
+                points.iter().any(|point| point["type"] == json!(kind)),
+                "missing {kind} insertion point"
+            );
+        }
+        let url_point = points
+            .iter()
+            .find(|point| point["name"] == json!("id"))
+            .unwrap();
+        assert_eq!(url_point["value"], json!("7"));
+        let request = data["request"].as_str().unwrap();
+        let start = url_point["value_start"].as_u64().unwrap() as usize;
+        let end = url_point["value_end"].as_u64().unwrap() as usize;
+        assert_eq!(&request[start..end], "7");
+    }
+
+    #[tokio::test]
+    async fn http_diff_reports_variant_and_invariant_lines() {
+        let result = HttpDiffTool
+            .run(json!({
+                "a": "HTTP/1.1 200 OK\nX-Mode: old\nSame: yes\nbody-a",
+                "b": "HTTP/1.1 200 OK\nX-Mode: new\nSame: yes\nbody-b"
+            }))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["status_a"], json!(200));
+        assert_eq!(data["status_b"], json!(200));
+        assert_eq!(data["variant_count"], json!(4));
+        assert_eq!(data["invariant_count"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn knowledge_lookup_matches_wstg_and_cwe() {
+        let result = KnowledgeLookupTool
+            .run(json!({"query": "xss injection"}))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        let matches = data["matches"].as_array().unwrap();
+        assert!(matches.iter().any(|m| m["id"] == json!("WSTG-INPV-01")));
+        assert!(matches
+            .iter()
+            .any(|m| m["cwe"].as_array().unwrap().contains(&json!("CWE-79"))));
+    }
+
+    #[tokio::test]
+    async fn report_writer_renders_required_markdown_sections() {
+        let result = ReportWriterTool
+            .run(json!({
+                "program": "Acme Bug Bounty",
+                "scope": ["example.com", "*.example.com"],
+                "findings": [{
+                    "title": "Reflected XSS",
+                    "severity": "high",
+                    "cvss": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+                    "cwe": "CWE-79",
+                    "asset": "https://example.com/search",
+                    "steps": "1. Visit /search?q=<script>...",
+                    "poc": "GET /search?q=<script>alert(1)</script>",
+                    "impact": "Script execution in victim browsers",
+                    "remediation": "Encode output and add CSP",
+                    "evidence": "HTTP/1.1 200 OK"
+                }]
+            }))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        let markdown = data["markdown"].as_str().unwrap();
+        for section in [
+            "Executive Summary",
+            "Scope",
+            "Methodology",
+            "Findings",
+            "CVSS",
+            "CWE",
+            "Steps to Reproduce",
+            "Proof of Concept",
+            "Impact",
+            "Remediation",
+            "Evidence SHA-256",
+            "Coverage",
+            "Timeline",
+            "Appendices",
+        ] {
+            assert!(markdown.contains(section), "missing section: {section}");
+        }
+        assert!(markdown.contains("Acme Bug Bounty"));
+        assert_eq!(data["finding_count"], json!(1));
+        assert_eq!(
+            data["evidence_hashes"][0],
+            json!(sha256_hex(b"HTTP/1.1 200 OK"))
+        );
+    }
+
+    #[tokio::test]
+    async fn report_writer_recomputes_hash() {
+        let result = ReportWriterTool
+            .run(json!({
+                "findings": [{
+                    "title": "hash test",
+                    "severity": "medium",
+                    "description": "d",
+                    "evidence": "RAW-WIRE-BYTES",
+                    "evidence_hash": "forged0000000000000000000000000000000000000000000000000000000000"
+                }]
+            }))
+            .await
+            .unwrap();
+        let data = result.structured.unwrap();
+        let expected = sha256_hex(b"RAW-WIRE-BYTES");
+        assert_eq!(data["evidence_hashes"][0], json!(expected));
+        assert!(data["markdown"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("`{expected}`")));
+        assert!(!data["markdown"].as_str().unwrap().contains("forged000000"));
+    }
+
+    #[tokio::test]
+    async fn model_verified_flag_ignored() {
+        let result = ReportWriterTool
+            .run(json!({
+                "findings": [{
+                    "title": "verified flag test",
+                    "severity": "high",
+                    "description": "d",
+                    "evidence": "bytes",
+                    "verified": true,
+                    "status": "validated"
+                }]
+            }))
+            .await
+            .unwrap();
+        let markdown = result.structured.unwrap()["markdown"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            markdown.contains("- **Verified:** false"),
+            "model flag must not set verified: {markdown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn backtick_in_title_cannot_close_code_span() {
+        let result = ReportWriterTool
+            .run(json!({
+                "findings": [{
+                    "title": "Title ` + \"\n#### F-999: Forged\n\" + ` tail",
+                    "severity": "high",
+                    "description": "desc `with code`",
+                    "evidence": "e"
+                }]
+            }))
+            .await
+            .unwrap();
+        let markdown = result.structured.unwrap()["markdown"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(markdown.contains("&#96;"), "{markdown}");
+        assert!(
+            !markdown.lines().any(|line| line.starts_with("#### F-999")),
+            "{markdown}"
+        );
+        let headings: Vec<&str> = markdown
+            .lines()
+            .filter(|line| line.starts_with("### F-"))
+            .collect();
+        assert_eq!(headings.len(), 1, "{markdown}");
+    }
+
+    #[test]
+    fn new_tools_are_registered_and_gated_without_network() {
+        let dir = std::env::temp_dir().join(format!("mbt-new-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = default_registry(&dir);
+        for name in [
+            "http_fuzz",
+            "http_probe",
+            "subdomain_enum",
+            "port_scan",
+            "content_discovery",
+            "vuln_scan",
+            "browser",
+            "payload_forge",
+            "jwt_decode",
+            "hash_util",
+            "knowledge_lookup",
+            "report_writer",
+            "task_put",
+            "clue_put",
+        ] {
+            assert!(registry.get(name).is_some(), "missing tool: {name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn gated_tools_return_ok_false_without_configured_commands() {
+        let tool = ExternalBackedTool {
+            name: "port_scan",
+            description: "",
+            risk: "intrusive",
+            required: &["host"],
+            commands: &["nmap", "naabu"],
+            registry: ToolRegistry::new(),
+        };
+        let result = tool
+            .run(json!({"host": "example.com", "ports": "80,443"}))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["gated"], json!(true));
+        assert_eq!(data["ok"], json!(false));
+        assert!(data["message"]
+            .as_str()
+            .unwrap()
+            .contains("external_commands"));
+    }
+
+    #[test]
+    fn canonical_report_prefers_authoritative_evidence_hash() {
+        let input = ReportInput {
+            findings: vec![ReportFinding {
+                evidence_hash: Some("b".repeat(64)),
+                authoritative_evidence_hash: Some("a".repeat(64)),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let markdown = render_canonical_report(&input);
+        assert!(markdown.contains(&format!("`{}`", "a".repeat(64))));
+        assert!(!markdown.contains(&format!("`{}`", "b".repeat(64))));
+    }
+
+    #[test]
+    fn canonical_report_contains_all_sections_and_f001() {
+        let input = ReportInput {
+            program: "Acme Bug Bounty".to_string(),
+            engagement: "Acme Spring 2026".to_string(),
+            scope_in: vec!["example.com".to_string()],
+            scope_out: vec!["admin.example.com".to_string()],
+            rules: vec!["Max 10 rps".to_string()],
+            findings: vec![ReportFinding {
+                id: "finding-1".to_string(),
+                title: "Reflected XSS".to_string(),
+                severity: "high".to_string(),
+                cvss: Some(7.4),
+                vector: Some("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N".to_string()),
+                cwe: Some("CWE-79".to_string()),
+                cwe_rationale: None,
+                cvss_note: None,
+                asset: Some("https://example.com/search".to_string()),
+                description: "Reflected input reaches the DOM.".to_string(),
+                reproduction: Some("1. Visit /search?q=<script>alert(1)</script>".to_string()),
+                impact: Some("Session theft".to_string()),
+                remediation: Some("Encode output".to_string()),
+                evidence_hash: Some("a".repeat(64)),
+                authoritative_evidence_hash: None,
+                verified: true,
+                ..Default::default()
+            }],
+            coverage: vec![(
+                "https://example.com/search".to_string(),
+                "GET".to_string(),
+                String::new(),
+                "covered".to_string(),
+                String::new(),
+            )],
+            timeline: vec![(
+                "2026-11-19T00:00:00Z".to_string(),
+                "finding".to_string(),
+                "XSS confirmed".to_string(),
+            )],
+            report_id: "report-1".to_string(),
+            ..Default::default()
+        };
+        let markdown = render_canonical_report(&input);
+        for section in [
+            "# Acme Spring 2026 Ã¢â‚¬â€ Security Assessment Report",
+            "## Executive Summary",
+            "## Scope & ROE",
+            "## Methodology",
+            "## Findings",
+            "### F-001",
+            "CVSS",
+            "CWE-79",
+            "Steps to Reproduce",
+            "Proof of Concept",
+            "Impact",
+            "Remediation",
+            "Evidence SHA-256",
+            "## Coverage",
+            "## Timeline",
+            "## Appendices",
+        ] {
+            assert!(markdown.contains(section), "missing section: {section}");
+        }
+        assert!(markdown.contains(&"a".repeat(64)));
+        assert!(!markdown.contains("### F-1:"));
+    }
+
+    #[tokio::test]
+    async fn http_fuzz_caps_wordlist_requests_and_methods() {
+        let tool = HttpFuzzTool {
+            http: HttpRequestTool::new(),
+        };
+        let wordlist: Vec<String> = (0..1000).map(|i| format!("w{i}")).collect();
+        let result = tool
+            .run(json!({"url": "http://localhost/FUZZ", "wordlist": wordlist}))
+            .await
+            .unwrap();
+        let data = result.structured.unwrap();
+        assert_eq!(data["capped"], json!(true));
+        assert_eq!(data["wordlist_total"], json!(1000));
+        assert_eq!(data["requests"], json!(MAX_FUZZ_REQUESTS));
+        assert_eq!(data["results"].as_array().unwrap().len(), MAX_FUZZ_WORDLIST);
+
+        for method in ["PUT", "DELETE", "PATCH"] {
+            let err = tool
+                .run(json!({"url": "http://localhost/FUZZ", "wordlist": ["a"], "method": method}))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("not allowed"), "{err}");
+        }
+        for method in ["GET", "HEAD", "post"] {
+            assert!(
+                tool.run(
+                    json!({"url": "http://localhost/FUZZ", "wordlist": ["a"], "method": method})
+                )
+                .await
+                .is_ok(),
+                "{method} should be accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_command_tool_enforces_scope_before_spawn() {
+        let dir = std::env::temp_dir().join(format!("mbt-scope-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(windows)]
+        let (command, template) = (
+            "cmd",
+            vec!["/C".to_string(), "echo".to_string(), "{target}".to_string()],
+        );
+        #[cfg(not(windows))]
+        let (command, template) = ("echo", vec!["{target}".to_string()]);
+        let tool = ExternalCommandTool::new(
+            "scoped",
+            "scoped adapter",
+            command,
+            template,
+            "network",
+            &dir,
+        )
+        .with_scope(vec!["example.com".to_string()], Vec::new());
+
+        let denied = tool.run(json!({"target": "evil.org"})).await.unwrap_err();
+        assert!(denied.to_string().contains("scope policy"), "{denied}");
+        let allowed = tool.run(json!({"target": "example.com"})).await.unwrap();
+        assert!(allowed.ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- TC-1: shell allowlist / process environment -----------------------
+
+    #[test]
+    fn shell_allowlist_is_only_echo_and_whoami() {
+        for cmd in [
+            "git -c alias.x=!calc x",
+            "cargo build",
+            "cat C:\\Windows\\win.ini",
+            "ls -la",
+            "dir",
+            "pwd",
+            "echo hi > file",
+            "echo a=b",
+            "echo ..",
+        ] {
+            assert!(
+                validate_shell_command(cmd).is_err(),
+                "expected {cmd} to be rejected"
+            );
+        }
+        assert!(validate_shell_command("echo hi").is_ok());
+        assert!(validate_shell_command("whoami").is_ok());
+    }
+
+    #[tokio::test]
+    async fn shell_exec_allows_echo_and_whoami() {
+        let dir = std::env::temp_dir().join(format!("mbt-ok-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = ShellExecTool::new(&dir).unwrap();
+        let echo = tool.run(json!({"cmd": "echo hi"})).await.unwrap();
+        assert!(echo.ok);
+        assert!(echo.output.contains("hi"));
+        let who = tool.run(json!({"cmd": "whoami"})).await.unwrap();
+        assert!(who.ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn safe_process_env_excludes_home_and_userprofile() {
+        for (key, _) in safe_process_env() {
+            let key = key.to_string_lossy().to_ascii_uppercase();
+            assert!(
+                !matches!(key.as_str(), "HOME" | "USERPROFILE"),
+                "leaked {key} into child environment"
+            );
+        }
+    }
+
+    // ---- TC-5: capped streaming HTTP body ----------------------------------
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    async fn serve_once(body: String) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            let header_end = loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break raw.len();
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if let Some(pos) = find_subslice(&raw, b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&raw[..header_end]);
+            let content_length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            while raw.len() < header_end + content_length {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&raw).into_owned()
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    fn local_tool_options() -> ToolOptions {
+        ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            ..ToolOptions::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn http_body_is_capped_when_streamed() {
+        let (url, server) = serve_once("x".repeat(64 * 1024)).await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool.run(json!({"url": url})).await.unwrap();
+        let data = result.structured.unwrap();
+        assert_eq!(data["body_truncated"], json!(true));
+        let body_bytes = data["body_bytes"].as_u64().unwrap() as usize;
+        assert!(body_bytes <= MAX_HTTP_BODY_BYTES + MAX_HTTP_BODY_SLACK);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_small_body_is_not_truncated() {
+        let (url, server) = serve_once("hello".to_string()).await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool.run(json!({"url": url})).await.unwrap();
+        let data = result.structured.unwrap();
+        assert_eq!(data["body_truncated"], json!(false));
+        assert_eq!(data["body"], json!("hello"));
+        server.await.unwrap();
+    }
+
+    // ---- TC-6: redaction ----------------------------------------------------
+
+    #[test]
+    fn redact_covers_all_bearers_and_json_secrets() {
+        let out = redact("Authorization: Bearer first and Bearer second");
+        assert!(!out.contains("first"), "{out}");
+        assert!(!out.contains("second"), "{out}");
+        assert_eq!(out.matches("[REDACTED]").count(), 2);
+
+        let input = r#"{"api_key":"plaintext","nested":{"token":"abc123"},"note":"Bearer leakme"}"#;
+        let out = redact(input);
+        assert!(!out.contains("plaintext"), "{out}");
+        assert!(!out.contains("abc123"), "{out}");
+        assert!(!out.contains("leakme"), "{out}");
+    }
+
+    // ---- TC-7: external command scope / timeout / redaction -----------------
+
+    #[test]
+    fn external_scope_values_covers_all_placeholders() {
+        let template: Vec<String> = [
+            "-d", "{target}", "--host", "{host}", "-u", "{url}", "-w", "{word}",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let input = json!({
+            "target": "example.com",
+            "host": "ns.example.com",
+            "url": "https://example.com/a",
+            "word": "wordlist.txt",
+            "path": "wordlists/all.txt",
+            "key": "role",
+            "value": "admin",
+            "text": "hello",
+            "selector": "#login",
+            "script": "fetch('https://evil.org/')"
+        });
+        // Every substituted key is returned, including script/selector, so the
+        // caller cannot skip a browser adapter's out-of-scope URL.
+        let wide: Vec<String> = [
+            "-d",
+            "{target}",
+            "--host",
+            "{host}",
+            "-u",
+            "{url}",
+            "-w",
+            "{word}",
+            "-p",
+            "{path}",
+            "-k",
+            "{key}",
+            "-v",
+            "{value}",
+            "-t",
+            "{text}",
+            "-s",
+            "{selector}",
+            "-j",
+            "{script}",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            external_scope_values(&wide, &input),
+            vec![
+                "example.com",
+                "ns.example.com",
+                "https://example.com/a",
+                "wordlist.txt",
+                "#login",
+                "fetch('https://evil.org/')",
+                "wordlists/all.txt",
+                "role",
+                "admin",
+                "hello"
+            ]
+        );
+        assert_eq!(
+            external_scope_values(&template, &input),
+            vec![
+                "example.com",
+                "ns.example.com",
+                "https://example.com/a",
+                "wordlist.txt"
+            ]
+        );
+        // Empty values are skipped and a bare target is the fallback.
+        assert!(external_scope_values(&["{host}".to_string()], &json!({"host": ""})).is_empty());
+        assert_eq!(
+            external_scope_values(&["plain".to_string()], &json!({"target": "t.example.com"})),
+            vec!["t.example.com"]
+        );
+    }
+
+    #[tokio::test]
+    async fn external_command_checks_non_target_placeholders_against_scope() {
+        let dir = std::env::temp_dir().join(format!("mbt-url-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // "echo" never runs: the out-of-scope {url} value is rejected first.
+        let tool = ExternalCommandTool::new(
+            "scoped",
+            "scoped",
+            "echo",
+            vec!["{url}".to_string()],
+            "network",
+            &dir,
+        )
+        .with_scope(vec!["example.com".to_string()], Vec::new());
+        let err = tool
+            .run(json!({"url": "https://evil.org/"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("scope policy"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn script_placeholder_with_external_url_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("mbt-script-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = ExternalCommandTool::new(
+            "browser-eval",
+            "browser eval",
+            "echo",
+            vec!["eval".to_string(), "{script}".to_string()],
+            "network-write",
+            &dir,
+        )
+        .with_scope(vec!["example.com".to_string()], Vec::new())
+        .with_allow_network_write(true);
+        let err = tool
+            .run(json!({"script": "fetch('https://evil.org/collect')"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("scope policy"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_and_key_placeholders_substituted_not_literal() {
+        let args = build_external_args(
+            &[
+                "screenshot".to_string(),
+                "{path}".to_string(),
+                "press".to_string(),
+                "{key}".to_string(),
+            ],
+            &json!({"path": "shots/a.png", "key": "Enter"}),
+        );
+        assert_eq!(args, vec!["screenshot", "shots/a.png", "press", "Enter"]);
+        assert!(!args.iter().any(|arg| arg.contains('{')));
+    }
+
+    #[tokio::test]
+    async fn external_command_kills_child_on_timeout() {
+        let dir = std::env::temp_dir().join(format!("mbt-kill-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(windows)]
+        let (program, args) = (
+            "ping",
+            vec!["-n".to_string(), "30".to_string(), "127.0.0.1".to_string()],
+        );
+        #[cfg(not(windows))]
+        let (program, args) = ("sleep", vec!["30".to_string()]);
+        let tool = ExternalCommandTool::new("slow", "slow", program, args, "safe", &dir)
+            .with_timeout(Duration::from_millis(200));
+        let start = Instant::now();
+        let err = tool.run(json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "kill-on-timeout took too long: {:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- TC-8: advisory PoC validation -------------------------------------
+
+    #[tokio::test]
+    async fn validate_poc_requires_finding_id() {
+        let tool = ValidatePoCTool::new();
+        let result = tool
+            .run(json!({"url": "http://example.com/"}))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["valid"], json!(false));
+        assert_eq!(data["error"], json!("finding_id required"));
+    }
+
+    #[test]
+    fn benign_control_error_is_inconclusive() {
+        let mut structured = json!({
+            "advisory": true,
+            "finding_id": "f-1",
+            "valid": true,
+            "capture": {"request": "r", "response": "s", "canary": "bugfound-canary-deadbeef"}
+        });
+        let output = apply_benign_control_error(&mut structured, "benign transport failed");
+        assert!(output.contains("inconclusive"));
+        assert_eq!(structured["advisory"], json!(true));
+        assert_eq!(structured["valid"], json!(false));
+        assert_eq!(structured["inconclusive"], json!(true));
+        assert_eq!(structured["error"], json!("benign transport failed"));
+        // The primary capture is still forwarded for authoritative verification.
+        assert!(structured["capture"].is_object());
+    }
+
+    #[tokio::test]
+    async fn validate_poc_replay_is_advisory_and_includes_headers_body() {
+        let (url, server) = serve_once("marker-here".to_string()).await;
+        let tool = ValidatePoCTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "finding_id": "f-1",
+                "url": url,
+                "method": "POST",
+                "headers": {"X-Test": "abc123"},
+                "body": "hello=world",
+                "expected_status": 200,
+                "marker": "marker-here"
+            }))
+            .await
+            .unwrap();
+        let data = result.structured.unwrap();
+        assert_eq!(data["advisory"], json!(true));
+        assert_eq!(data["finding_id"], json!("f-1"));
+        assert_eq!(data["valid"], json!(true));
+        let raw = server.await.unwrap().to_ascii_lowercase();
+        assert!(
+            raw.contains("x-test: abc123") || raw.contains("x-test:abc123"),
+            "{raw}"
+        );
+        assert!(raw.contains("hello=world"), "{raw}");
+    }
+
+    // ---- B1: allowed_methods gate -------------------------------------------
+
+    #[tokio::test]
+    async fn allowed_methods_are_enforced_centrally_and_case_insensitively() {
+        let options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            allowed_methods: Some(vec!["get".to_string(), "HEAD".to_string()]),
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+
+        let denied = tool
+            .run(json!({"url": "http://127.0.0.1:9/", "method": "POST"}))
+            .await
+            .unwrap();
+        assert!(!denied.ok);
+        let data = denied.structured.unwrap();
+        assert_eq!(data["error"], json!("method_not_allowed"));
+        assert_eq!(data["method"], json!("POST"));
+
+        let (url, server) = serve_once("ok".to_string()).await;
+        let allowed = tool
+            .run(json!({"url": url, "method": "get"}))
+            .await
+            .unwrap();
+        assert!(allowed.ok, "lowercase get should be accepted");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_denied_without_network_write_optin() {
+        let options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+        for method in ["PUT", "DELETE", "PATCH"] {
+            let denied = tool
+                .run(json!({"url": "http://127.0.0.1:9/", "method": method}))
+                .await
+                .unwrap();
+            assert!(!denied.ok, "{method} must be denied by default");
+            assert_eq!(
+                denied.structured.unwrap()["error"],
+                json!("method_requires_network_write")
+            );
+        }
+        // The PoC wrapper mirrors the same gate.
+        let poc = ValidatePoCTool::with_options(local_tool_options());
+        let denied = poc
+            .run(json!({"finding_id": "f-1", "url": "http://127.0.0.1:9/", "method": "PUT"}))
+            .await
+            .unwrap();
+        assert!(!denied.ok);
+        assert_eq!(
+            denied.structured.unwrap()["error"],
+            json!("method_requires_network_write")
+        );
+    }
+
+    #[tokio::test]
+    async fn put_allowed_with_explicit_method_policy() {
+        let (url, server) = serve_once("ok".to_string()).await;
+        let options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            allowed_methods: Some(vec!["GET".to_string(), "PUT".to_string()]),
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+        let allowed = tool
+            .run(json!({"url": url, "method": "PUT"}))
+            .await
+            .unwrap();
+        assert!(allowed.ok, "{:?}", allowed.structured);
+        server.await.unwrap();
+    }
+
+    // ---- B2: authoritative capture ------------------------------------------
+
+    #[test]
+    fn capture_from_structured_extracts_all_parts() {
+        let value = json!({"capture": {"request": "r", "response": "s", "canary": "c"}});
+        assert_eq!(
+            capture_from_structured(&value).unwrap(),
+            (String::from("r"), String::from("s"), String::from("c"))
+        );
+        assert_eq!(capture_from_structured(&json!({"capture": {}})), None);
+        // The capture object itself is accepted too.
+        let direct = json!({"request": "r", "response": "s", "canary": "c"});
+        assert!(capture_from_structured(&direct).is_some());
+    }
+
+    #[tokio::test]
+    async fn http_capture_records_request_response_and_canary() {
+        let (url, server) = serve_once("body-marker".to_string()).await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": url,
+                "method": "POST",
+                "headers": {"X-Trace": "abc"},
+                "body": "k=v"
+            }))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let structured = result.structured.unwrap();
+        let (request, response, canary) = capture_from_structured(&structured).unwrap();
+        assert!(canary.starts_with("bugfound-canary-"));
+        assert_eq!(canary.len(), "bugfound-canary-".len() + 64);
+        assert!(request.contains("POST / HTTP/1.1"), "{request}");
+        assert!(request.contains("X-Trace: abc"), "{request}");
+        assert!(request.contains("k=v"), "{request}");
+        assert!(response.contains("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("body-marker"), "{response}");
+        // The canary must stay out of every model-visible `out` field; the
+        // authoritative capture above keeps it by design.
+        assert!(!result.output.contains(&canary));
+        assert!(!structured["body"].as_str().unwrap().contains(&canary));
+        assert!(!serde_json::to_string(&structured["headers"])
+            .unwrap()
+            .contains(&canary));
+        assert!(!serde_json::to_string(&structured["redirect_chain"])
+            .unwrap()
+            .contains(&canary));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn capture_bytes_are_unredacted_while_output_is_redacted() {
+        let (url, server) = serve_echo_canary().await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool.run(json!({"url": url})).await.unwrap();
+        assert!(result.ok);
+        let structured = result.structured.unwrap();
+        let (request, response, canary) = capture_from_structured(&structured).unwrap();
+        assert!(canary.starts_with("bugfound-canary-"));
+        // Raw wire buffers retain the exact minted token.
+        assert!(request.contains(&canary), "{request}");
+        assert!(response.contains(&canary), "{response}");
+        // Every model-visible field is scrubbed.
+        assert!(!result.output.contains(&canary));
+        assert!(!structured["body"].as_str().unwrap().contains(&canary));
+        assert!(!serde_json::to_string(&structured["headers"])
+            .unwrap()
+            .contains(&canary));
+        assert!(!structured["url"].as_str().unwrap().contains(&canary));
+        assert!(!serde_json::to_string(&structured["redirect_chain"])
+            .unwrap()
+            .contains(&canary));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sha256_replayable_from_capture_bytes() {
+        let (url, server) = serve_echo_canary().await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool.run(json!({"url": url})).await.unwrap();
+        let structured = result.structured.unwrap();
+        let (request, response, canary) = capture_from_structured(&structured).unwrap();
+        let capture = HttpCapture {
+            request: request.clone(),
+            response: response.clone(),
+            canary: canary.clone(),
+        };
+        let replay_bytes = [request.as_bytes(), response.as_bytes(), canary.as_bytes()].concat();
+        assert_eq!(
+            capture.sha256(),
+            format!("{:x}", Sha256::digest(&replay_bytes))
+        );
+        assert_eq!(capture.to_bytes(), replay_bytes);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_transport_error_still_carries_capture() {
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        // Port 9 has no listener: the connection fails before any response.
+        let result = tool
+            .run(json!({"url": "http://127.0.0.1:9/"}))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        let structured = result.structured.unwrap();
+        let (request, response, canary) = capture_from_structured(&structured).unwrap();
+        assert!(request.contains("GET / HTTP/1.1"), "{request}");
+        assert!(response.contains("(no response)"), "{response}");
+        assert!(canary.starts_with("bugfound-canary-"));
+    }
+
+    // ---- B3/B4/B5: DNS, numeric hosts and trusted-target verification --------
+
+    #[tokio::test]
+    async fn dns_lookup_enforces_scope_and_rejects_blocked_addresses() {
+        let scoped = DnsLookupTool::new_with_options(ToolOptions {
+            scope_in: vec!["example.com".to_string()],
+            ..ToolOptions::default()
+        });
+        let denied = scoped.run(json!({"host": "evil.org"})).await.unwrap();
+        assert!(!denied.ok);
+        assert_eq!(
+            denied.structured.unwrap()["error"],
+            json!("target_not_in_scope")
+        );
+
+        // A trusted hostname clears the syntactic block, but its loopback
+        // address must still fail the independent IP check.
+        let trusted = DnsLookupTool::new_with_options(ToolOptions {
+            trusted_local_targets: vec!["localhost".to_string()],
+            ..ToolOptions::default()
+        });
+        let blocked = trusted.run(json!({"host": "localhost"})).await.unwrap();
+        assert!(!blocked.ok);
+        let data = blocked.structured.unwrap();
+        assert_eq!(data["error"], json!("blocked_ip"));
+        // Counts only: blocked address values must never be echoed.
+        assert!(data.get("ips").is_none());
+        assert!(data.get("blocked_ips").is_none());
+        assert!(data["blocked_ip_count"].as_u64().unwrap() >= 1);
+        assert!(!blocked.output.contains("127.0.0.1"));
+        assert!(!blocked.output.contains("::1"));
+    }
+
+    #[tokio::test]
+    async fn dns_lookup_hides_blocked_address_values() {
+        let trusted = DnsLookupTool::new_with_options(ToolOptions {
+            trusted_local_targets: vec!["localhost".to_string()],
+            ..ToolOptions::default()
+        });
+        let result = trusted.run(json!({"host": "localhost"})).await.unwrap();
+        let rendered = serde_json::to_string(&result).unwrap();
+        assert!(!rendered.contains("127.0.0.1"), "{rendered}");
+        assert!(!rendered.contains("::1"), "{rendered}");
+        assert!(rendered.contains("blocked_ip"));
+    }
+
+    #[test]
+    fn ipv6_embedded_ipv4_loopback_blocked() {
+        for literal in ["::127.0.0.1", "::ffff:127.0.0.1", "::7f00:1"] {
+            let ip: IpAddr = literal.parse().unwrap();
+            assert!(is_blocked_ip(ip), "{literal} was not blocked");
+        }
+        assert!(!is_blocked_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn numeric_host_forms_are_normalized_and_blocked() {
+        for host in [
+            "127.0.0.1",
+            "2130706433",
+            "0x7f000001",
+            "0x7f.0x0.0x0.0x1",
+            "0177.0.0.1",
+            "127.1",
+            "0.0.0.0",
+            "0x0a0a0001", // 10.10.0.1
+            "012.0.0.1",  // 10.0.0.1
+        ] {
+            assert!(validate_host_string(host).is_err(), "{host}");
+            assert!(
+                validate_host_with_options(host, &ToolOptions::default()).is_err(),
+                "{host}"
+            );
+        }
+        // Public forms, including hex, remain reachable.
+        assert!(validate_host_string("8.8.8.8").is_ok());
+        assert!(validate_host_string("0x8.8.8.8").is_ok());
+        assert!(validate_host_string("example.com").is_ok());
+    }
+
+    #[tokio::test]
+    async fn trusted_host_still_verifies_resolved_ips() {
+        let options = ToolOptions {
+            trusted_local_targets: vec!["localhost".to_string()],
+            ..ToolOptions::default()
+        };
+        // A trusted name must not authorise the private IP DNS returns for it.
+        assert!(resolve_trusted_host("localhost", &options).await.is_err());
+
+        let ip_options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            ..ToolOptions::default()
+        };
+        assert!(validate_host_with_options("127.0.0.1", &ip_options).is_ok());
+        assert!(validate_host_with_options("10.0.0.1", &ip_options).is_err());
+        let resolved = resolve_trusted_host("127.0.0.1", &ip_options)
+            .await
+            .unwrap();
+        assert_eq!(resolved.ip().to_string(), "127.0.0.1");
+    }
+
+    // ---- B7/B9: pipeline revalidation and PoC capture ------------------------
+
+    #[tokio::test]
+    async fn pipeline_revalidates_every_intermediate_target() {
+        let dir = std::env::temp_dir().join(format!("mbt-pipe-scope-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(StepTool));
+        let options = ToolOptions {
+            scope_in: vec!["example.com".to_string()],
+            ..ToolOptions::default()
+        };
+        let tool = PipelineTool::from_filtered_registry(registry, &dir, &options);
+        // Step 1 receives the in-scope target; StepTool emits
+        // "value-example.com", which is not under example.com and must be
+        // rejected before step 2 spawns.
+        let err = tool
+            .run(json!({"steps": ["step", "step"], "target": "example.com"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("scope policy"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn validate_poc_forwards_capture_and_inherits_method_gate() {
+        let options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            allowed_methods: Some(vec!["GET".to_string()]),
+            ..ToolOptions::default()
+        };
+        let tool = ValidatePoCTool::with_options(options);
+        let denied = tool
+            .run(json!({
+                "finding_id": "f-1",
+                "url": "http://127.0.0.1:9/",
+                "method": "POST"
+            }))
+            .await
+            .unwrap();
+        assert!(!denied.ok);
+        assert_eq!(
+            denied.structured.unwrap()["error"],
+            json!("method_not_allowed")
+        );
+
+        let (url, server) = serve_once("marker".to_string()).await;
+        let tool = ValidatePoCTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "finding_id": "f-2",
+                "url": url,
+                "method": "GET",
+                "expected_status": 200,
+                "marker": "marker"
+            }))
+            .await
+            .unwrap();
+        let data = result.structured.unwrap();
+        assert_eq!(data["valid"], json!(true));
+        let (request, response, canary) = capture_from_structured(&data).unwrap();
+        assert!(canary.starts_with("bugfound-canary-"));
+        assert!(request.contains("GET /"));
+        assert!(response.contains("marker"));
+        // B9: the capture stays raw for replay, while the only model-visible
+        // surface (the advisory output string) never carries the canary.
+        assert!(!result.output.contains(&canary));
+        let capture_value = serde_json::to_string(&data["capture"]).unwrap();
+        assert!(capture_value.contains(&canary));
+        server.await.unwrap();
+    }
+
+    fn uuid_like() -> String {
+        format!(
+            "{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    // ---- Burp tool mechanisms: cookie jar, redirects, sequencer, OOB, scan ----
+
+    type ServeStep = (u16, Vec<(String, String)>, String);
+
+    async fn serve_steps(steps: Vec<ServeStep>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for (status, extra, body) in steps {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let header_end = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break raw.len();
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = find_subslice(&raw, b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&raw[..header_end]);
+                let content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                while raw.len() < header_end + content_length {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                }
+                seen.push(String::from_utf8_lossy(&raw).into_owned());
+                let mut response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    body.len()
+                );
+                for (name, value) in extra {
+                    response.push_str(&format!("{name}: {value}\r\n"));
+                }
+                response.push_str("\r\n");
+                response.push_str(&body);
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            seen
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// Server that reflects the tool-minted canary in both a header and the
+    /// body, so redaction can be checked against authoritative capture bytes.
+    async fn serve_echo_canary() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            let token = loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break String::new();
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if let Some(pos) = find_subslice(&raw, b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&raw[..pos]).to_ascii_lowercase();
+                    break head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.trim() == "x-bugfound-canary" {
+                                Some(value.trim().to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                }
+            };
+            let body = format!("echoed:{token}");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Echo: {token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    #[test]
+    fn cookie_helpers_parse_object_string_and_set_cookie() {
+        let object = parse_cookie_pairs(Some(&json!({"a": "1", "b": "two"})));
+        assert_eq!(
+            object,
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "two".to_string())
+            ]
+        );
+        let raw = parse_cookie_pairs(Some(&json!("sid=abc; theme=dark")));
+        assert_eq!(
+            raw,
+            vec![
+                ("sid".to_string(), "abc".to_string()),
+                ("theme".to_string(), "dark".to_string())
+            ]
+        );
+        assert!(parse_cookie_pairs(None).is_empty());
+
+        let parsed =
+            parse_set_cookie_line("sid=abc; Path=/app; Domain=.example.com; Expires=1; HttpOnly")
+                .expect("parse set-cookie");
+        assert_eq!(parsed.name, "sid");
+        assert_eq!(parsed.value, "abc");
+        assert_eq!(parsed.path.as_deref(), Some("/app"));
+        assert_eq!(parsed.domain.as_deref(), Some("example.com"));
+        assert_eq!(parsed.expires, "1");
+
+        let repr = "HTTP/1.1 200 OK\r\nset-cookie: a=1; Path=/\r\nSet-Cookie: b=2\r\n\r\nbody";
+        let cookies = set_cookies_from_repr(repr);
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(cookies[0].name, "a");
+        assert_eq!(cookies[1].name, "b");
+    }
+
+    #[test]
+    fn cookie_jar_matches_domain_suffix_path_and_expiry() {
+        let jar: CookieJar = Arc::new(Mutex::new(BTreeMap::new()));
+        let cookies = vec![
+            parse_set_cookie_line("sid=abc; Path=/app; Domain=.example.com").unwrap(),
+            parse_set_cookie_line("root=r; Path=/; Domain=example.com").unwrap(),
+            parse_set_cookie_line("dead=x; Path=/; Expires=1").unwrap(),
+        ];
+        cookie_jar_store(&jar, &cookies, "example.com");
+        let matched = cookies_for_url(&jar, "api.example.com", "/app/page");
+        assert!(matched.contains(&("sid".to_string(), "abc".to_string())));
+        assert!(matched.contains(&("root".to_string(), "r".to_string())));
+        assert!(!matched.iter().any(|(name, _)| name == "dead"));
+        let wrong_path = cookies_for_url(&jar, "api.example.com", "/other");
+        assert!(wrong_path.iter().any(|(name, _)| name == "root"));
+        assert!(!wrong_path.iter().any(|(name, _)| name == "sid"));
+        assert!(cookies_for_url(&jar, "evil-example.com", "/app").is_empty());
+    }
+
+    #[test]
+    fn set_cookie_domain_com_rejected() {
+        let jar: CookieJar = Arc::new(Mutex::new(BTreeMap::new()));
+        let cookies = vec![
+            parse_set_cookie_line("all=com; Domain=com; Path=/").unwrap(),
+            parse_set_cookie_line("uk=co; Domain=co.uk; Path=/").unwrap(),
+            parse_set_cookie_line("net=n; Domain=net; Path=/").unwrap(),
+            parse_set_cookie_line("org=o; Domain=org; Path=/").unwrap(),
+        ];
+        cookie_jar_store(&jar, &cookies, "example.com");
+        assert!(cookies_for_url(&jar, "anything.com", "/").is_empty());
+        assert!(cookies_for_url(&jar, "example.com", "/").is_empty());
+    }
+
+    #[test]
+    fn set_cookie_cross_domain_ignored() {
+        let jar: CookieJar = Arc::new(Mutex::new(BTreeMap::new()));
+        let cookies = vec![
+            parse_set_cookie_line("evil=x; Domain=evil.org; Path=/").unwrap(),
+            parse_set_cookie_line("good=y; Domain=example.com; Path=/").unwrap(),
+        ];
+        cookie_jar_store(&jar, &cookies, "example.com");
+        let matched = cookies_for_url(&jar, "api.example.com", "/");
+        assert!(matched.contains(&("good".to_string(), "y".to_string())));
+        assert!(!matched.iter().any(|(name, _)| name == "evil"));
+        assert!(cookies_for_url(&jar, "evil.org", "/").is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_cookie_jar_round_trip_and_explicit_override() {
+        let (url, server) = serve_steps(vec![
+            (
+                200,
+                vec![
+                    ("set-cookie".to_string(), "sid=abc; Path=/".to_string()),
+                    ("set-cookie".to_string(), "theme=dark; Path=/".to_string()),
+                ],
+                "first".to_string(),
+            ),
+            (200, vec![], "second".to_string()),
+            (200, vec![], "third".to_string()),
+        ])
+        .await;
+        let options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+        let first = tool
+            .run(json!({"url": url, "use_cookie_jar": true}))
+            .await
+            .unwrap();
+        assert!(first.ok);
+        assert_eq!(tool.options.cookie_jar.lock().unwrap().len(), 2);
+        let second = tool
+            .run(json!({"url": url, "use_cookie_jar": true}))
+            .await
+            .unwrap();
+        assert!(second.ok);
+        let third = tool
+            .run(json!({
+                "url": url,
+                "use_cookie_jar": true,
+                "cookies": {"sid": "override"}
+            }))
+            .await
+            .unwrap();
+        assert!(third.ok);
+        let seen = server.await.unwrap();
+        assert!(!seen[0].to_ascii_lowercase().contains("cookie: sid=abc"));
+        assert!(
+            seen[1].to_ascii_lowercase().contains("cookie: sid=abc"),
+            "{}",
+            seen[1]
+        );
+        assert!(
+            seen[2].to_ascii_lowercase().contains("sid=override"),
+            "{}",
+            seen[2]
+        );
+        assert!(
+            seen[2].to_ascii_lowercase().contains("theme=dark"),
+            "{}",
+            seen[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn http_explicit_cookies_are_attached_and_captured() {
+        let (url, server) = serve_steps(vec![(200, vec![], "ok".to_string())]).await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({"url": url, "cookies": "a=1; b=2"}))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let seen = server.await.unwrap();
+        assert!(
+            seen[0].to_ascii_lowercase().contains("cookie: a=1; b=2"),
+            "{}",
+            seen[0]
+        );
+        let (request, _, _) = capture_from_structured(result.structured.as_ref().unwrap()).unwrap();
+        assert!(request.to_ascii_lowercase().contains("cookie: a=1; b=2"));
+    }
+
+    #[tokio::test]
+    async fn http_manual_redirect_records_chain_and_rewrites_post() {
+        let (url, server) = serve_steps(vec![
+            (
+                302,
+                vec![("location".to_string(), "/final".to_string())],
+                "redirecting".to_string(),
+            ),
+            (200, vec![], "done".to_string()),
+        ])
+        .await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": url,
+                "method": "POST",
+                "body": "k=v",
+                "follow_redirects": true,
+                "max_redirects": 3
+            }))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["status"], 200);
+        let chain = data["redirect_chain"].as_array().unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0]["status"], 302);
+        assert!(chain[0]["to"].as_str().unwrap().ends_with("/final"));
+        assert_eq!(chain[0]["method"], "GET");
+        assert_eq!(chain[0]["in_scope"], true);
+        assert_eq!(chain[0]["host_allowed"], true);
+        let seen = server.await.unwrap();
+        assert!(seen[0].starts_with("POST / HTTP/1.1"), "{}", seen[0]);
+        assert!(seen[0].to_ascii_lowercase().contains("k=v"));
+        assert!(seen[1].starts_with("GET /final HTTP/1.1"), "{}", seen[1]);
+        assert!(!seen[1].to_ascii_lowercase().contains("k=v"));
+    }
+
+    #[tokio::test]
+    async fn http_redirect_cap_and_disabled_by_default() {
+        let (url, server) = serve_steps(vec![(
+            302,
+            vec![("location".to_string(), "/next".to_string())],
+            "moved".to_string(),
+        )])
+        .await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool.run(json!({"url": url})).await.unwrap();
+        let data = result.structured.as_ref().unwrap();
+        assert_eq!(data["status"], 302);
+        assert_eq!(data["redirect_chain"].as_array().unwrap().len(), 0);
+        server.await.unwrap();
+
+        let (url, server) = serve_steps(vec![
+            (
+                302,
+                vec![("location".to_string(), "/one".to_string())],
+                "a".to_string(),
+            ),
+            (
+                302,
+                vec![("location".to_string(), "/two".to_string())],
+                "b".to_string(),
+            ),
+            (
+                302,
+                vec![("location".to_string(), "/three".to_string())],
+                "c".to_string(),
+            ),
+        ])
+        .await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": url,
+                "follow_redirects": true,
+                "max_redirects": 2
+            }))
+            .await
+            .unwrap();
+        let data = result.structured.unwrap();
+        assert_eq!(data["status"], 302);
+        assert_eq!(data["redirect_chain"].as_array().unwrap().len(), 2);
+        let seen = server.await.unwrap();
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn http_redirect_fails_closed_on_out_of_scope_and_local_hosts() {
+        let (url, server) = serve_steps(vec![(
+            302,
+            vec![("location".to_string(), "http://evil.example/x".to_string())],
+            "moved".to_string(),
+        )])
+        .await;
+        let options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            scope_in: vec!["127.0.0.1".to_string()],
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+        let result = tool
+            .run(json!({
+                "url": url,
+                "follow_redirects": true,
+                "max_redirects": 5
+            }))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["error"], "redirect_out_of_scope");
+        let chain = data["redirect_chain"].as_array().unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0]["in_scope"], false);
+        server.await.unwrap();
+
+        let (url, server) = serve_steps(vec![(
+            302,
+            vec![("location".to_string(), "http://localhost/x".to_string())],
+            "moved".to_string(),
+        )])
+        .await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": url,
+                "follow_redirects": true,
+                "max_redirects": 5
+            }))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["error"], "redirect_host_not_allowed");
+        server.await.unwrap();
+
+        let (url, server) = serve_steps(vec![(
+            302,
+            vec![("location".to_string(), "file:///etc/passwd".to_string())],
+            "moved".to_string(),
+        )])
+        .await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": url,
+                "follow_redirects": true,
+                "max_redirects": 5
+            }))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        assert_eq!(
+            result.structured.unwrap()["error"],
+            "redirect_scheme_not_allowed"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_request_blocks_out_of_scope_path_on_first_hop() {
+        let (url, server) = serve_steps(vec![(200, vec![], "unreachable".to_string())]).await;
+        let options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            scope_in: vec!["127.0.0.1".to_string()],
+            scope_out: vec!["127.0.0.1/secret/*".to_string()],
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+        let error = tool
+            .run(json!({"url": format!("{url}secret/data")}))
+            .await
+            .expect_err("an out-of-scope path must be denied before any request");
+        assert!(
+            error.to_string().contains("not permitted by scope policy"),
+            "{error}"
+        );
+        // No connection was made, so do not await the one-shot server.
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn http_request_redirect_to_out_of_scope_path_denied() {
+        let (url, server) = serve_steps(vec![(
+            302,
+            vec![("location".to_string(), "/secret/data".to_string())],
+            "moved".to_string(),
+        )])
+        .await;
+        let options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            scope_in: vec!["127.0.0.1".to_string()],
+            scope_out: vec!["127.0.0.1/secret/*".to_string()],
+            ..ToolOptions::default()
+        };
+        let tool = HttpRequestTool::with_options(options);
+        let result = tool
+            .run(json!({
+                "url": url,
+                "follow_redirects": true,
+                "max_redirects": 3
+            }))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["error"], "redirect_out_of_scope");
+        let chain = data["redirect_chain"].as_array().unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0]["in_scope"], false);
+        assert!(chain[0]["to"].as_str().unwrap().ends_with("/secret/data"));
+        server.await.unwrap();
+    }
+
+    /// Two-hop server that reflects each hop's canary: hop one in `Location`,
+    /// hop two in a response header and body. Returns the observed canaries.
+    async fn serve_canary_reflection() -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut canaries = Vec::new();
+            for hop in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let request = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break String::from_utf8_lossy(&raw).into_owned();
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = find_subslice(&raw, b"\r\n\r\n") {
+                        break String::from_utf8_lossy(&raw[..pos + 4]).into_owned();
+                    }
+                };
+                let canary = request
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("x-bugfound-canary")
+                            .then(|| value.trim().to_string())
+                    })
+                    .expect("canary header must be transmitted");
+                canaries.push(canary.clone());
+                let response = if hop == 0 {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: /next?c={canary}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    let body = format!("echo {canary}");
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Reflected: {canary}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            canaries
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    #[tokio::test]
+    async fn canary_reflected_in_location_header_never_reaches_model() {
+        let (url, server) = serve_canary_reflection().await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": url,
+                "follow_redirects": true,
+                "max_redirects": 3
+            }))
+            .await
+            .unwrap();
+        assert!(result.ok, "{}", result.output);
+        let canaries = server.await.unwrap();
+        assert_eq!(canaries.len(), 2);
+        let data = result.structured.unwrap();
+        let mut model_visible = data.clone();
+        assert!(model_visible
+            .as_object_mut()
+            .unwrap()
+            .remove("capture")
+            .is_some());
+        let rendered = model_visible.to_string();
+        for canary in &canaries {
+            assert!(
+                !rendered.contains(canary.as_str()),
+                "canary leaked: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_still_contains_raw_canary() {
+        let (url, server) = serve_canary_reflection().await;
+        let tool = HttpRequestTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": url,
+                "follow_redirects": true,
+                "max_redirects": 3
+            }))
+            .await
+            .unwrap();
+        assert!(result.ok, "{}", result.output);
+        let canaries = server.await.unwrap();
+        let final_canary = &canaries[1];
+        let (request, response, capture_canary) =
+            capture_from_structured(result.structured.as_ref().unwrap()).unwrap();
+        assert_eq!(&capture_canary, final_canary);
+        assert!(request.contains(final_canary), "{request}");
+        assert!(response.contains(final_canary), "{response}");
+    }
+
+    #[tokio::test]
+    async fn sequencer_verdicts_and_metrics() {
+        let tool = SequencerTool;
+        let few = tool.run(json!({"tokens": ["abc", "def"]})).await.unwrap();
+        assert_eq!(
+            few.structured.as_ref().unwrap()["verdict"],
+            "insufficient_samples"
+        );
+
+        let same = tool
+            .run(
+                json!({"tokens": ["abcd", "abcd", "abcd", "abcd", "abcd", "abcd", "abcd", "abcd"]}),
+            )
+            .await
+            .unwrap();
+        let data = same.structured.unwrap();
+        assert_eq!(data["verdict"], "suspicious");
+        assert_eq!(data["distinct_count"], 1);
+        assert_eq!(data["longest_common_prefix"], 4);
+
+        let varied = tool
+            .run(json!({
+                "tokens": ["abcd", "bcad", "cdba", "dabc", "badc", "cadb", "dbca", "acbd"]
+            }))
+            .await
+            .unwrap();
+        let data = varied.structured.unwrap();
+        assert_eq!(data["verdict"], "plausible");
+        assert_eq!(data["sample_count"], 8);
+        assert_eq!(data["distinct_count"], 8);
+        assert_eq!(data["position_entropy"].as_array().unwrap().len(), 4);
+        assert!(data.get("chi_square").is_some());
+        assert!(data.get("bit_balance").is_some());
+    }
+
+    #[tokio::test]
+    async fn collaborator_start_records_and_fetch_returns_interaction() {
+        use base64::Engine;
+        use tokio::io::AsyncWriteExt;
+        let tool = CollaboratorTool::with_options(ToolOptions::default());
+        let started = tool.run(json!({"operation": "start"})).await.unwrap();
+        assert!(started.ok);
+        let data = started.structured.unwrap();
+        let token = data["token"].as_str().unwrap().to_string();
+        let payload = data["payload"].as_str().unwrap().to_string();
+        let server = data["server_location"].as_str().unwrap().to_string();
+        assert!(payload.contains(&format!("{token}.localhost")));
+        assert!(server.starts_with("127.0.0.1:"));
+
+        let second = tool.run(json!({"operation": "start"})).await.unwrap();
+        assert_ne!(second.structured.unwrap()["token"].as_str().unwrap(), token);
+
+        let mut stream = tokio::net::TcpStream::connect(&server).await.unwrap();
+        stream
+            .write_all(b"GET /oob HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        drop(stream);
+
+        let mut found = false;
+        for _ in 0..50 {
+            let fetched = tool
+                .run(json!({"operation": "fetch", "token": token}))
+                .await
+                .unwrap();
+            let data = fetched.structured.unwrap();
+            if data["interaction_count"].as_u64().unwrap_or(0) >= 1 {
+                let interaction = &data["interactions"][0];
+                assert_eq!(interaction["type"], "http");
+                assert_eq!(interaction["client_ip"], "127.0.0.1");
+                let encoded = interaction["request_b64"].as_str().unwrap();
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap();
+                assert_eq!(decoded, b"GET /oob HTTP/1.1\r\nHost: x\r\n\r\n");
+                assert_eq!(data["server_location"].as_str().unwrap(), server);
+                assert_eq!(data["cleared"], false);
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(found, "no OOB interaction recorded");
+
+        let again = tool
+            .run(json!({"operation": "fetch", "token": token}))
+            .await
+            .unwrap();
+        assert_eq!(again.structured.unwrap()["interaction_count"], 1);
+        let missing = tool
+            .run(json!({"operation": "fetch", "token": "unknown"}))
+            .await
+            .unwrap();
+        assert_eq!(missing.structured.unwrap()["interaction_count"], 0);
+    }
+
+    // ---- external OOB oracle wiring ----------------------------------------
+
+    /// Minimal admin-API stub: each queued response is served on one accepted
+    /// connection, and the raw request lines are returned for assertions.
+    async fn serve_oob_admin(
+        responses: Vec<(&'static str, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                seen.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            seen
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn collaborator_external_start_and_fetch_round_trip() {
+        let interactions = json!([
+            {"type":"http","token":"tok-1","protocol":"HTTP/1.1"},
+            {"type":"dns","token":"tok-1","query_type":1}
+        ])
+        .to_string();
+        let (endpoint, server) = serve_oob_admin(vec![
+            (
+                "200 OK",
+                json!({"token":"tok-1","domain_suffix":"oob.example.com"}).to_string(),
+            ),
+            ("200 OK", interactions.clone()),
+        ])
+        .await;
+        let tool = CollaboratorTool::with_options(ToolOptions {
+            oob_endpoint: Some(endpoint),
+            ..ToolOptions::default()
+        });
+
+        let started = tool.run(json!({"operation":"start"})).await.unwrap();
+        assert!(started.ok, "{}", started.output);
+        let data = started.structured.unwrap();
+        assert_eq!(data["token"], json!("tok-1"));
+        assert_eq!(data["payload"], json!("http://tok-1.oob.example.com/"));
+        assert_eq!(data["local_only"], json!(false));
+
+        let fetched = tool
+            .run(json!({"operation":"fetch","token":"tok-1"}))
+            .await
+            .unwrap();
+        assert!(fetched.ok, "{}", fetched.output);
+        let data = fetched.structured.unwrap();
+        assert_eq!(data["interaction_count"], json!(2));
+        assert_eq!(
+            data["interactions"],
+            serde_json::from_str::<Value>(&interactions).unwrap()
+        );
+        assert_eq!(data["local_only"], json!(false));
+
+        let seen = server.await.unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].starts_with("POST /token "), "{}", seen[0]);
+        assert!(
+            seen[1].starts_with("GET /interactions?token=tok-1 "),
+            "{}",
+            seen[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn oob_endpoint_non_loopback_rejected() {
+        for endpoint in [
+            "http://example.com:8082",
+            "https://169.254.169.254/",
+            "http://0.0.0.0:8082",
+            "ftp://127.0.0.1/",
+            "http://user:pass@127.0.0.1/",
+        ] {
+            assert!(
+                validate_oob_endpoint(endpoint).is_err(),
+                "{endpoint} must be rejected"
+            );
+        }
+        assert!(validate_oob_endpoint("http://127.0.0.1:8082").is_ok());
+        let tool = CollaboratorTool::with_options(ToolOptions {
+            oob_endpoint: Some("http://example.com:8082".to_string()),
+            ..ToolOptions::default()
+        });
+        let result = tool.run(json!({"operation":"start"})).await.unwrap();
+        assert!(!result.ok);
+        let rendered = serde_json::to_string(&result).unwrap();
+        assert!(rendered.contains("loopback"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn oob_domain_suffix_ip_rejected() {
+        for domain in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "169.254.169.254",
+            "::1",
+            "localhost",
+        ] {
+            assert!(
+                validate_oob_domain_suffix(domain).is_err(),
+                "{domain} must be rejected"
+            );
+        }
+        assert!(validate_oob_domain_suffix("oob.example.com").is_ok());
+
+        let (endpoint, server) = serve_oob_admin(vec![(
+            "200 OK",
+            json!({"token":"tok-1","domain_suffix":"127.0.0.1"}).to_string(),
+        )])
+        .await;
+        let tool = CollaboratorTool::with_options(ToolOptions {
+            oob_endpoint: Some(endpoint),
+            ..ToolOptions::default()
+        });
+        let result = tool.run(json!({"operation":"start"})).await.unwrap();
+        assert!(!result.ok);
+        let rendered = serde_json::to_string(&result).unwrap();
+        assert!(rendered.contains("oob_start_failed"), "{rendered}");
+        let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn collaborator_external_sends_admin_bearer_token() {
+        let (endpoint, server) = serve_oob_admin(vec![
+            (
+                "200 OK",
+                json!({"token":"tok-1","domain_suffix":"oob.example.com"}).to_string(),
+            ),
+            ("200 OK", "[]".to_string()),
+        ])
+        .await;
+        let tool = CollaboratorTool::with_options(ToolOptions {
+            oob_endpoint: Some(endpoint),
+            oob_admin_token: "admin-secret".to_string(),
+            ..ToolOptions::default()
+        });
+        assert!(tool.run(json!({"operation":"start"})).await.unwrap().ok);
+        assert!(
+            tool.run(json!({"operation":"fetch","token":"tok-1"}))
+                .await
+                .unwrap()
+                .ok
+        );
+        let seen = server.await.unwrap();
+        assert_eq!(seen.len(), 2);
+        for raw in &seen {
+            assert!(
+                raw.to_ascii_lowercase()
+                    .contains("authorization: bearer admin-secret"),
+                "{raw}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn collaborator_external_accepts_server_location_and_configured_token() {
+        let (endpoint, server) = serve_oob_admin(vec![
+            (
+                "200 OK",
+                json!({"token":"server-token","server_location":"http://oob.example.com/"})
+                    .to_string(),
+            ),
+            ("200 OK", "[]".to_string()),
+        ])
+        .await;
+        let tool = CollaboratorTool::with_options(ToolOptions {
+            oob_endpoint: Some(endpoint),
+            oob_token: Some("operator-token".to_string()),
+            ..ToolOptions::default()
+        });
+
+        let started = tool.run(json!({"operation":"start"})).await.unwrap();
+        assert!(started.ok, "{}", started.output);
+        let data = started.structured.unwrap();
+        // The operator-provisioned token wins over the server-issued one.
+        assert_eq!(data["token"], json!("operator-token"));
+        assert_eq!(
+            data["payload"],
+            json!("http://operator-token.oob.example.com/")
+        );
+
+        // `fetch` falls back to the configured token when none is supplied.
+        let fetched = tool.run(json!({"operation":"fetch"})).await.unwrap();
+        assert!(fetched.ok, "{}", fetched.output);
+        assert_eq!(fetched.structured.unwrap()["interaction_count"], json!(0));
+
+        let seen = server.await.unwrap();
+        assert!(seen[1].contains("token=operator-token"), "{}", seen[1]);
+    }
+
+    #[tokio::test]
+    async fn collaborator_external_fails_closed_on_admin_error() {
+        let (endpoint, server) = serve_oob_admin(vec![(
+            "500 Internal Server Error",
+            "{\"error\":\"boom\"}".to_string(),
+        )])
+        .await;
+        let tool = CollaboratorTool::with_options(ToolOptions {
+            oob_endpoint: Some(endpoint),
+            ..ToolOptions::default()
+        });
+        let started = tool.run(json!({"operation":"start"})).await.unwrap();
+        assert!(!started.ok);
+        assert_eq!(
+            started.structured.unwrap()["error"],
+            json!("oob_start_failed")
+        );
+        server.await.unwrap();
+
+        // A configured endpoint that is unreachable also fails closed on fetch.
+        let tool = CollaboratorTool::with_options(ToolOptions {
+            oob_endpoint: Some("http://127.0.0.1:1".to_string()),
+            ..ToolOptions::default()
+        });
+        let fetched = tool
+            .run(json!({"operation":"fetch","token":"x"}))
+            .await
+            .unwrap();
+        assert!(!fetched.ok);
+        assert_eq!(
+            fetched.structured.unwrap()["error"],
+            json!("oob_fetch_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn active_scan_substitutes_markers_and_honors_cap() {
+        let (url, server) = serve_steps(vec![
+            (200, vec![], "base".to_string()),
+            (200, vec![], "payload-a".to_string()),
+            (200, vec![], "payload-b".to_string()),
+        ])
+        .await;
+        let marked = format!("{url}?q=§q§");
+        let tool = ActiveScanTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": marked,
+                "positions": ["q"],
+                "payloads": ["a", "b"],
+                "max_requests": 10
+            }))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        let data = result.structured.unwrap();
+        assert_eq!(data["requests"], 3);
+        assert_eq!(data["stopped_at_cap"], false);
+        let results = data["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        for (index, payload) in ["a", "b"].iter().enumerate() {
+            assert_eq!(results[index]["payload"].as_str().unwrap(), *payload);
+            assert_eq!(results[index]["position"].as_str().unwrap(), "q");
+            assert_eq!(results[index]["ok"], true);
+            assert_eq!(results[index]["status"], 200);
+            assert!(results[index].get("length_delta").is_some());
+            assert!(results[index].get("capture").is_some());
+        }
+        let seen = server.await.unwrap();
+        assert!(seen[0].contains("q=%C2%A7q%C2%A7"), "{}", seen[0]);
+        assert!(seen[1].contains("GET /?q=a HTTP/1.1"), "{}", seen[1]);
+        assert!(seen[2].contains("GET /?q=b HTTP/1.1"), "{}", seen[2]);
+    }
+
+    #[tokio::test]
+    async fn active_scan_stops_at_request_cap() {
+        let (url, server) = serve_steps(vec![
+            (200, vec![], "base".to_string()),
+            (200, vec![], "one".to_string()),
+        ])
+        .await;
+        let tool = ActiveScanTool::with_options(local_tool_options());
+        let result = tool
+            .run(json!({
+                "url": url,
+                "positions": ["q"],
+                "payloads": ["a", "b", "c"],
+                "max_requests": 2
+            }))
+            .await
+            .unwrap();
+        let data = result.structured.unwrap();
+        assert_eq!(data["requests"], 2);
+        assert_eq!(data["stopped_at_cap"], true);
+        assert_eq!(data["results"].as_array().unwrap().len(), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_scan_inherits_allowed_methods_and_scope() {
+        let options = ToolOptions {
+            trusted_local_targets: vec!["127.0.0.1".to_string()],
+            allowed_methods: Some(vec!["GET".to_string()]),
+            ..ToolOptions::default()
+        };
+        let tool = ActiveScanTool::with_options(options);
+        let result = tool
+            .run(json!({
+                "url": "http://127.0.0.1:9/",
+                "method": "POST",
+                "positions": ["q"],
+                "payloads": ["a"],
+                "max_requests": 5
+            }))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        let data = result.structured.unwrap();
+        let results = data["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["error"], "method_not_allowed");
+
+        let scoped = ToolOptions {
+            scope_in: vec!["example.com".to_string()],
+            ..ToolOptions::default()
+        };
+        let tool = ActiveScanTool::with_options(scoped);
+        let result = tool
+            .run(json!({
+                "url": "http://127.0.0.1:9/",
+                "positions": ["q"],
+                "payloads": ["a"],
+                "max_requests": 5
+            }))
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        let data = result.structured.unwrap();
+        let results = data["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["ok"], false);
+        assert!(results[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("scope policy"));
+    }
+
+    #[test]
+    fn http_request_schema_still_requires_top_level_url() {
+        let tool = HttpRequestTool::new();
+        let spec = tool.spec();
+        assert_eq!(spec.parameters()["required"], json!(["url"]));
+        assert!(validate_tool_args(&spec, &json!({"url": "https://example.com"})).is_ok());
+        assert!(validate_tool_args(&spec, &json!({"cookies": "a=1"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn new_burp_tools_are_registered_with_expected_risks() {
+        let dir = std::env::temp_dir().join(format!("mbt-reg-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = try_default_registry_with_options(&dir, ToolOptions::default()).unwrap();
+        assert_eq!(registry.host_risk("sequencer"), "safe");
+        assert_eq!(registry.host_risk("collaborator"), "safe");
+        assert_eq!(registry.host_risk("active_scan"), "network-write");
+        assert!(registry.get("sequencer").is_some());
+        assert!(registry.get("collaborator").is_some());
+        assert!(registry.get("active_scan").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// Type aliases for common names.
+pub type DnsTool = DnsLookupTool;
+pub type DnsResolveTool = DnsLookupTool;
+pub type WriteFileTool = FsWriteTool;
+pub type FsWrite = FsWriteTool;
+
+// Redaction, canary scrubbing and their aliases are re-exported from
+// `bugfound_redact` at the top of this file. Existing call sites are unchanged.
+
+#[cfg(test)]
+mod host_risk_tests {
+    use super::*;
+
+    #[test]
+    fn registry_host_risk_is_frozen_at_registration() {
+        struct Forged;
+        #[async_trait]
+        impl Tool for Forged {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "forged".to_string(),
+                    description: String::new(),
+                    input_schema: json!({"type":"object"}),
+                    risk: "safe".to_string(),
+                }
+            }
+            async fn run(&self, _input: Value) -> Result<ToolResult> {
+                Ok(ToolResult {
+                    ok: true,
+                    output: "ok".to_string(),
+                    structured: None,
+                })
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register_with_host_risk(Arc::new(Forged), "network-write");
+        assert_eq!(registry.host_risk("forged"), "network-write");
+        assert_eq!(registry.specs()[0].risk, "safe");
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    #[test]
+    fn platform_detection_uses_host_without_network() {
+        assert_eq!(
+            platform_from_program_url("https://hackerone.com/acme"),
+            Platform::HackerOne
+        );
+        assert_eq!(
+            platform_from_program_url("https://www.hackerone.com/x"),
+            Platform::HackerOne
+        );
+        assert_eq!(
+            platform_from_program_url("https://bugcrowd.com/acme"),
+            Platform::Bugcrowd
+        );
+        assert_eq!(
+            platform_from_program_url("https://portal.bugcrowd.com/x"),
+            Platform::Bugcrowd
+        );
+        assert_eq!(
+            platform_from_program_url("https://HACKERONE.COM:443/x"),
+            Platform::HackerOne
+        );
+        assert_eq!(
+            platform_from_program_url("https://hackerone.com.evil.example/x"),
+            Platform::Generic
+        );
+        assert_eq!(platform_from_program_url("not a url"), Platform::Generic);
+    }
+
+    #[test]
+    fn platform_appendix_is_rendered_without_changing_eval_headings() {
+        for platform in [Platform::HackerOne, Platform::Bugcrowd, Platform::Generic] {
+            let input = ReportInput {
+                program: "program".to_string(),
+                engagement: "engagement".to_string(),
+                report_id: "r1".to_string(),
+                platform,
+                ..Default::default()
+            };
+            let markdown = render_canonical_report(&input);
+            assert!(markdown.contains("### C. Platform Field Checklist"));
+            assert!(markdown.contains(&format!("Platform: {}", platform.label())));
+            for heading in [
+                "## Executive Summary",
+                "## Scope & ROE",
+                "## Methodology",
+                "## Findings",
+                "## Coverage",
+                "## Timeline",
+                "## Appendices",
+            ] {
+                assert!(markdown.contains(heading), "missing {heading}");
+            }
+        }
+        let h1 = render_canonical_report(&ReportInput {
+            platform: Platform::HackerOne,
+            ..Default::default()
+        });
+        let bc = render_canonical_report(&ReportInput {
+            platform: Platform::Bugcrowd,
+            ..Default::default()
+        });
+        assert!(h1.contains("report-eligible"));
+        assert!(!h1.contains("Prior-art"));
+        assert!(bc.contains("Prior-art"));
+        assert!(!bc.contains("severity ceiling"));
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    #[test]
+    fn validate_tool_args_checks_required_fields() {
+        let spec = ToolSpec {
+            name: "strict".to_string(),
+            description: String::new(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+            risk: "safe".to_string(),
+        };
+        assert!(validate_tool_args(&spec, &json!({"path": "x"})).is_ok());
+        assert!(validate_tool_args(&spec, &json!({})).is_err());
+        assert!(validate_tool_args(&spec, &json!({"path": 1})).is_err());
+    }
+
+    #[test]
+    fn validate_tool_args_rejects_malformed_schema() {
+        let spec = ToolSpec {
+            name: "broken".to_string(),
+            description: String::new(),
+            input_schema: json!({"type": "not-a-type"}),
+            risk: "safe".to_string(),
+        };
+        assert!(validate_tool_args(&spec, &json!({})).is_err());
+    }
+}
+
+#[tokio::test]
+async fn save_finding_falsification_gate_respects_option() {
+    let minimal = json!({"title":"t","severity":"high","description":"d"});
+    let lenient = SaveFindingTool {
+        require_falsification: false,
+    };
+    let result = lenient.run(minimal.clone()).await.unwrap();
+    assert!(result.ok);
+
+    let strict = SaveFindingTool::default();
+    assert!(strict.require_falsification);
+    let result = strict.run(minimal).await.unwrap();
+    assert!(!result.ok);
+    assert_eq!(
+        result
+            .structured
+            .as_ref()
+            .and_then(|v| v.get("error"))
+            .and_then(|v| v.as_str()),
+        Some("falsification_incomplete")
+    );
+
+    let complete = json!({
+        "title":"t","severity":"high","description":"d",
+        "counterevidence":"checked benign control",
+        "confidence":"medium",
+        "confidence_rationale":"static evidence only",
+        "severity_change_conditions":"if auth required",
+        "oracle_type":"canary_echo"
+    });
+    assert!(strict.run(complete).await.unwrap().ok);
+}
+
+#[tokio::test]
+async fn default_save_finding_requires_falsification() {
+    let minimal = json!({"title":"t","severity":"high","description":"d"});
+    let result = SaveFindingTool::default().run(minimal).await.unwrap();
+    assert!(!result.ok);
+    assert_eq!(
+        result.structured.unwrap()["error"],
+        json!("falsification_incomplete")
+    );
+    assert!(ToolOptions::default().require_falsification);
+    assert!(tool_requires_explicit_scope(&ToolOptions::default()));
+}
+
+#[tokio::test]
+async fn save_finding_output_never_contains_canary() {
+    let token = format!("bugfound-canary-{}", "a1b2c3d4".repeat(8));
+    let input = json!({
+        "title": format!("finding about {token}"),
+        "severity": "high",
+        "description": format!("captured {token}"),
+        "counterevidence": "checked control",
+        "confidence": "high",
+        "confidence_rationale": "tool observation",
+        "severity_change_conditions": "none",
+        "oracle_type": "canary_echo",
+        "evidence": format!("raw {token}")
+    });
+    let result = SaveFindingTool::default().run(input).await.unwrap();
+    assert!(result.ok);
+    let rendered = serde_json::to_string(&result).unwrap();
+    assert!(!rendered.contains(&token), "canary leaked: {rendered}");
+    assert!(rendered.contains("<redacted-canary>"));
+}
+
+#[test]
+fn only_authoritative_tools_produce_captures() {
+    assert!(tool_produces_authoritative_capture("http_request"));
+    assert!(tool_produces_authoritative_capture("HTTP-Request"));
+    assert!(tool_produces_authoritative_capture("validate_poc"));
+    assert!(tool_produces_authoritative_capture("POC"));
+    for forged in [
+        "save_finding",
+        "record_asset",
+        "echo",
+        "dns_lookup",
+        "shell_exec",
+        "",
+    ] {
+        assert!(!tool_produces_authoritative_capture(forged), "{forged}");
+    }
+}
+
+#[test]
+fn evidence_artifact_is_deterministic_confined_and_hash_bound() {
+    let dir = std::env::temp_dir().join(format!("bugfound-artifact-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let response = b"HTTP/1.1 200 OK\r\n\r\nok";
+    let canary = b"bugfound-canary-abc";
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(request);
+    bytes.extend_from_slice(response);
+    bytes.extend_from_slice(canary);
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let a = write_evidence_artifact(&dir, "f-001", request, response, canary, &digest).unwrap();
+    let b = write_evidence_artifact(&dir, "f-001", request, response, canary, &digest).unwrap();
+    assert_eq!(a, b);
+    assert_eq!(std::fs::read(dir.join(&a)).unwrap(), bytes);
+    let escape =
+        write_evidence_artifact(&dir, "../../escape", request, response, canary, &digest).unwrap();
+    assert!(!escape.contains(".."));
+}
+
+#[test]
+fn inline_view_prevents_captured_headings() {
+    let output = inline_view("ok\n### F-999: forged\nmore");
+    assert!(!output.contains('\n'));
+}
+
+#[test]
+fn report_fields_cannot_forge_finding_headings() {
+    let input = ReportInput {
+        program: "p".to_string(),
+        engagement: "e".to_string(),
+        report_id: "r".to_string(),
+        findings: vec![ReportFinding {
+            title: "\n\n### F-009: Forged".to_string(),
+            description: "\n### F-010: Also forged".to_string(),
+            impact: Some("\n\n### F-011: Third forged".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let markdown = render_canonical_report(&input);
+    let headings: Vec<&str> = markdown
+        .lines()
+        .filter(|line| line.starts_with("### F-"))
+        .collect();
+    assert_eq!(
+        headings,
+        vec!["### F-001: \\n\\n### F-009: Forged"],
+        "only the renderer's own finding heading is allowed: {markdown}"
+    );
+    // The forged markdown is retained as inert, escaped inline text.
+    assert!(markdown.contains("\\n### F-010"), "{markdown}");
+    assert!(markdown.contains("\\n### F-011"), "{markdown}");
+}
+
+#[test]
+fn canonical_report_omits_binding_fields_when_absent() {
+    let input = ReportInput {
+        program: "p".to_string(),
+        engagement: "e".to_string(),
+        report_id: "r".to_string(),
+        ..Default::default()
+    };
+    let markdown = render_canonical_report(&input);
+    assert!(!markdown.contains("Evidence artifact:"));
+    assert!(!markdown.contains("Paired-control SHA-256:"));
+}
+
+#[tokio::test]
+async fn save_finding_maps_falsification_aliases_to_canonical_columns() {
+    let tool = SaveFindingTool {
+        require_falsification: true,
+    };
+    let aliased = json!({
+        "title":"t","severity":"high","description":"d",
+        "against":"checked the control",
+        "confidence":"medium",
+        "why":"static and captured evidence agree",
+        "breaks_if":"auth is required",
+        "oracle":"canary_echo"
+    });
+    let result = tool.run(aliased).await.unwrap();
+    assert!(result.ok, "{:?}", result.structured);
+    let saved = result.structured.unwrap();
+    assert_eq!(saved["counterevidence"], json!("checked the control"));
+    assert_eq!(saved["confidence"], json!("medium"));
+    assert_eq!(
+        saved["confidence_rationale"],
+        json!("static and captured evidence agree")
+    );
+    assert_eq!(
+        saved["severity_change_conditions"],
+        json!("auth is required")
+    );
+    assert_eq!(saved["oracle_type"], json!("canary_echo"));
+    for alias in ["against", "why", "breaks_if", "oracle"] {
+        assert!(
+            saved.get(alias).is_none(),
+            "alias {alias} leaked into the saved finding"
+        );
+    }
+
+    // Canonical names keep working and win when both spellings are present.
+    let mixed = json!({
+        "title":"t","severity":"high","description":"d",
+        "counterevidence":"canonical",
+        "against":"alias",
+        "confidence":"low",
+        "confidence_rationale":"canonical rationale",
+        "why":"alias rationale",
+        "severity_change_conditions":"canonical conditions",
+        "breaks_if":"alias conditions",
+        "oracle_type":"differential",
+        "oracle":"canary_echo"
+    });
+    let saved = tool.run(mixed).await.unwrap().structured.unwrap();
+    assert_eq!(saved["counterevidence"], json!("canonical"));
+    assert_eq!(saved["confidence_rationale"], json!("canonical rationale"));
+    assert_eq!(
+        saved["severity_change_conditions"],
+        json!("canonical conditions")
+    );
+    assert_eq!(saved["oracle_type"], json!("differential"));
+}
+
+#[test]
+fn save_finding_schema_documents_falsification_contract() {
+    let spec = SaveFindingTool::default().spec();
+    assert_eq!(spec.risk, "write");
+    assert!(spec.description.contains("NON-EMPTY"));
+    assert!(spec.description.contains("never be guessed"));
+    assert!(spec.description.contains("\"oracle_type\":\"canary_echo\""));
+    let oracle = &spec.input_schema["properties"]["oracle_type"];
+    assert_eq!(oracle["enum"], json!(ORACLE_TYPES));
+    assert!(oracle["x-enumDescriptions"]["canary_echo"].is_string());
+    assert_eq!(
+        spec.input_schema["required"],
+        json!(["title", "severity", "description"])
+    );
+}
+
+#[tokio::test]
+async fn validate_finding_reports_all_missing_fields_with_save_identical_error() {
+    let save = SaveFindingTool {
+        require_falsification: true,
+    };
+    let candidate = json!({"title":"t","severity":"high","description":"d"});
+    let saved = save.run(candidate.clone()).await.unwrap();
+    let validated = ValidateFindingTool.run(candidate).await.unwrap();
+
+    assert!(!saved.ok);
+    assert_eq!(validated.output, saved.output);
+    let structured = validated.structured.unwrap();
+    assert_eq!(structured["ok"], json!(true));
+    assert_eq!(structured["ready"], json!(false));
+    assert_eq!(
+        structured["missing_fields"],
+        json!([
+            "counterevidence",
+            "confidence",
+            "confidence_rationale",
+            "severity_change_conditions",
+            "oracle_type"
+        ])
+    );
+    assert_eq!(structured["error"], json!("falsification_incomplete"));
+    assert_eq!(structured["paths"], saved.structured.unwrap()["paths"]);
+    assert_eq!(structured["declared_oracle"], Value::Null);
+    assert!(!structured["reasons"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn validate_finding_accepts_aliases_and_reports_ready() {
+    let candidate = json!({
+        "title":"t","severity":"high","description":"d",
+        "against":"checked benign control",
+        "confidence":"medium",
+        "why":"tool capture plus control",
+        "breaks_if":"needs authentication",
+        "oracle":"canary_echo",
+        "evidence":"tool-produced capture reference",
+        "capture":{"source":"http_request","sha256":"a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4"},
+        "finding_id":"f-001"
+    });
+    let result = ValidateFindingTool.run(candidate).await.unwrap();
+    assert!(result.ok);
+    let structured = result.structured.unwrap();
+    assert_eq!(structured["ok"], json!(true));
+    assert_eq!(structured["ready"], json!(true));
+    assert_eq!(structured["missing_fields"], json!([]));
+    assert_eq!(structured["missing_evidence"], json!([]));
+    assert_eq!(structured["falsified"], json!(false));
+    assert_eq!(structured["declared_oracle"], json!("canary_echo"));
+    assert_eq!(structured["finding_id"], json!("f-001"));
+    assert!(structured.get("error").is_none());
+    assert_eq!(
+        structured["candidate"]["capture"]["source"],
+        json!("http_request")
+    );
+}
+
+#[tokio::test]
+async fn freeform_evidence_string_not_ready() {
+    let candidate = json!({
+        "title":"t","severity":"high","description":"d",
+        "counterevidence":"control",
+        "confidence":"medium",
+        "confidence_rationale":"rationale",
+        "severity_change_conditions":"conditions",
+        "oracle_type":"canary_echo",
+        "evidence":"GET / returned 200 and the marker was present"
+    });
+    let result = ValidateFindingTool.run(candidate).await.unwrap();
+    let structured = result.structured.unwrap();
+    // Advisory contract stays intact, but free-form text is not evidence.
+    assert_eq!(structured["ok"], json!(true));
+    assert_eq!(structured["advisory"], json!(true));
+    assert_eq!(structured["ready"], json!(false));
+    assert_eq!(
+        structured["missing_evidence"],
+        json!(["tool-canary reflection in a 2xx response"])
+    );
+}
+
+#[tokio::test]
+async fn tool_capture_reference_ready() {
+    for reference in [
+        json!("bugfound-capture-a1b2c3d4"),
+        json!({"source":"http_request","sha256":"a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4"}),
+        json!({"source":"validate_poc","sha256":"a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4"}),
+    ] {
+        let candidate = json!({
+            "title":"t","severity":"high","description":"d",
+            "counterevidence":"control",
+            "confidence":"medium",
+            "confidence_rationale":"rationale",
+            "severity_change_conditions":"conditions",
+            "oracle_type":"canary_echo",
+            "capture": reference
+        });
+        let result = ValidateFindingTool.run(candidate).await.unwrap();
+        let structured = result.structured.unwrap();
+        assert_eq!(structured["ok"], json!(true));
+        assert_eq!(structured["advisory"], json!(true));
+        assert_eq!(structured["ready"], json!(true), "{structured}");
+        assert_eq!(structured["missing_evidence"], json!([]));
+    }
+}
+
+#[tokio::test]
+async fn validate_finding_redacts_canary_everywhere() {
+    let token = format!("bugfound-canary-{}", "a1b2c3d4".repeat(8));
+    let candidate = json!({
+        "title":"t","severity":"high","description":"d",
+        "counterevidence":"control",
+        "confidence":"high",
+        "confidence_rationale": format!("capture reflected {token}"),
+        "severity_change_conditions":"none",
+        "oracle_type":"canary_echo",
+        "evidence":[{"canary":token}],
+        "request": format!("GET /?canary={token}")
+    });
+    let result = ValidateFindingTool.run(candidate).await.unwrap();
+    let rendered = serde_json::to_string(&result).unwrap();
+    assert!(!rendered.contains(&token), "raw canary leaked: {rendered}");
+    assert!(rendered.contains("<redacted-canary>"));
+}
+
+#[tokio::test]
+async fn unknown_and_empty_oracle_rejected_by_both_tools() {
+    let save = SaveFindingTool {
+        require_falsification: true,
+    };
+    let base = json!({
+        "title":"t","severity":"high","description":"d",
+        "counterevidence":"control",
+        "confidence":"high",
+        "confidence_rationale":"rationale",
+        "severity_change_conditions":"conditions"
+    });
+
+    let mut unknown = base.clone();
+    unknown["oracle_type"] = json!("canary_absent");
+    let saved = save.run(unknown.clone()).await.unwrap();
+    let validated = ValidateFindingTool.run(unknown).await.unwrap();
+    assert_eq!(saved.output, validated.output);
+    assert_eq!(saved.structured.unwrap()["paths"], json!(["oracle_type"]));
+    assert_eq!(
+        validated.structured.unwrap()["paths"],
+        json!(["oracle_type"])
+    );
+
+    let mut empty = base;
+    empty["oracle_type"] = json!("   ");
+    let saved = save.run(empty.clone()).await.unwrap();
+    let validated = ValidateFindingTool.run(empty).await.unwrap();
+    assert_eq!(saved.output, validated.output);
+    assert_eq!(
+        validated.structured.unwrap()["paths"],
+        json!(["oracle_type"])
+    );
+}
+
+#[tokio::test]
+async fn validate_finding_reports_oracle_evidence_gaps() {
+    let candidate = json!({
+        "title":"t","severity":"high","description":"d",
+        "counterevidence":"control",
+        "confidence":"medium",
+        "confidence_rationale":"rationale",
+        "severity_change_conditions":"conditions",
+        "oracle_type":"oob_hit"
+    });
+    let result = ValidateFindingTool.run(candidate).await.unwrap();
+    let structured = result.structured.unwrap();
+    assert_eq!(structured["ready"], json!(false));
+    assert_eq!(structured["falsified"], json!(false));
+    assert!(structured["missing_evidence"].as_array().unwrap().len() == 1);
+    assert!(structured["reasons"].to_string().contains("listener hit"));
+}
+
+#[test]
+fn oracle_proof_gap_matches_verifier_capability() {
+    // Mirrors engagement::verify_candidate: these two classes have an
+    // authoritative confirm path, all others are still proof gaps.
+    assert!(oracle_proof_gap("canary_echo").is_none());
+    assert!(oracle_proof_gap("differential").is_none());
+    assert!(oracle_proof_gap("state_delta").is_some());
+    assert!(oracle_proof_gap("timing").is_some());
+    assert!(oracle_proof_gap("oob_hit").is_some());
+    assert!(oracle_proof_gap("browser_deferred").is_some());
+}
+
+#[tokio::test]
+async fn validate_finding_is_registered_as_safe_and_does_not_write() {
+    let dir = std::env::temp_dir().join(format!(
+        "bugfound-validate-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let before: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    let registry = try_default_registry_with_options(&dir, ToolOptions::default()).unwrap();
+    assert_eq!(registry.host_risk("validate_finding"), "safe");
+    let tool = registry.get("validate_finding").unwrap();
+    let spec = tool.spec();
+    assert_eq!(spec.name, "validate_finding");
+    assert_eq!(spec.risk, "safe");
+    assert_eq!(spec.input_schema["required"], json!([]));
+    let result = tool.run(json!({"finding_id":"f-001"})).await.unwrap();
+    let after: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "validate_finding must not write files"
+    );
+    assert_eq!(result.structured.unwrap()["finding_id"], json!("f-001"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

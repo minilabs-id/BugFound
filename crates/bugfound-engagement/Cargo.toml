@@ -1,0 +1,29 @@
+[package]
+name = "bugfound-engagement"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+async-trait.workspace = true
+url.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+base64.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+bugfound-core = { path = "../bugfound-core" }
+bugfound-kernel-traits = { path = "../bugfound-kernel-traits" }
+bugfound-llm = { path = "../bugfound-llm" }
+bugfound-policy = { path = "../bugfound-policy" }
+bugfound-store = { path = "../bugfound-store" }
+bugfound-tools = { path = "../bugfound-tools" }
+
+[dev-dependencies]
+rusqlite.workspace = true

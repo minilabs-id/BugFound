@@ -1,0 +1,99 @@
+name: desktop-ui
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  frontend:
+    name: frontend (typecheck, test, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - run: pnpm --dir frontend install --frozen-lockfile
+      - run: pnpm --dir frontend typecheck
+      - name: Vitest frontend tests
+        run: pnpm --dir frontend test
+      - run: pnpm --dir frontend build
+
+  core:
+    name: desktop-core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: cargo check -p bugfound-desktop-core
+      - run: cargo test -p bugfound-desktop-core
+      # Real gate: both lab scripts exit non-zero on a crashed CLI (audit F1).
+      # Do not add continue-on-error here; only the live lab below is informational.
+      - name: Authorised fixture lab (3 adaptive runs) + adversarial lab
+        if: runner.os == 'Linux'
+        run: |
+          cargo build -p bugfound-cli
+          python eval/agent_lab.py --runs 3 --adaptive
+          python eval/adversarial_lab.py
+      - name: Assert lab metrics are green
+        if: runner.os == 'Linux'
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          agent = json.loads(Path("eval/work/agent-lab/metrics.json").read_text(encoding="utf-8"))
+          adversarial = json.loads(Path("eval/work/adversarial/metrics.json").read_text(encoding="utf-8"))
+
+          bad_runs = [run for run in agent["fixture"]["runs"] if run["exit_code"] != 0]
+          bad_cases = [case for case in adversarial["cases"] if case["passed"] is not True]
+          if bad_runs or bad_cases:
+              print("non-green lab metrics:", {"runs": bad_runs, "cases": bad_cases})
+              raise SystemExit(1)
+          PY
+      - name: Live loopback lab (informational, never a merge gate)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: python eval/agent_lab.py --runs 3 --adaptive --live
+
+  eval-harness:
+    name: agent evaluation harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Self-test scorer and evaluator
+        run: |
+          python -m py_compile eval/score.py eval/export_trace.py eval/agent_eval.py
+          python eval/score.py --self-test
+          python eval/agent_eval.py --self-test
+
+  shell:
+    name: tauri shell (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p bugfound-app

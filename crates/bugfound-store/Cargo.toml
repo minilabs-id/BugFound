@@ -1,0 +1,18 @@
+[package]
+name = "bugfound-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+bugfound-tools = { path = "../bugfound-tools" }
+bugfound-redact.workspace = true

@@ -1,0 +1,94 @@
+# BugFound example config (universal agent core MVP)
+# Copy to bugfound.toml and adjust.
+
+[llm]
+# OpenAI-compatible endpoint. base_url may include or omit /v1
+base_url = "https://api.openai.com"
+# api_key can be a literal or env:VAR_NAME
+api_key = "env:OPENAI_API_KEY"
+# Empty means runtime discovery via GET /v1/models (with first model as fallback)
+default_model = ""
+# Extra model ids to try when the primary reports ModelNotFound.
+fallback_models = []
+timeout_ms = 60000
+# Optional cost tracking (USD per 1K tokens)
+cost_per_1k_input = 0.0
+cost_per_1k_output = 0.0
+
+[agent]
+# "ask" = require approval for risky tools, "full_auto" = allow within policy
+# full_auto is the default for unattended runs; pick ask when you want prompts.
+mode = "full_auto"
+max_steps = 20
+# Optional system prompt injected at the start of every session
+system_prompt = "You are a careful bug bounty agent. Stay within engagement scope."
+# Optional guardrails. 0 = unlimited.
+max_tool_calls = 100
+max_network_calls = 50
+requests_per_minute = 60
+# Safe/read-only tools that may be auto-approved without a human prompt
+auto_approve_tools = ["echo"]
+# Hard cap on estimated tokens per session (0 = unlimited)
+max_estimated_tokens = 0
+# V3: let the model propose the next investigation step from the versioned
+# technique catalog. Config-only, off by default. Every proposal is still
+# filtered by the deterministic harness (catalog membership, scope, ROE, budget).
+llm_planning = false
+# Bypass per-tool approval for every tool (engagement runs only). Keep false.
+auto_approve_all = false
+
+# Policy: tool/target allow/deny lists and budget aliases.
+# Empty lists mean "no restriction"; a deny entry takes precedence over an allow entry.
+# Budgets are aliases for the [agent] limits: a non-zero value here wins, 0 = unlimited.
+[policy]
+allowed_tools = []
+denied_tools = []
+allowed_targets = []
+denied_targets = []
+max_steps_budget = 0
+max_tool_calls_budget = 0
+max_network_calls_budget = 0
+requests_per_minute_budget = 0
+max_tokens_budget = 0
+
+[storage]
+path = ".bugfound/bugfound.db"
+# Retention window in days for audit/trace events, applied at startup.
+# 0 = disabled (default, no automatic deletion); max 36500. Pruning is
+# chain-guarded: a session with a broken event chain is never pruned.
+# retention_days = 30
+
+# Bug bounty engagement scope (optional but recommended for network tools).
+# If in_scope is non-empty, network targets must match at least one entry.
+# out_of_scope denies matching targets. Patterns: host, *.domain, URL, or CIDR-like prefix.
+[scope]
+engagement = ""
+in_scope = []
+out_of_scope = []
+notes = "Program rules / contacts"
+
+# Network egress. Proxy is OFF by default because it bypasses DNS pinning.
+# Enable only for an explicit trusted proxy (e.g. Burp) in a controlled setup.
+[network]
+allow_proxy = false
+# proxy_url = "http://127.0.0.1:8080"
+# Local lab/staging targets are blocked by default; opt in explicitly.
+trusted_local_targets = []
+# Risk opt-ins. Keep false unless the engagement brief explicitly allows them.
+allow_network_write = false
+allow_intrusive = false
+
+# External adapters / browser tools. Commands are opt-in by being present.
+# Browser adapters are still gated by scope, ROE, and network-write policy.
+[external_tools]
+enabled = true
+auto_detect = true
+
+[external_tools.commands]
+# Chrome DevTools MCP (recommended, CDP-based, no extension):
+#   npm install eval/fixtures/chrome-mcp
+chrome_mcp = "node eval/fixtures/chrome-mcp/chrome-mcp-wrapper.js {action} {url} {selector}"
+# Playwright fallback (cross-browser automation):
+#   npm install eval/fixtures/browser && npx playwright install chromium
+playwright = "node eval/fixtures/browser/playwright-wrapper.js {action} {url} {selector}"
+# commands = { nuclei = "/usr/local/bin/nuclei", nmap = "/usr/bin/nmap" }

@@ -12,6 +12,8 @@ Usage:
     python eval/score.py --dir eval/results \
         --manifest eval/golden.example.json \
         --replay eval/results/<id>/replay.jsonl [--json] [--strict]
+    python eval/score.py report.md --finding-map eval/golden.example.json \
+        --manifest manifest.json --replay replay.jsonl [--json] [--strict]
     python eval/score.py --replay replay.jsonl  (replay-only; no report needed)
     python eval/score.py <replay.jsonl>         (.jsonl positional is a replay)
     python eval/score.py --self-test            (synthetic regression cases)
@@ -19,6 +21,11 @@ Usage:
 Inputs
     --manifest  JSON: {"expected_vulns": [...]} (see eval/golden.example.json).
                 Entries may be strings or objects with id/type/cwe/aliases.
+                Malformed structures are rejected with a clean error.
+    --finding-map JSON: {"<report heading>": "<finding id>"}. Report headings
+                carry no structured verdict, so a verdict is inherited only by a
+                heading explicitly mapped to a replay finding id. Without a map
+                every report-heading verdict stays None (never a true positive).
     --replay    JSONL, one event per line. Recognised kinds:
                   run_start {run_id}                    (run boundary)
                   action    {run_id, tool, target, ok}  (tool call / hypothesis)
@@ -43,12 +50,16 @@ Verification (fail closed)
     ``not_measured (<reason>)`` rather than a fabricated number.
 
 Metrics (computed only when the relevant input is present)
-    recall, precision, false_positive_rate (+ count and basis),
+    recall, precision, false_positive_rate (+ count and basis) from negative
+    tested/verifier events only, false_discovery_rate_proxy = 1 - precision,
     reproducibility (finding + report-hash), tokens_per_finding.
+    --max-fpr enforces only a measured false_positive_rate, never the proxy.
     Section/field checks run for every report regardless of inputs.
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -102,7 +113,7 @@ CWE_RE = re.compile(r"CWE-\d+", re.IGNORECASE)
 HASH_RE = re.compile(r"\b[0-9a-fA-F]{64}\b")
 # Canonical renderer: "### F-01: ..."; engagement renderer: "### [High] ...".
 FINDING_RE = re.compile(
-    r"^###\s+(?:F-?\d+\s*:?|\[(?:Critical|High|Medium|Low|None|Info)\]).*$",
+    r"^###\s+((?:F-?\d+\s*:?|\[(?:Critical|High|Medium|Low|None|Info)\]).*)$",
     re.MULTILINE | re.IGNORECASE,
 )
 SEVERITY_RE = re.compile(
@@ -112,6 +123,8 @@ BRACKET_SEVERITY_RE = re.compile(
     r"\[(Critical|High|Medium|Low|None)\]", re.IGNORECASE
 )
 TYPE_RE = re.compile(r"(?:\*\*Type:\*\*|Type:)\s*(.+)", re.IGNORECASE)
+# Canonical renderer headings start with a stable finding id: "### F-01: ...".
+STABLE_HEADING_ID_RE = re.compile(r"^\s*(F-?\d+)\b", re.IGNORECASE)
 
 FIELD_PATTERNS = {
     "steps": re.compile(r"steps to reproduce|reproduction|\brepro\b", re.IGNORECASE),
@@ -177,7 +190,9 @@ def score_report(path):
     blocks = FINDING_RE.split(findings_text)
     findings = []
     reported = []
-    for block in blocks[1:]:
+    for index in range(1, len(blocks) - 1, 2):
+        heading = blocks[index].strip()
+        block = blocks[index + 1]
         severity_match = SEVERITY_RE.search(block) or BRACKET_SEVERITY_RE.search(block)
         severity = severity_match.group(1).capitalize() if severity_match else "Unknown"
         missing_fields = [name for name, pattern in FIELD_PATTERNS.items() if not pattern.search(block)]
@@ -185,7 +200,9 @@ def score_report(path):
         type_match = TYPE_RE.search(block)
         identifiers = set(cwes)
         identifiers.update(identifiers_from([type_match.group(1)] if type_match else []))
-        first_line = next((line.strip("# *") for line in block.splitlines() if line.strip()), "")
+        first_line = heading or next(
+            (line.strip("# *") for line in block.splitlines() if line.strip()), ""
+        )
         identifiers.update(identifiers_from([first_line]))
         findings.append({
             "severity": severity,
@@ -193,7 +210,11 @@ def score_report(path):
             "cwe": bool(cwes),
             "missing_fields": missing_fields,
         })
-        reported.append({"identifiers": identifiers, "source": "report"})
+        reported.append({
+            "identifiers": identifiers,
+            "heading": first_line,
+            "source": "report",
+        })
 
     counts = {severity: 0 for severity in SEVERITIES}
     for finding in findings:
@@ -238,19 +259,47 @@ def load_manifest(path):
         data = json.load(handle)
     if isinstance(data, list):
         entries = data
-    else:
+    elif isinstance(data, dict):
         entries = data.get("expected_vulns", [])
+        if not isinstance(entries, list):
+            raise ValueError("expected_vulns must be a list of strings or objects")
+    else:
+        raise ValueError("manifest must be a JSON object or list")
     ground_truth = []
     for index, entry in enumerate(entries):
         if isinstance(entry, str):
             entry = {"id": entry}
+        elif not isinstance(entry, dict):
+            raise ValueError(
+                "expected_vulns[%d] must be a string or object, got %s"
+                % (index, type(entry).__name__)
+            )
         key = str(entry.get("id") or entry.get("type") or entry.get("name") or "vuln-%d" % (index + 1))
         aliases = entry.get("aliases") or []
         if isinstance(aliases, str):
             aliases = [aliases]
+        elif not isinstance(aliases, list):
+            raise ValueError(
+                "expected_vulns[%d].aliases must be a string or list, got %s"
+                % (index, type(aliases).__name__)
+            )
         identifiers = identifiers_from([key, entry.get("cwe")] + list(aliases))
         ground_truth.append({"key": key, "identifiers": identifiers})
     return ground_truth
+
+
+def load_finding_map(path):
+    """Load {"<report heading>": "<finding id>"}; validate before use."""
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("finding map must be a JSON object of heading -> finding id")
+    result = {}
+    for heading, finding_id in data.items():
+        if not isinstance(heading, str) or not isinstance(finding_id, (str, int)):
+            raise ValueError("finding map entries must map a heading string to a finding id")
+        result[heading] = str(finding_id)
+    return result
 
 
 def load_replay(path):
@@ -272,6 +321,29 @@ def load_replay(path):
             else:
                 warnings.append("replay line %d: expected an object" % line_number)
     return events, warnings
+
+
+# Verdict spellings that count as a *negative* for the FPR denominator. An
+# explicit positive (observed/confirmed/true) must never inflate that denominator.
+NEGATIVE_VERDICTS = {
+    "false", "0", "no", "rejected", "not a finding", "not vulnerable",
+}
+POSITIVE_VERDICTS = {
+    "true", "1", "yes", "confirmed", "observed", "verified", "positive",
+    "vulnerable", "found", "success",
+}
+
+
+def _is_negative_verdict(value):
+    """True only for explicit negative verdicts; positives never count."""
+    if isinstance(value, bool):
+        return not value
+    if value is None:
+        return False
+    text = normalize(value)
+    if text in POSITIVE_VERDICTS:
+        return False
+    return text in NEGATIVE_VERDICTS
 
 
 def _is_false(value):
@@ -390,13 +462,15 @@ def _status(measured, reason=""):
     }
 
 
-def compute_metrics(results, ground_truth, replay_events):
+def compute_metrics(results, ground_truth, replay_events, finding_map=None):
     """Compute detection/reproducibility metrics dicts; values may be None.
 
     Only findings carrying an explicit boolean verdict can become true or false
-    positives. Findings without one are counted in ``unverified_findings`` and
-    never inflate detection metrics. Metrics lacking required evidence are
-    reported as not_measured with a reason in ``measurement_status``.
+    positives. Report headings inherit a verdict only when explicitly mapped to
+    a finding id via ``finding_map``; identifier similarity alone is not enough.
+    Findings without a verdict are counted in ``unverified_findings`` and never
+    inflate detection metrics. Metrics lacking required evidence are reported as
+    not_measured with a reason in ``measurement_status``.
     """
     index = defaultdict(set)
     for entry in ground_truth:
@@ -428,13 +502,37 @@ def compute_metrics(results, ground_truth, replay_events):
             ),
             "source": "replay",
         })
+    # F8: report prose has no structured verdict. Without an explicit heading ->
+    # finding-id mapping the verdict stays None; two same-type headings must not
+    # be promoted by matching identifiers alone.
+    finding_map = finding_map or {}
+    by_heading = {normalize(heading): finding_id for heading, finding_id in finding_map.items()}
     for item in reported:
         if item["source"] == "report":
-            # Report headings carry no structured verdict; inherit one only if
-            # the replay explicitly verified a matching finding.
-            item["verdict"] = _resolve_verdict(
-                item["identifiers"], None, verdict_by_id, verdict_by_identifier
-            )
+            heading = item.get("heading", "")
+            mapped_id = finding_map.get(heading)
+            if mapped_id is None:
+                mapped_id = by_heading.get(normalize(heading))
+            if mapped_id is None:
+                # Stable finding id in the heading itself, never a type/name match.
+                stable = STABLE_HEADING_ID_RE.match(heading)
+                if stable:
+                    mapped_id = stable.group(1)
+            if mapped_id is not None:
+                item["finding_id"] = str(mapped_id)
+                # Look up by stable id only, never by identifier similarity.
+                item["verdict"] = verdict_by_id.get(str(mapped_id))
+            else:
+                item["verdict"] = None
+
+    report_verdicts = [
+        {
+            "heading": item.get("heading"),
+            "finding_id": item.get("finding_id"),
+            "verdict": item.get("verdict"),
+        }
+        for item in reported if item["source"] == "report"
+    ]
 
     for item in reported:
         item["keys"] = _match_keys(item["identifiers"], index)
@@ -478,19 +576,34 @@ def compute_metrics(results, ground_truth, replay_events):
     precision = len(true_positives) / denominator if not precision_reason else None
     status["precision"] = _status(not precision_reason, precision_reason)
 
-    # FPR: explicit tested hypotheses first, then verifier rejections, then
-    # failed actions carrying a hypothesis identifier. A bare failed tool call
-    # (e.g. fs_read) is not a security negative.
+    # F2: 1 - precision is a false *discovery* rate proxy, not an FPR. It is
+    # reported separately and can never satisfy --max-fpr.
+    fdr_proxy = 1.0 - precision if precision is not None else None
+    status["false_discovery_rate_proxy"] = _status(
+        fdr_proxy is not None, precision_reason or "precision not measured"
+    )
+
+    # F2/F3: a true FPR needs at least one negative tested hypothesis or
+    # negative verifier verdict. Precedence stays tested > verifier > action.
+    # A bare failed tool call (e.g. fs_read) is not a security negative.
     tested_negatives = []
     verifier_negatives = []
     action_negatives = []
     for event in replay_events:
         kind = event["kind"]
         if kind == "tested":
+            # `tested` denotes a rejected hypothesis; an absent verdict is an
+            # implicit negative. Explicit positives (observed/confirmed/true)
+            # are excluded from the denominator.
+            explicit = [event[name] for name in ("verdict", "verified", "ok") if name in event]
+            if explicit and not any(_is_negative_verdict(value) for value in explicit):
+                continue
             identifiers = identifiers_from([event.get("type"), event.get("id"), event.get("cwe")])
             if identifiers:
                 tested_negatives.append(identifiers)
-        elif kind == "verifier" and _explicit_verdict(event) is False:
+        elif kind == "verifier" and any(
+            _is_negative_verdict(event.get(name)) for name in ("verdict", "verified", "ok")
+        ):
             identifiers = identifiers_from([
                 event.get("type"), event.get("cwe"), event.get("id"),
                 event.get("finding_id"), event.get("candidate"),
@@ -524,13 +637,10 @@ def compute_metrics(results, ground_truth, replay_events):
         )
         tn = len(negatives) - fp_negatives
         fpr = fp_negatives / (fp_negatives + tn) if (fp_negatives + tn) else None
-    elif detection_ready and precision is not None:
-        fpr = 1.0 - precision
-        fpr_basis = "reported_findings_fdr_proxy"
     if not detection_ready:
         fpr_reason = detection_reason
     elif fpr is None:
-        fpr_reason = "no negative hypotheses or verified findings"
+        fpr_reason = "no negative tested hypotheses or verifier verdicts"
         fpr_basis = "not_measured"
     else:
         fpr_reason = ""
@@ -615,6 +725,8 @@ def compute_metrics(results, ground_truth, replay_events):
         "false_positive_rate": fpr,
         "false_positive_count": len(false_positives) if detection_ready else None,
         "false_positive_basis": fpr_basis,
+        "false_discovery_rate_proxy": fdr_proxy,
+        "false_discovery_rate_proxy_basis": "1 - precision",
         "reproducibility": reproducibility,
         "reproducibility_findings": finding_repro,
         "reproducibility_report_hash": hash_repro,
@@ -625,6 +737,7 @@ def compute_metrics(results, ground_truth, replay_events):
         "verified_findings": len(verified),
         "rejected_findings": len(rejected),
         "unverified_findings": len(unverified),
+        "report_verdicts": report_verdicts,
         "explicit_verdicts_in_replay": verdict_count,
         "total_tokens": total_tokens,
         "valid_findings": valid_findings,
@@ -663,6 +776,7 @@ def print_summary(results, metrics, notes):
         "recall",
         "precision",
         "false_positive_rate",
+        "false_discovery_rate_proxy",
         "false_positive_count",
         "reproducibility",
         "reproducibility_findings",
@@ -671,6 +785,9 @@ def print_summary(results, metrics, notes):
     ):
         print("  %-28s %s" % (name, _format_metric(name, metrics)))
     print("  %-28s %s" % ("false_positive_basis", metrics["false_positive_basis"]))
+    print("  %-28s %s" % (
+        "false_discovery_rate_proxy_basis", metrics["false_discovery_rate_proxy_basis"]
+    ))
     print("  %-28s %s" % ("ground_truth", metrics["ground_truth_count"]))
     print("  %-28s %s" % ("reported_findings", metrics["reported_findings"]))
     print("  %-28s %s" % ("verified_findings", metrics["verified_findings"]))
@@ -697,6 +814,31 @@ Steps to reproduce, proof of concept, impact and remediation.
 Severity: High
 **Type:** SQL injection
 CWE-89
+Steps to reproduce, proof of concept, impact and remediation.
+## Coverage
+Synthetic.
+## Timeline
+Synthetic.
+## Appendices
+Synthetic.
+"""
+
+SELF_TEST_FINDING_MAP_REPORT = """## Executive Summary
+Synthetic report with two same-type headings (--self-test only).
+## Scope & ROE
+Synthetic.
+## Methodology
+Synthetic.
+## Findings
+### [High] Genuine reflected XSS
+Severity: High
+**Type:** reflected XSS
+CWE-79
+Steps to reproduce, proof of concept, impact and remediation.
+### [High] Forged reflected XSS
+Severity: High
+**Type:** reflected XSS
+CWE-79
 Steps to reproduce, proof of concept, impact and remediation.
 ## Coverage
 Synthetic.
@@ -776,9 +918,123 @@ def self_test():
              "type": "reflected XSS", "cwe": "CWE-79", "verified": True},
         ], directory, "forged_heading")
         m = compute_metrics([result], [xss, sqli], replay)
-        check("forged heading is not a true positive", m["true_positives"] == 1)
-        check("forged heading remains unverified", m["unverified_findings"] == 1)
+        check("no map -> forged heading is not a true positive", m["true_positives"] == 0)
+        check("no map -> both report headings remain unverified", m["unverified_findings"] == 2)
         check("forged report has two reported findings", m["reported_findings"] == 2)
+
+        # 5. F2: no negatives -> FPR not_measured, but 1-precision proxy is available.
+        replay = load([
+            {"kind": "finding", "run_id": "r1", "id": "F-5a",
+             "type": "reflected XSS", "cwe": "CWE-79", "verified": True},
+            {"kind": "finding", "run_id": "r1", "id": "F-5b",
+             "type": "SQL injection", "cwe": "CWE-89", "verified": False},
+        ], directory, "no_negatives")
+        m = compute_metrics([], [xss], replay)
+        check("precision 0.5 from one TP and one FP", m["precision"] == 0.5)
+        check("no negatives -> FPR is not_measured",
+              m["measurement_status"]["false_positive_rate"]["status"] == "not_measured")
+        check("no negatives -> FPR basis is not_measured",
+              m["false_positive_basis"] == "not_measured")
+        check("no negatives -> FDR proxy is 1 - precision",
+              m["false_discovery_rate_proxy"] == 0.5)
+        manifest_path = os.path.join(directory, "manifest-xss.json")
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump({"expected_vulns": [{"id": "xss", "type": "reflected XSS", "cwe": "CWE-79"}]}, handle)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            strict_code = main([
+                "--manifest", manifest_path,
+                "--replay", os.path.join(directory, "no_negatives.jsonl"),
+                "--strict", "--max-fpr", "0.1",
+            ])
+        check("strict --max-fpr refuses proxy-only basis", strict_code == 1)
+        check("strict refusal explains the proxy", "proxy" in err.getvalue().lower())
+
+        # 6. F3: an observed tested hypothesis must not enter the FPR denominator.
+        replay = load([
+            {"kind": "finding", "run_id": "r1", "id": "F-6",
+             "type": "reflected XSS", "cwe": "CWE-79", "verified": True},
+            {"kind": "tested", "run_id": "r1", "type": "open redirect",
+             "cwe": "CWE-601", "verdict": "observed"},
+            {"kind": "tested", "run_id": "r1", "type": "reflected XSS",
+             "cwe": "CWE-79", "verdict": "rejected"},
+        ], directory, "tested_verdicts")
+        m = compute_metrics([], [xss], replay)
+        check("negative tested verdict sets FPR basis",
+              m["false_positive_basis"] == "replay_tested_hypotheses")
+        check("positive tested verdict excluded from denominator",
+              m["false_positive_rate"] == 1.0)
+
+        # 7. F2/F3: verifier negatives alone give a measured FPR.
+        replay = load([
+            {"kind": "finding", "run_id": "r1", "id": "F-7",
+             "type": "reflected XSS", "cwe": "CWE-79"},
+            {"kind": "verifier", "run_id": "r1", "finding_id": "F-7", "verified": True},
+            {"kind": "verifier", "run_id": "r1", "candidate": "SQL injection",
+             "cwe": "CWE-89", "verified": False},
+        ], directory, "verifier_negative")
+        m = compute_metrics([], [xss], replay)
+        check("verifier-only negatives basis",
+              m["false_positive_basis"] == "replay_verifier_verdicts")
+        check("verifier-only FPR is measured",
+              m["measurement_status"]["false_positive_rate"]["status"] == "measured")
+        check("verifier-only FPR is 0.0", m["false_positive_rate"] == 0.0)
+
+        # 8. F8: two same-type report headings, only the explicitly mapped one
+        #    may inherit the replay verdict.
+        map_report = os.path.join(directory, "two-same-type.md")
+        with open(map_report, "w", encoding="utf-8") as handle:
+            handle.write(SELF_TEST_FINDING_MAP_REPORT)
+        result = score_report(map_report)
+        check("two same-type headings parsed", result["total_findings"] == 2)
+        headings = [item["heading"] for item in result["reported"]]
+        check("the two headings are distinct", headings[0] != headings[1])
+        replay = load([
+            {"kind": "finding", "run_id": "r1", "id": "F-8",
+             "type": "reflected XSS", "cwe": "CWE-79", "verified": True},
+        ], directory, "finding_map")
+        unmapped = compute_metrics([result], [xss], replay)
+        check("no map -> report headings stay unverified",
+              all(row["verdict"] is None for row in unmapped["report_verdicts"]))
+        mapped = compute_metrics([result], [xss], replay, {headings[0]: "F-8"})
+        check("mapped heading inherits the stable-id verdict",
+              mapped["report_verdicts"][0]["verdict"] is True)
+        check("unmapped same-type heading stays None",
+              mapped["report_verdicts"][1]["verdict"] is None)
+        stable_report = os.path.join(directory, "stable-id.md")
+        with open(stable_report, "w", encoding="utf-8") as handle:
+            handle.write(SELF_TEST_REPORT.replace(
+                "### [High] Genuine reflected XSS", "### F-8: Genuine reflected XSS"
+            ))
+        stable_result = score_report(stable_report)
+        stable_metrics = compute_metrics([stable_result], [xss, sqli], replay)
+        check("stable finding id in a heading inherits the verdict",
+              stable_metrics["true_positives"] == 1)
+
+        # 9. F9: malformed manifests fail cleanly, never with a traceback.
+        malformed = os.path.join(directory, "bad-manifest.json")
+        with open(malformed, "w", encoding="utf-8") as handle:
+            json.dump({"expected_vulns": [42]}, handle)
+        try:
+            load_manifest(malformed)
+            check("malformed manifest entry raises ValueError", False)
+        except ValueError:
+            check("malformed manifest entry raises ValueError", True)
+        with open(malformed, "w", encoding="utf-8") as handle:
+            json.dump({"expected_vulns": [{"id": "x", "aliases": {"bad": 1}}]}, handle)
+        try:
+            load_manifest(malformed)
+            check("malformed aliases raise ValueError", False)
+        except ValueError:
+            check("malformed aliases raise ValueError", True)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                main(["--manifest", malformed,
+                      "--replay", os.path.join(directory, "no_negatives.jsonl")])
+            exit_code = 0
+        except SystemExit as error:
+            exit_code = error.code
+        check("malformed manifest exits non-zero cleanly", exit_code != 0)
+        check("malformed manifest produces no traceback", "Traceback" not in err.getvalue())
 
     for name, passed in checks:
         print("[%s] %s" % ("PASS" if passed else "FAIL", name))
@@ -787,19 +1043,20 @@ def self_test():
     return 1 if failed else 0
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("reports", nargs="*", help="Markdown report files")
     ap.add_argument("--dir", help="directory to scan recursively for .md reports")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of text")
     ap.add_argument("--strict", action="store_true", help="exit 1 on report problems or threshold violations")
     ap.add_argument("--manifest", help="JSON ground-truth manifest (expected vulns)")
+    ap.add_argument("--finding-map", help="JSON heading -> finding id map for report verdicts")
     ap.add_argument("--replay", help="JSONL replay log from an engagement")
     ap.add_argument("--min-recall", type=float, help="strict: require recall >= value")
     ap.add_argument("--min-precision", type=float, help="strict: require precision >= value")
     ap.add_argument("--max-fpr", type=float, help="strict: require FPR <= value")
     ap.add_argument("--self-test", action="store_true", help="run synthetic regression cases and exit")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.self_test:
         return self_test()
@@ -818,6 +1075,7 @@ def main():
 
     notes = []
     ground_truth = []
+    finding_map = {}
     replay_events = []
     if args.manifest:
         try:
@@ -826,6 +1084,11 @@ def main():
             ap.error("cannot read manifest %s: %s" % (args.manifest, error))
     else:
         notes.append("no --manifest: recall/precision/FPR are not_measured")
+    if args.finding_map:
+        try:
+            finding_map = load_finding_map(args.finding_map)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            ap.error("cannot read finding map %s: %s" % (args.finding_map, error))
     if replay_path:
         try:
             replay_events, replay_warnings = load_replay(replay_path)
@@ -844,7 +1107,7 @@ def main():
         except OSError as error:
             ap.error("cannot read report %s: %s" % (path, error))
 
-    metrics = compute_metrics(results, ground_truth, replay_events)
+    metrics = compute_metrics(results, ground_truth, replay_events, finding_map)
     payload = {
         "reports": [
             {key: value for key, value in result.items() if key != "reported"}
@@ -868,6 +1131,21 @@ def main():
         return 0
     if any(result["problems"] for result in results):
         return 1
+    if args.max_fpr is not None:
+        # --max-fpr is a real FPR gate: never satisfy it with 1 - precision.
+        measured_bases = {
+            "replay_tested_hypotheses", "replay_verifier_verdicts", "replay_failed_actions"
+        }
+        if (
+            metrics["false_positive_basis"] not in measured_bases
+            or metrics["measurement_status"]["false_positive_rate"]["status"] != "measured"
+        ):
+            print(
+                "strict: --max-fpr requires a measured false_positive_rate from "
+                "negative tested/verifier events; false_discovery_rate_proxy is not accepted",
+                file=sys.stderr,
+            )
+            return 1
     checks = [
         (args.min_recall, metrics["recall"], lambda a, b: b >= a, "recall"),
         (args.min_precision, metrics["precision"], lambda a, b: b >= a, "precision"),

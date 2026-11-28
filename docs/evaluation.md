@@ -41,7 +41,10 @@ marker row in a DB, or a verifier script). Ground truth is withheld from the age
 6. Recompute with
    `python eval/score.py --dir eval/results/<target> --manifest eval/results/<target>/manifest.json --replay eval/results/<target>/replay.jsonl --json --strict`.
 7. Check each reported finding against the ground-truth oracle and record verdicts.
-   `score.py --strict` requires a replay log.
+   `--strict` does **not** require a replay log for report checks, but any
+   FPR threshold (`--max-fpr`) requires a measured negative from the replay;
+   without it the scorer refuses the proxy basis and exits non-zero.
+   Reproducibility and tokens-per-finding are `not_measured` without `--replay`.
 
 ## 4. Metrics
 
@@ -51,14 +54,18 @@ For a task set with ground truth `G` and reported findings `R`:
 | --- | --- |
 | **Recall** | `|G ∩ R| / |G|` — fraction of known vulns found. Report overall and per class. |
 | **Precision** | `|G ∩ R| / |R|` — fraction of reports that are true positives. |
-| **False-positive rate (FPR)** | `FP / (FP + TN)` over tested hypotheses; also report raw FP count. A "finding" that fails the deterministic verifier is an FP. |
-| **Time-to-first-valid-finding** | Wall-clock from run start to the first finding that passes the verifier; report median and p90. |
-| **Reproducibility** | Fraction of findings reproduced across N≥3 identical runs from the same replay log; and fraction of runs producing an identical report hash. |
-| **Branch coverage** | Fraction of distinct code paths / in-scope branches exercised (coverage ledger entries vs. known attack surface). |
-| **Token / time per finding** | LLM tokens and wall-clock seconds divided by valid findings; compare to baseline. |
+| **False-positive rate (FPR)** | `FP / (FP + TN)` computed only from explicit negatives (`tested` hypotheses, verifier rejections, or failed actions carrying a hypothesis id); also report raw FP count. A "finding" that fails the deterministic verifier is an FP. |
+| **False-discovery-rate proxy** | `score.py` always reports `false_discovery_rate_proxy = 1 − precision` in a **separate** field. True `false_positive_rate` is computed only from explicit tested negatives / verifier verdicts; with no negatives its status is `not_measured`. `--max-fpr` refuses the proxy basis and exits non-zero rather than accepting it. |
+| **Time-to-first-valid-finding** | *(planned, not implemented)* Wall-clock from run start to the first verifier-passing finding; median and p90. |
+| **Reproducibility** | Fraction of findings reproduced across **N≥2** identical runs (`score.py` requires `run_count >= 2`); and fraction of runs producing an identical report hash. Below 2 runs it is `not_measured`. |
+| **Branch coverage** | *(planned, not implemented)* Distinct code paths / in-scope branches exercised (coverage ledger vs. known attack surface). |
+| **Token / time per finding** | *(partly implemented)* `tokens_per_finding` comes from replay `usage` events; **wall-clock time per finding is planned, not implemented**. |
 
-Also record: budget exhaustion rate, approval count, pause/abort incidents, and
-ROE-stop events.
+Also record *(planned, not implemented in `score.py`)*: budget exhaustion rate,
+approval count, pause/abort incidents, and ROE-stop events. Implemented by
+`score.py` today: report section/field checks, recall, precision, FPR/FDR-proxy
+with its basis, reproducibility (N≥2), and tokens-per-finding; the remaining
+metrics above are aspirations, not measurements.
 
 ## 5. Baseline comparison
 
@@ -87,7 +94,8 @@ and joined by the driver) containing:
 `started` / `finding` / `report_ready` spellings to these kinds.
 
 Replay logs are used to reproduce a finding, audit why a false positive was produced,
-and diff BugFound against the baseline. `score.py --strict` requires one.
+and diff BugFound against the baseline. They are required for reproducibility and
+tokens-per-finding, **not** for `--strict` (see §3).
 
 ## 7. Acceptance thresholds (proposed)
 
@@ -95,8 +103,8 @@ and diff BugFound against the baseline. `score.py --strict` requires one.
 | --- | --- |
 | Recall on Juice Shop + DVWA ground truth | ≥ 0.70 |
 | Precision after deterministic verification | ≥ 0.90 |
-| FPR on tested hypotheses | ≤ 0.10 |
-| Reproducibility (N=3) | ≥ 0.95 |
+| FPR on explicit tested hypotheses | ≤ 0.10 (`false_positive_basis` must be a real-negative basis, not the FDR proxy) |
+| Reproducibility (N≥2) | ≥ 0.95 |
 | Deterministic verifier agreement with ground truth | 1.00 |
 
 Thresholds are provisional; recalibrate after the first full run and record the change.
@@ -111,7 +119,10 @@ Thresholds are provisional; recalibrate after the first full run and record the 
 ## 9. Artifacts
 
 - `eval/targets.example.yml` — target/testbed inventory.
-- `eval/run_benchmark.ps1` / `eval/run_benchmark.sh` — drivers, dry-run by default.
+- `eval/run_benchmark.ps1` — full driver (export, manifest, score).
+  `eval/run_benchmark.sh` is a **smoke path only**: it generates a report/log but
+  does not produce manifest/replay artifacts or call `score.py`. Use the PowerShell
+  driver when scored results are required.
 - `eval/export_trace.py` — stdlib SQLite `trace_events` → replay JSONL exporter.
 - `eval/score.py` — stdlib-only Markdown report scorer and metrics calculator.
 - `eval/e2e_test.ps1` — local wiring test: report sections + `score.py --strict`.

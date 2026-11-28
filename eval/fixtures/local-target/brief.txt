@@ -10,8 +10,8 @@ Out of scope:
 
 Rules of engagement:
 Fuzzing is authorized.
-State changes are allowed.
-Automated scanners are allowed.
+Read-only only: no state changes, no writes, no exploitation.
+Automated scanners are allowed if non-intrusive.
 No disclosure.
 Do not access any host other than 127.0.0.1.
 Local lab only; no external submission of any kind.

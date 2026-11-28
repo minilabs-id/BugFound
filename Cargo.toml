@@ -9,9 +9,12 @@ members = [
   "crates/bugfound-store",
   "crates/bugfound-cli",
   "crates/bugfound-desktop",
+  "crates/bugfound-desktop-core",
+  "crates/bugfound-app",
   "crates/bugfound-engagement",
   "crates/bugfound-proxy",
   "crates/bugfound-collaborator",
+  "crates/bugfound-redact",
 ]
 
 [workspace.package]
@@ -42,3 +45,4 @@ egui = "0.31"
 base64 = "0.22"
 regex = "1"
 jsonschema = { version = "0.26", default-features = false }
+bugfound-redact = { path = "crates/bugfound-redact" }

@@ -1,0 +1,17 @@
+[package]
+name = "bugfound-collaborator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bugfound-collaborator"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio = { workspace = true, features = ["net"] }
+clap.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+bugfound-redact.workspace = true

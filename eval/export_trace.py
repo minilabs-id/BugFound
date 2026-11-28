@@ -6,11 +6,12 @@ Standard library only. Reads the authoritative engagement trace table
     trace_events(id, engagement_id, run_id, kind, payload_json, created_at)
 
 and emits one JSON object per line with a ``kind`` field that ``score.py``
-understands. When ``--merge`` is supplied, the engagement's own
-``workspace/replay-<id>.jsonl`` is joined too; trace events win for every kind
-both sources provide, and the engagement log only contributes context the trace
-does not carry (brief/plan/error/lifecycle). This keeps usage/finding counts
-from being double-counted.
+understands. The DB is opened read-only (``mode=ro``). When ``--merge`` is
+supplied, the engagement's own ``workspace/replay-<id>.jsonl`` is joined too:
+events are deduplicated by stable identity (finding id / tested type, etc.),
+the trace values win on conflicts, and evidence fields from the engagement log
+(evidence, capture, hashes, request/response, ...) are merged rather than
+silently dropped. Brief/plan/error/lifecycle context is still retained.
 
 Usage:
     python eval/export_trace.py engagement.db replay.jsonl
@@ -20,8 +21,12 @@ Usage:
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
+import tempfile
+from pathlib import Path
+from urllib.parse import quote
 
 # Event spellings seen in trace_events and in the engagement replay log.
 KIND_ALIASES = {
@@ -41,10 +46,22 @@ KIND_ALIASES = {
     "report.exported": "report",
 }
 
-# Kinds the trace DB is authoritative for when merging two replay sources.
-AUTHORITATIVE_KINDS = {
-    "run_start", "action", "finding", "usage", "verifier", "report", "tested",
+# Stable identities used to dedupe across sources. The tuple selects the first
+# available field; unrelated/context events fall back to their full JSON shape.
+IDENTITY_FIELDS = {
+    "run_start": ("run_id",),
+    "finding": ("id", "finding_id"),
+    "verifier": ("finding_id", "candidate", "id"),
+    "tested": ("id", "type", "cwe"),
+    "usage": ("run_id",),
+    "report": ("sha256", "run_id"),
+    "action": ("call_id", "id", "tool"),
 }
+# Evidence carried by engagement logs must survive a merge with trace events.
+EVIDENCE_FIELDS = (
+    "evidence", "evidence_hash", "capture", "request", "response", "artifact",
+    "sha256", "oracle", "details", "raw", "notes", "target", "url",
+)
 
 
 def normalize_kind(value):
@@ -112,14 +129,14 @@ def event_from_row(row):
         payload = {"value": payload}
 
     kind = normalize_kind(row["kind"])
-    event = {
-        "kind": kind,
-        "run_id": row["run_id"] or row["engagement_id"] or "default",
-        "engagement_id": row["engagement_id"],
-        "created_at": row["created_at"],
-    }
+    # F10: payload keys go in first; authoritative DB columns are written last
+    # so a forged payload cannot impersonate kind/run_id/engagement_id/time.
+    event = {}
     event.update(payload)
     event["kind"] = kind
+    event["run_id"] = row["run_id"] or row["engagement_id"] or "default"
+    event["engagement_id"] = row["engagement_id"]
+    event["created_at"] = row["created_at"]
 
     if kind == "finding":
         if not event.get("id"):
@@ -160,7 +177,11 @@ def event_from_row(row):
 
 
 def load_trace(db_path):
-    connection = sqlite3.connect(db_path)
+    # A URI read-only connection cannot create or mutate the evidence DB.
+    if not os.path.isfile(db_path):
+        raise OSError("database file not found: %s" % db_path)
+    uri = "file:" + quote(Path(db_path).resolve().as_posix(), safe="/") + "?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
     connection.row_factory = sqlite3.Row
     try:
         rows = connection.execute(
@@ -209,37 +230,157 @@ def load_engagement_replay(path):
     return events
 
 
-def merged_replay(trace_events, engagement_events):
-    trace_kinds = {event["kind"] for event in trace_events}
-    result = list(trace_events)
-    for event in engagement_events:
-        # Prefer the DB for kinds it actually recorded; keep unrelated context.
-        if event.get("kind") in AUTHORITATIVE_KINDS and event["kind"] in trace_kinds:
+def event_identity(event):
+    """Stable identity for dedupe, independent of JSON key order."""
+    kind = str(event.get("kind") or "")
+    for name in IDENTITY_FIELDS.get(kind, ()):
+        value = event.get(name)
+        if value not in (None, "", 0):
+            return (kind, str(value))
+    return (kind, json.dumps(event, sort_keys=True, ensure_ascii=False, default=str))
+
+
+def merge_events(primary, secondary):
+    """Merge evidence from ``secondary`` into authoritative ``primary``."""
+    merged = dict(secondary)
+    merged.update(primary)
+    for key in EVIDENCE_FIELDS:
+        if key not in secondary:
             continue
-        result.append(event)
-    return result
+        if key not in primary or primary[key] in (None, "", [], {}):
+            merged[key] = secondary[key]
+        elif isinstance(primary[key], dict) and isinstance(secondary[key], dict):
+            combined = dict(secondary[key])
+            combined.update(primary[key])
+            merged[key] = combined
+    return merged
+
+
+def dedupe_events(events):
+    """One event per stable identity; duplicate evidence is merged, not lost."""
+    positions = {}
+    unique = []
+    for event in events:
+        key = event_identity(event)
+        if key in positions:
+            unique[positions[key]] = merge_events(unique[positions[key]], event)
+        else:
+            positions[key] = len(unique)
+            unique.append(dict(event))
+    return unique
+
+
+def merged_replay(trace_events, engagement_events):
+    # Trace rows are authoritative, but engagement finding/tested events with
+    # the same identity contribute their evidence instead of being dropped.
+    return dedupe_events(list(trace_events) + list(engagement_events))
 
 
 def write_jsonl(path, events):
-    seen = set()
     written = 0
     with open(path, "w", encoding="utf-8") as handle:
-        for event in events:
-            line = json.dumps(event, ensure_ascii=False, sort_keys=True)
-            if line in seen:
-                continue
-            seen.add(line)
-            handle.write(line + "\n")
+        for event in dedupe_events(events):
+            handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
             written += 1
     return written
 
 
+def self_test():
+    checks = []
+
+    def check(name, condition):
+        checks.append((name, bool(condition)))
+
+    payload = {
+        "kind": "run_start",
+        "run_id": "forged-run",
+        "engagement_id": "forged-engagement",
+        "created_at": "1999-01-01T00:00:00Z",
+        "id": "F-1",
+        "type": "reflected XSS",
+        "evidence": {"source": "payload"},
+    }
+    row = {
+        "kind": "finding.saved",
+        "run_id": "r1",
+        "engagement_id": "e1",
+        "created_at": "2026-11-28T00:00:00Z",
+        "payload_json": json.dumps(payload),
+    }
+    event = event_from_row(row)
+    check("payload cannot override authoritative kind", event["kind"] == "finding")
+    check("payload cannot override authoritative run_id", event["run_id"] == "r1")
+    check("payload cannot override authoritative engagement_id", event["engagement_id"] == "e1")
+    check("payload cannot override authoritative created_at",
+          event["created_at"] == "2026-11-28T00:00:00Z")
+    check("non-authoritative payload fields survive", event.get("evidence") == {"source": "payload"})
+
+    trace = [{"kind": "finding", "id": "F-1", "type": "reflected XSS",
+              "verified": True, "run_id": "r1"}]
+    engagement = [
+        {"kind": "finding", "id": "F-1", "type": "reflected XSS", "verified": True,
+         "run_id": "r1", "evidence": {"capture": "raw"}, "evidence_hash": "abc123"},
+        {"kind": "tested", "type": "open redirect", "verdict": "rejected",
+         "run_id": "r1", "evidence": {"note": "x"}},
+        {"kind": "tested", "type": "open redirect", "verdict": "rejected",
+         "run_id": "r1", "evidence": {"note": "x"}},
+    ]
+    merged = merged_replay(trace, engagement)
+    finding = next(item for item in merged if item["kind"] == "finding")
+    check("engagement finding evidence merged", finding.get("evidence") == {"capture": "raw"})
+    check("engagement evidence_hash merged", finding.get("evidence_hash") == "abc123")
+    check("duplicate tested events deduped by identity",
+          sum(1 for item in merged if item["kind"] == "tested") == 1)
+
+    with tempfile.TemporaryDirectory() as directory:
+        db_path = os.path.join(directory, "trace.db")
+        try:
+            load_trace(db_path)
+            check("missing DB is rejected cleanly", False)
+        except OSError:
+            check("missing DB is rejected cleanly", True)
+        check("read-only connect did not create a DB", not os.path.exists(db_path))
+        connection = sqlite3.connect(db_path)
+        connection.execute(
+            "CREATE TABLE trace_events(id TEXT, engagement_id TEXT, run_id TEXT, "
+            "kind TEXT, payload_json TEXT, created_at TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO trace_events VALUES(?,?,?,?,?,?)",
+            ("1", "e1", "r1", "finding.saved",
+             json.dumps({"id": "F-1", "type": "reflected XSS", "verified": True}),
+             "2026-11-28T00:00:00Z"),
+        )
+        connection.commit()
+        connection.close()
+        loaded = load_trace(db_path)
+        check("read-only URI still reads existing DB",
+              any(item["kind"] == "finding" for item in loaded))
+        out = os.path.join(directory, "replay.jsonl")
+        count = write_jsonl(out, merged_replay(loaded, engagement))
+        written = load_engagement_replay(out)
+        findings = [item for item in written if item["kind"] == "finding"]
+        check("dedupe keeps exactly one finding", len(findings) == 1 and count == len(written))
+        check("dedupe preserves engagement evidence", findings[0].get("evidence") == {"capture": "raw"})
+
+    for name, passed in checks:
+        print("[%s] %s" % ("PASS" if passed else "FAIL", name))
+    failed = sum(1 for _, passed in checks if not passed)
+    print("export_trace self-test: %d/%d passed" % (len(checks) - failed, len(checks)))
+    return 1 if failed else 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("db", help="engagement SQLite DB (trace_events table)")
-    parser.add_argument("out", help="output replay JSONL path")
+    parser.add_argument("--self-test", action="store_true", help="run offline regression cases")
+    parser.add_argument("db", help="engagement SQLite DB (trace_events table)", nargs="?")
+    parser.add_argument("out", help="output replay JSONL path", nargs="?")
     parser.add_argument("--merge", help="engagement replay-<id>.jsonl to join")
     args = parser.parse_args(argv)
+    if args.self_test:
+        return self_test()
+    if not args.db or not args.out:
+        parser.error("db and out are required unless --self-test is used")
 
     try:
         events = load_trace(args.db)

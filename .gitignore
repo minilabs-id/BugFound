@@ -15,5 +15,6 @@ __pycache__/
 # Evidence artifacts are generated under the engagement workspace, never in source.
 **/evidence/*.bin
 
-# Node dependencies for local browser adapters.
+# Node dependencies for local browser adapters and the Tauri frontend.
 node_modules/
+/frontend/dist/

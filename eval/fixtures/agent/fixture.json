@@ -1,0 +1,29 @@
+{
+  "id": "local-lab-1",
+  "version": "1.0.0",
+  "authorization_ref": "operator-owned loopback lab",
+  "target": "http://127.0.0.1",
+  "scope": {
+    "in": ["127.0.0.1"],
+    "out": ["example.com"]
+  },
+  "roe": {
+    "allowed_classes": ["passive", "read-only"],
+    "forbidden_classes": ["intrusive", "state-change"],
+    "rate_cap": 10,
+    "tlp": "TLP:AMBER"
+  },
+  "hidden_facts": [
+    {
+      "id": "F-1",
+      "class": "reflected_input",
+      "asset": "127.0.0.1",
+      "oracle_required": "canary_echo"
+    }
+  ],
+  "decoys": [],
+  "expected": {
+    "coverage_requirements": ["WSTG-INFO-01"]
+  },
+  "note": "Local lab fixture only. Never point BugFound at a public target without explicit written authorization."
+}

@@ -2,13 +2,29 @@
 # Run from the workspace root with: cargo deny check
 # See https://embarkstudios.github.io/cargo-deny/
 
-version = 2
+# The `version` key is intentionally omitted: newer cargo-deny rejects it.
+# Schema is otherwise unchanged. CI pins cargo-deny to 0.18.5 (see
+# .github/workflows/ci.yml) so a schema change in a newer release cannot
+# silently alter this policy.
 
 [advisories]
 # Never build against a yanked crate version.
 yanked = "deny"
-# Triaged advisories may be added here with a comment and an expiry date.
-ignore = []
+# Triaged advisories with a reason and a review date. Every entry below is a
+# known, pre-existing dependency debt (see roadmap §15); re-review by 2027-02-26
+# and remove entries once the underlying crates are upgraded.
+ignore = [
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error via Tauri Linux glib macros; no safe upstream upgrade", expiry = "2027-02-26" },
+    { id = "RUSTSEC-2024-0436", reason = "paste via egui/accesskit; removed when the egui crate is deleted at Phase 3", expiry = "2027-02-26" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser via egui font stack; removed with egui at Phase 3", expiry = "2027-02-26" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.30 via zbus/egui; removed with egui at Phase 3", expiry = "2027-02-26" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.30 via zbus/egui; removed with egui at Phase 3", expiry = "2027-02-26" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant via egui accessibility stack; removed with egui at Phase 3", expiry = "2027-02-26" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names via egui accessibility stack; removed with egui at Phase 3", expiry = "2027-02-26" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive via egui accessibility stack; removed with egui at Phase 3", expiry = "2027-02-26" },
+    { id = "RUSTSEC-2026-0459", reason = "bundled sqlite via rusqlite 0.31; upgrade to rusqlite 0.41 is a separate tracked migration", expiry = "2027-02-26" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; migration to jiff/time is a separate tracked task", expiry = "2027-02-26" },
+]
 
 [licenses]
 # Copyleft (GPL/AGPL/LGPL/SSPL/...) and unlicensed crates are denied by
@@ -22,16 +38,37 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Unicode-DFS-2016",
+    "Unicode-3.0",
     "MPL-2.0",
     "Zlib",
     "CC0-1.0",
+    # Permissive licenses pulled in by the egui/Tauri native stacks.
+    "MIT-0",
+    "BSL-1.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]
 # Reject more than one version of the same crate in the dependency graph.
-multiple-versions = "deny"
+# TEMPORARY (ADR-009, Phase 0): `warn` while both the egui stack and the Tauri
+# webview stack are in the workspace. Phase 3 removes `bugfound-desktop` and
+# eframe/egui; restore `deny` at that gate. Do not turn this into a permanent
+# exemption — duplicate versions here are migration debt, not accepted design.
+# Plan to tighten (audit F16): at the egui-removal gate flip this to `deny`,
+# prune the `skip` list below, and re-run `cargo deny check` as a real gate.
+multiple-versions = "warn"
 # Reject wildcard (*) version requirements in manifests.
-wildcards = "deny"
+# Internal workspace crates use path dependencies without a version key, which
+# cargo-deny reports as wildcards for public crates. These are intentional and
+# cannot be published by design; keep the lint visible but non-blocking.
+# Plan to tighten (audit F16): after egui removal, review the remaining path
+# dependencies and move this to `deny` (or replace it with a narrow, dated
+# exemption) so wildcard requirements cannot silently reappear.
+wildcards = "warn"
+allow-wildcard-paths = true
 # Small, explicit allowlist of transitive duplicates that cannot currently be
 # collapsed upstream. Remove entries as soon as dependencies converge.
 skip = [

@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shlex
 import subprocess
 import sys
 import time
@@ -23,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from agent_lab import minimal_env  # noqa: E402
 from lab.local_reflect_server import start_lab_server  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -158,7 +160,14 @@ def main() -> int:
         for index in range(1, args.repeat + 1):
             manifest["runs"].append(run_once(base_url, "lab", index, destination))
         if args.baseline_cmd:
-            subprocess.run(args.baseline_cmd, shell=True, check=False, cwd=str(ROOT))
+            subprocess.run(
+                shlex.split(args.baseline_cmd),
+                shell=False,
+                check=True,
+                timeout=300,
+                cwd=str(ROOT),
+                env=minimal_env(),
+            )
             write_baseline_not_run(destination, "operator-supplied baseline command executed; not scored")
         else:
             write_baseline_not_run(destination, "no plain-agent baseline supplied")
